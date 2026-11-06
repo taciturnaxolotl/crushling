@@ -352,9 +352,29 @@ fn cancel(state: State, note: Option(String)) -> State {
       let _ = call(conns, client.cancel(ready.workspace_id, ready.session_id))
       let active = Active(..active, cancel_note: note)
       State(..state, waiting: [], active: Some(active))
+      |> close_subs(note)
     }
-    _, _, _ -> State(..state, waiting: [])
+    _, _, _ -> State(..state, waiting: []) |> close_subs(note)
   }
+}
+
+/// A cancelled run takes its subagents with it, and their threads would
+/// otherwise just stop mid-note: say so in each.
+fn close_subs(state: State, note: Option(String)) -> State {
+  let said = case note {
+    Some(note) -> "_" <> note <> "_"
+    None -> "_stopped._"
+  }
+  dict.each(state.subs, fn(_, sub) {
+    case sub.done, sub.sink {
+      False, Some(branch) -> {
+        let _ = branch.post(said)
+        branch.working(False)
+      }
+      _, _ -> Nil
+    }
+  })
+  state
 }
 
 fn call(conns: Conns, call: client.Call(a)) -> Result(a, client.Error) {
