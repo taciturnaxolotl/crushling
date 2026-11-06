@@ -14,7 +14,8 @@ fn policy() -> sandbox.Policy {
     uid: 970,
     gid: 970,
     root: "/storage/crushling/workspaces",
-    env: ["ANTHROPIC_BASE_URL=http://proxy"],
+    env: ["EXTRA=1"],
+    crush_config: "{}",
   )
 }
 
@@ -39,7 +40,7 @@ pub fn run_args_test() {
   let assert True = has("--network", "sbx-egress")
   let assert True = has("--user", "970:970")
   let assert True = has("--cap-drop", "ALL")
-  let assert True = has("--env", "ANTHROPIC_BASE_URL=http://proxy")
+  let assert True = has("--env", "EXTRA=1")
   let assert True =
     has("--volume", "/storage/crushling/workspaces/k/work:/workspace")
   let assert True =
@@ -83,6 +84,8 @@ pub fn prepare_creates_dirs_test() {
   let assert Ok(Nil) = sandbox.prepare(p, "k")
   let assert True = sandbox.socket_ready(sandbox.host_workspace(p, "k"))
   let assert True = sandbox.socket_ready(sandbox.host_socket_dir(p, "k"))
+  let assert True =
+    sandbox.socket_ready(sandbox.host_crush_data(p, "k") <> "/crush.json")
 }
 
 pub fn exec_runs_without_a_shell_test() {

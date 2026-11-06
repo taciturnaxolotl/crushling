@@ -1,7 +1,7 @@
 -module(crushling_ffi).
 
 -export([line_at/2, uuid_v4/0, monotonic_ms/0, log_warning/1, exec/3, sha256_hex/1,
-         file_exists/1, mkdir_p/1]).
+         file_exists/1, mkdir_p/1, write_private/2]).
 
 line_at(Lines, Index) ->
     element(Index + 1, Lines).
@@ -60,4 +60,17 @@ mkdir_p(Path) ->
     case filelib:ensure_path(Path) of
         ok -> {ok, nil};
         {error, Reason} -> {error, unicode:characters_to_binary(io_lib:format("~p", [Reason]))}
+    end.
+
+write_private(Path, Content) ->
+    Tmp = <<Path/binary, ".tmp">>,
+    case file:write_file(Tmp, Content) of
+        ok ->
+            _ = file:change_mode(Tmp, 8#600),
+            case file:rename(Tmp, Path) of
+                ok -> {ok, nil};
+                {error, R} -> {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
+            end;
+        {error, R} ->
+            {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
     end.

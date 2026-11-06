@@ -31,6 +31,8 @@ pub type Policy {
     root: String,
     /// `KEY=value` pairs passed into the container.
     env: List(String),
+    /// The container's global crush.json, from `provider.config`.
+    crush_config: String,
   )
 }
 
@@ -97,6 +99,7 @@ pub fn fingerprint(policy: Policy) -> String {
     int.to_string(policy.uid),
     int.to_string(policy.gid),
     policy.root,
+    policy.crush_config,
     ..policy.env
   ]
   |> string.join("\u{0}")
@@ -242,6 +245,15 @@ pub fn remove(policy: Policy, key: String) -> Result(Nil, Error) {
 @external(erlang, "crushling_ffi", "mkdir_p")
 fn mkdir_p(path: String) -> Result(Nil, String)
 
+@external(erlang, "crushling_ffi", "write_private")
+fn write_private(path: String, content: String) -> Result(Nil, String)
+
+/// Where crush in the container keeps its global data, under the
+/// `XDG_DATA_HOME` set in `run_args`.
+pub fn host_crush_data(policy: Policy, key: String) -> String {
+  host_workspace(policy, key) <> "/.home/.local/share/crush"
+}
+
 /// Create the thread's host directories as the bridge's own user. Left to
 /// docker, missing mount sources are created owned by root, and the
 /// container's uid could then not write its workspace or socket.
@@ -249,7 +261,13 @@ pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
   use _ <- result.try(
     mkdir_p(host_workspace(policy, key)) |> result.map_error(Filesystem),
   )
-  mkdir_p(host_socket_dir(policy, key)) |> result.map_error(Filesystem)
+  use _ <- result.try(
+    mkdir_p(host_socket_dir(policy, key)) |> result.map_error(Filesystem),
+  )
+  let data = host_crush_data(policy, key)
+  use _ <- result.try(mkdir_p(data) |> result.map_error(Filesystem))
+  write_private(data <> "/crush.json", policy.crush_config)
+  |> result.map_error(Filesystem)
 }
 
 @external(erlang, "crushling_ffi", "file_exists")

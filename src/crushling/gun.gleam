@@ -46,6 +46,16 @@ pub type Message {
 @external(erlang, "crushling_gun_ffi", "connect_unix")
 pub fn connect_unix(path: String, timeout_ms: Int) -> Result(Conn, String)
 
+/// Connect over TCP, with TLS verified against the system trust store when
+/// `tls` is set.
+@external(erlang, "crushling_gun_ffi", "connect_tcp")
+pub fn connect_tcp(
+  host: String,
+  port: Int,
+  tls: Bool,
+  timeout_ms: Int,
+) -> Result(Conn, String)
+
 pub fn request(
   conn: Conn,
   method: Method,

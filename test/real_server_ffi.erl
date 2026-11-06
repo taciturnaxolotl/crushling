@@ -2,8 +2,8 @@
 
 %% Run and kill a real `crush server` for the gated end-to-end test.
 
--export([enabled/0, start/3, kill/1, wait_for_file/2, sh/2, env/2, timeout/2,
-         isolated_config/4, guarded/2, kill_on_socket/1]).
+-export([enabled/0, start/4, kill/1, wait_for_file/2, sh/2, env/2, timeout/2,
+         api_key/1, claude_version/0, expand_home/1, guarded/2, kill_on_socket/1]).
 
 enabled() ->
     case os:getenv("CRUSHLING_REAL") of
@@ -20,8 +20,10 @@ env(Name, Default) ->
     end.
 
 %% Start `crush server` on Socket, logging to Log, with its global config
-%% and data in Home. Returns the OS pid.
-start(Socket, Log, Home) ->
+%% and data in Home and Extra ("K=V" strings) in its environment. Provider
+%% variables from the caller's environment are cleared so the server only
+%% sees what the test gives it. Returns the OS pid.
+start(Socket, Log, Home, Extra) ->
     Crush = case os:find_executable("crush") of
         false -> error(crush_not_on_path);
         Path -> Path
@@ -30,10 +32,13 @@ start(Socket, Log, Home) ->
                         [Crush, Socket, Log]),
     Port = open_port({spawn_executable, "/bin/sh"},
                      [{args, ["-c", lists:flatten(Cmd)]},
-                      {env, [{"CRUSH_SERVER_IDLE_TIMEOUT", "600"},
-                             {"HYPER_URL", hyper_url()},
+                      {env, [{"HYPER_URL", false}, {"HYPER_API_KEY", false},
+                             {"ANTHROPIC_API_KEY", false},
+                             {"CRUSH_SERVER_IDLE_TIMEOUT", "600"},
                              {"CRUSH_GLOBAL_CONFIG", unicode:characters_to_list([Home, "/config"])},
-                             {"CRUSH_GLOBAL_DATA", unicode:characters_to_list([Home, "/data"])}]},
+                             {"CRUSH_GLOBAL_DATA", unicode:characters_to_list([Home, "/data"])}
+                             | [list_to_tuple(string:split(unicode:characters_to_list(E), "="))
+                                || E <- Extra]]},
                       exit_status, hide]),
     {os_pid, OsPid} = erlang:port_info(Port, os_pid),
     unlink(Port),
@@ -65,48 +70,33 @@ sh(Dir, Command) ->
 timeout(Seconds, Fun) ->
     {timeout, Seconds, Fun}.
 
-%% Write a global config into Home holding only Provider, with the given
-%% large and small models. Keeps the user's MCP servers, skills and context
-%% files out of the test prompt.
-%%
-%% The provider's settings are copied from the user's real data config, but
-%% never its credentials: OAuth refresh tokens are single use, so a copy that
-%% refreshes would revoke the user's real login. The key comes from
-%% CRUSHLING_TEST_API_KEY or CRUSH_<PROVIDER>_API_KEY instead, from the
-%% environment or the project's .env.
-isolated_config(Home, Provider, Large, Small) ->
-    ProviderVar = "CRUSH_" ++ string:uppercase(unicode:characters_to_list(Provider)) ++ "_API_KEY",
-    Key = case first_set(["CRUSHLING_TEST_API_KEY", ProviderVar]) of
-        none -> error({set_one_of, ["CRUSHLING_TEST_API_KEY", ProviderVar]});
-        {ok, K} -> unicode:characters_to_binary(K)
-    end,
-    Real = filename:join([os:getenv("HOME"), ".local/share/crush"]),
-    Entry0 = case file:read_file(filename:join(Real, "crush.json")) of
-        {ok, Bin} ->
-            maps:get(Provider, maps:get(<<"providers">>, json:decode(Bin), #{}), #{});
-        {error, _} ->
-            #{}
-    end,
-    Entry = (maps:without([<<"oauth">>, <<"api_key">>], Entry0))#{<<"api_key">> => Key},
-    Pick = fun(Model) ->
-        #{<<"provider">> => Provider, <<"model">> => Model, <<"max_tokens">> => 8192}
-    end,
-    Config = #{<<"providers">> => #{Provider => Entry},
-               <<"models">> => #{<<"large">> => Pick(Large), <<"small">> => Pick(Small)}},
-    Data = filename:join(Home, "data"),
-    ok = filelib:ensure_path(filename:join(Home, "config")),
-    ok = filelib:ensure_path(Data),
-    ok = file:change_mode(Home, 8#700),
-    Path = filename:join(Data, "crush.json"),
-    ok = file:write_file(Path, json:encode(Config)),
-    ok = file:change_mode(Path, 8#600),
-    %% The provider catalog, so the server needn't fetch it.
-    Catalog = filename:join(Real, "providers.json"),
-    case filelib:is_file(Catalog) of
-        true -> {ok, _} = file:copy(Catalog, filename:join(Data, "providers.json"));
-        false -> ok
-    end,
-    nil.
+%% A key from the environment or the project's .env.
+api_key(Name) ->
+    case first_set([unicode:characters_to_list(Name)]) of
+        {ok, V} -> {ok, unicode:characters_to_binary(V)};
+        none -> {error, nil}
+    end.
+
+%% The installed Claude Code's version, or crush's floor without one.
+claude_version() ->
+    case first_set(["CRUSHLING_CLAUDE_VERSION"]) of
+        {ok, V} -> unicode:characters_to_binary(V);
+        none ->
+            case os:find_executable("claude") of
+                false -> <<"2.1.282">>;
+                Claude ->
+                    Out = os:cmd(Claude ++ " --version 2>/dev/null"),
+                    case re:run(Out, "[0-9]+\\.[0-9]+\\.[0-9]+", [{capture, first, binary}]) of
+                        {match, [V]} -> V;
+                        nomatch -> <<"2.1.282">>
+                    end
+            end
+    end.
+
+expand_home(<<"~/", Rest/binary>>) ->
+    unicode:characters_to_binary([os:getenv("HOME"), "/", Rest]);
+expand_home(Path) ->
+    Path.
 
 first_set(Names) ->
     Dotenv = dotenv(".env"),
@@ -136,14 +126,6 @@ dotenv(Path) ->
 unquote([$" | Rest]) -> string:trim(Rest, trailing, "\"");
 unquote([$' | Rest]) -> string:trim(Rest, trailing, "'");
 unquote(Value) -> Value.
-
-%% Hyper's base URL for the test server, from HYPER_URL in the environment
-%% or .env. Unset (false) leaves crush on its production default.
-hyper_url() ->
-    case first_set(["HYPER_URL"]) of
-        {ok, Url} -> Url;
-        none -> false
-    end.
 
 %% Run Body, then Cleanup even if Body fails, re-raising the failure.
 guarded(Body, Cleanup) ->
