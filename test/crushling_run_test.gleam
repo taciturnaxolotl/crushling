@@ -84,8 +84,8 @@ pub fn tools_track_status_test() {
       tool_result("c2", True),
     ])
   let assert [
-    run.Tool("c1", "bash", _, "go test ./...", run.Succeeded, "out"),
-    run.Tool("c2", "view", _, "/workspace/a.go", run.Failed, "out"),
+    run.Tool("c1", "bash", _, "go test ./...", "", run.Succeeded, "out"),
+    run.Tool("c2", "view", _, "/workspace/a.go", "", run.Failed, "out"),
   ] = r.tools
 }
 
@@ -161,12 +161,13 @@ pub fn plan_render_test() {
     ])
   let assert Some(render.Plan("Working", [one, two, three])) =
     render.plan(r, "/workspace")
+  // Successful output stays out of the card.
   let assert render.Task(
     "c1",
     "Running a command",
     render.Complete,
     "step 1",
-    "out",
+    "",
   ) = one
   let assert render.Task(status: render.InProgress, output: "", ..) = two
   // File tools don't echo their boilerplate result, and paths are relative.
@@ -201,19 +202,21 @@ pub fn plan_folds_many_steps_test() {
   let assert [render.Task("earlier", _, _, _, "11 earlier steps"), ..] = tasks
 }
 
-pub fn status_test() {
-  let tool = fn(name, summary) {
-    run.Tool("c", name, "{}", summary, run.Running, "")
-  }
-  let assert "is running `go test ./...`…" =
-    render.status(tool("bash", "go test ./..."), "/w")
-  let assert "is editing a.go…" =
-    render.status(tool("edit", "/w/src/a.go"), "/w")
-  let assert "is reading example.com…" =
-    render.status(tool("fetch", "https://example.com/x/y"), "/w")
-  let long = render.status(tool("bash", string.repeat("x", 200)), "/w")
-  let assert 50 = string.length(long)
-  let assert True = string.ends_with(long, "…`…")
+pub fn descriptions_test() {
+  let call =
+    event.ToolCall(
+      "c1",
+      "bash",
+      "{\"command\":\"go test ./...\",\"description\":\"Run the tests\"}",
+      True,
+    )
+  let r = feed([assistant("m1", "", [call])])
+  let assert [tool] = r.tools
+  let assert "Run the tests" = tool.description
+  let assert Some(render.Plan(
+    _,
+    [render.Task(title: "Run the tests", details: "", ..)],
+  )) = render.plan(r, "/w")
 }
 
 pub fn titles_test() {

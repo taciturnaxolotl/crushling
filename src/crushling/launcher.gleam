@@ -28,6 +28,8 @@ pub type Launcher {
     launch: fn(String) -> Result(Launched, String),
     /// Stop the thread's agent but keep its workspace.
     stop: fn(String) -> Nil,
+    /// Whether the thread has a workspace, so it was started before.
+    exists: fn(String) -> Bool,
   )
 }
 
@@ -61,6 +63,7 @@ pub fn docker(policy: sandbox.Policy, creds: Credentials) -> Launcher {
       let _ = sandbox.stop(policy, key)
       Nil
     },
+    exists: fn(key) { file_exists(sandbox.host_workspace(policy, key)) },
   )
 }
 
@@ -81,6 +84,9 @@ fn wait_until_serving(
   os_pid: Int,
   timeout_ms: Int,
 ) -> Result(Nil, String)
+
+@external(erlang, "crushling_ffi", "file_exists")
+fn file_exists(path: String) -> Bool
 
 @external(erlang, "crushling_ffi", "mkdir_p")
 fn mkdir_p(path: String) -> Result(Nil, String)
@@ -129,5 +135,6 @@ pub fn local(
       unwatch(creds, config(key))
       stop_server(socket(key))
     },
+    exists: fn(key) { file_exists(dir(key) <> "/work") },
   )
 }

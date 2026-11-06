@@ -7,6 +7,7 @@ import gleam/erlang/process
 import gleam/json
 import gleam/set
 import slackline
+import slackline/app
 import slackline/event
 
 pub fn prompt_text_test() {
@@ -114,6 +115,7 @@ fn start_registry(launches: process.Subject(Launch)) {
         Error("no agents in this test")
       },
       stop: fn(key) { process.send(launches, Stopped(key)) },
+      exists: fn(key) { key == registry.key("C9", "1.0") },
     )
   let assert Ok(r) =
     registry.start(registry.Config(
@@ -160,4 +162,42 @@ pub fn registry_routing_test() {
   let assert Ok(Launched(_)) = process.receive(launches, 1000)
   let assert Error(Nil) = process.receive(launches, 100)
   Nil
+}
+
+pub fn replies_resume_threads_from_before_a_restart_test() {
+  let launches = process.new_subject()
+  let r = start_registry(launches)
+  // C9's thread has a workspace on disk, but this registry never saw it.
+  process.send(
+    r,
+    registry.Received(registry.Incoming("C9", "1.0", "5.0", "U1", "more", False)),
+  )
+  let assert Ok(Launched(key)) = process.receive(launches, 1000)
+  let assert True = key == registry.key("C9", "1.0")
+  // A reply in a thread with no workspace is still ignored.
+  process.send(
+    r,
+    registry.Received(registry.Incoming("C8", "1.0", "5.0", "U1", "more", False)),
+  )
+  let assert Error(Nil) = process.receive(launches, 100)
+  Nil
+}
+
+pub fn shutdown_with_nothing_running_stops_at_once_test() {
+  let launches = process.new_subject()
+  let r = start_registry(launches)
+  let done = process.new_subject()
+  process.send(r, registry.Shutdown(60_000, done))
+  let assert Ok(Nil) = process.receive(done, 1000)
+}
+
+pub fn native_stop_reaches_the_registry_test() {
+  let registry = process.new_subject()
+  let router = socket.router(registry, "UBOT")
+  let frame =
+    "{\"envelope_id\":\"e2\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev1\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"C1\",\"user\":\"U1\",\"thread_ts\":\"10.1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
+  let assert app.Send(after:, ..) = app.handle_socket(router, frame)
+  after()
+  let assert Ok(registry.StopRequested("C1", "10.1", "U1")) =
+    process.receive(registry, 1000)
 }

@@ -14,6 +14,7 @@ import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/set.{type Set}
@@ -50,6 +51,8 @@ pub type Incoming {
 
 pub type Message {
   Received(Incoming)
+  /// Someone pressed Slack's stop control on the thread's session.
+  StopRequested(channel: String, thread_ts: String, user: String)
   Started(
     key: String,
     generation: Int,
@@ -58,6 +61,13 @@ pub type Message {
     result: Result(Subject(thread.Message), String),
   )
   RunFinished(key: String)
+  /// Stop taking messages, let running turns finish for up to `grace_ms`,
+  /// cancel what is left, stop every agent, then reply.
+  Shutdown(grace_ms: Int, reply: Subject(Nil))
+  /// The grace period is over.
+  ShutdownDeadline
+  /// Cancelled turns have had their chance to wind down.
+  ShutdownFinal
   IdleCheck(key: String, generation: Int)
   ThreadDown(process.Down)
 }
@@ -88,8 +98,16 @@ type State {
     /// Recently handled message ids, so a redelivery is not run twice.
     seen: List(String),
     generation: Int,
+    /// Set once shutdown begins: who to tell when it is done.
+    stopping: Option(Subject(Nil)),
   )
 }
+
+/// After cancelling, how long turns get to post their closing note.
+const cancel_wait_ms = 10_000
+
+const restart_note =
+  "crushling restarted, so this run was stopped. Send a follow-up to carry on."
 
 const seen_limit = 1000
 
@@ -105,7 +123,14 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       process.new_selector()
       |> process.select(self)
       |> process.select_monitors(ThreadDown)
-    State(config:, self:, threads: dict.new(), seen: [], generation: 0)
+    State(
+      config:,
+      self:,
+      threads: dict.new(),
+      seen: [],
+      generation: 0,
+      stopping: None,
+    )
     |> actor.initialised
     |> actor.selecting(selector)
     |> actor.returning(self)
@@ -122,10 +147,47 @@ pub fn key(channel: String, thread_ts: String) -> String {
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
-    Received(incoming) -> actor.continue(received(state, incoming))
+    Received(incoming) ->
+      case state.stopping {
+        // Draining: a new message would start work that is about to be
+        // cut off. It is redelivered as context the next time.
+        Some(_) -> actor.continue(state)
+        None -> actor.continue(received(state, incoming))
+      }
     Started(key, generation, first, result) ->
       actor.continue(started(state, key, generation, first, result))
-    RunFinished(key) -> actor.continue(run_finished(state, key))
+    StopRequested(channel, thread_ts, user) ->
+      actor.continue(stop_requested(state, channel, thread_ts, user))
+    RunFinished(key) -> {
+      let state = run_finished(state, key)
+      case state.stopping, busy(state) {
+        Some(_), False -> finish_shutdown(state)
+        _, _ -> actor.continue(state)
+      }
+    }
+    Shutdown(grace_ms, reply) -> {
+      let state = State(..state, stopping: Some(reply))
+      case busy(state) {
+        False -> finish_shutdown(state)
+        True -> {
+          info("crushling: shutting down; waiting for running turns")
+          process.send_after(state.self, grace_ms, ShutdownDeadline)
+          actor.continue(state)
+        }
+      }
+    }
+    ShutdownDeadline -> {
+      dict.each(state.threads, fn(_, entry) {
+        case entry {
+          Live(thread:, in_flight:, ..) if in_flight > 0 ->
+            process.send(thread, thread.CancelFor(restart_note))
+          _ -> Nil
+        }
+      })
+      process.send_after(state.self, cancel_wait_ms, ShutdownFinal)
+      actor.continue(state)
+    }
+    ShutdownFinal -> finish_shutdown(state)
     IdleCheck(key, generation) ->
       actor.continue(idle_check(state, key, generation))
     ThreadDown(down) -> actor.continue(thread_down(state, down))
@@ -138,21 +200,26 @@ fn received(state: State, incoming: Incoming) -> State {
   let key = key(incoming.channel, incoming.thread_ts)
   let prompt = slack.prompt_text(incoming.text, config.bot_user)
   let known = dict.get(state.threads, key)
+  // A thread the bot is in, even one asleep or from before a restart: its
+  // workspace is still on disk.
+  let joined = case known {
+    Ok(_) -> True
+    Error(Nil) -> incoming.mention || config.launcher.exists(key)
+  }
   case
     list.contains(state.seen, id),
     set.contains(config.allowed, incoming.user),
-    known,
-    incoming.mention
+    joined
   {
-    True, _, _, _ -> state
-    // Plain replies only matter in threads the bot is already in.
-    _, _, Error(Nil), False -> state
-    False, False, _, _ -> {
+    True, _, _ -> state
+    // Plain replies only matter in threads the bot is in.
+    _, _, False -> state
+    False, False, _ -> {
       warn("crushling: ignoring " <> incoming.user <> ", not on the allowlist")
       remember(state, id)
     }
-    False, True, _, _ if prompt == "" -> remember(state, id)
-    False, True, _, _ ->
+    False, True, _ if prompt == "" -> remember(state, id)
+    False, True, _ ->
       case slack.command(prompt), known {
         slack.SideComment, _ -> remember(state, id)
         slack.HelpCommand, _ -> {
@@ -170,7 +237,6 @@ fn received(state: State, incoming: Incoming) -> State {
         }
         slack.StopCommand, Ok(Live(thread:, in_flight:, ..)) if in_flight > 0 -> {
           process.send(thread, thread.Cancel)
-          react(config, incoming, "octagonal_sign")
           remember(state, id)
         }
         slack.StopCommand, _ -> {
@@ -186,36 +252,16 @@ fn received(state: State, incoming: Incoming) -> State {
           })
           remember(state, id)
         }
-        slack.NotACommand, Ok(entry) -> {
-          // Seen; it runs after the current turn, as gorkie marks it.
-          let busy = case entry {
-            Live(in_flight:, ..) -> in_flight > 0
-            Starting(..) -> True
-          }
-          react(config, incoming, case busy {
-            True -> "white_check_mark"
-            False -> "eyes"
-          })
+        slack.NotACommand, Ok(entry) ->
           remember(deliver(state, key, entry, prompt), id)
-        }
-        slack.NotACommand, Error(Nil) -> {
-          react(config, incoming, "eyes")
+        slack.NotACommand, Error(Nil) ->
           remember(launch(state, key, incoming, prompt), id)
-        }
       }
   }
 }
 
 fn remember(state: State, id: String) -> State {
   State(..state, seen: list.take([id, ..state.seen], seen_limit))
-}
-
-fn react(config: Config, incoming: Incoming, name: String) -> Nil {
-  let client = config.client
-  process.spawn_unlinked(fn() {
-    slack.react(client, incoming.channel, incoming.ts, name)
-  })
-  Nil
 }
 
 fn deliver(state: State, key: String, entry: Entry, prompt: String) -> State {
@@ -336,6 +382,90 @@ fn started(
     }
     _, Error(_) -> state
   }
+}
+
+fn stop_requested(
+  state: State,
+  channel: String,
+  thread_ts: String,
+  user: String,
+) -> State {
+  let config = state.config
+  case
+    set.contains(config.allowed, user),
+    dict.get(state.threads, key(channel, thread_ts))
+  {
+    True, Ok(Live(thread:, in_flight:, ..)) if in_flight > 0 ->
+      process.send(thread, thread.Cancel)
+    False, _ -> {
+      let client = config.client
+      process.spawn_unlinked(fn() {
+        slack.whisper(
+          client,
+          channel,
+          thread_ts,
+          user,
+          "_only the people this agent works for can stop it._",
+        )
+      })
+      Nil
+    }
+    // Nothing running here, so the session shouldn't say it is.
+    True, _ -> {
+      let client = config.client
+      process.spawn_unlinked(fn() {
+        slack.session_done(client, channel, thread_ts)
+      })
+      Nil
+    }
+  }
+  state
+}
+
+fn busy(state: State) -> Bool {
+  dict.values(state.threads)
+  |> list.any(fn(entry) {
+    case entry {
+      Live(in_flight:, ..) -> in_flight > 0
+      Starting(..) -> False
+    }
+  })
+}
+
+/// Stop every thread and its agent, then let the caller know.
+fn finish_shutdown(state: State) -> actor.Next(State, Message) {
+  let stop = state.config.launcher.stop
+  let stoppers =
+    dict.to_list(state.threads)
+    |> list.map(fn(pair) {
+      let #(key, entry) = pair
+      case entry {
+        Live(thread:, monitor:, ..) -> {
+          process.demonitor_process(monitor)
+          process.send(thread, thread.Stop)
+        }
+        Starting(..) -> Nil
+      }
+      let done = process.new_subject()
+      process.spawn_unlinked(fn() {
+        stop(key)
+        process.send(done, Nil)
+      })
+      done
+    })
+  // Agents stop in parallel; each waits for its own process to exit.
+  list.each(stoppers, fn(done) {
+    let _ = process.receive(done, 30_000)
+    Nil
+  })
+  info(
+    "crushling: stopped " <> int.to_string(list.length(stoppers)) <> " agents",
+  )
+  case state.stopping {
+    Some(reply) -> process.send(reply, Nil)
+    None -> Nil
+  }
+  actor.stop()
 }
 
 fn run_finished(state: State, key: String) -> State {
