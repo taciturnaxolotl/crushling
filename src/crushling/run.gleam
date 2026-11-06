@@ -82,7 +82,9 @@ pub fn apply(run: Run, known: Known, event: Event) -> Run {
       apply_message(run, message)
     event.FileEvent(file) if file.session_id == run.session_id ->
       apply_file(run, known, file)
-    event.RunCompleteEvent(done) if done.run_id == run.run_id -> {
+    event.RunCompleteEvent(done)
+      if done.run_id == run.run_id && done.session_id == run.session_id
+    -> {
       let outcome = case done.cancelled, done.error {
         True, _ -> Cancelled
         False, "" -> Completed(done.text)

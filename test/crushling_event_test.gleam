@@ -12,6 +12,7 @@ pub fn assistant_message_test() {
       text: "Hello world",
       tool_calls: [event.ToolCall("c1", "bash", "{\"command\":\"ls\"}", True)],
       tool_results: [],
+      reports: [],
     ),
   )) = event.parse(frame)
 }
@@ -83,4 +84,16 @@ pub fn unknown_kind_test() {
 pub fn null_op_test() {
   let frame = "{\"type\":\"client_session\",\"payload\":{\"type\":null}}"
   let assert Ok(event.Other("client_session")) = event.parse(frame)
+}
+
+pub fn sub_agent_report_test() {
+  let frame =
+    "{\"type\":\"message\",\"payload\":{\"type\":\"created\",\"payload\":{\"id\":\"m9\",\"role\":\"user\",\"session_id\":\"s1\",\"parts\":[{\"type\":\"sub_agent_report\",\"data\":{\"label\":\"madeline-api\",\"output\":\"found it\",\"failed\":false,\"model\":\"x\"}}]}}}"
+  let assert Ok(event.MessageEvent(
+    message: event.Message(
+      reports: [event.SubReport("madeline-api", "found it", False)],
+      ..,
+    ),
+    ..,
+  )) = event.parse(frame)
 }

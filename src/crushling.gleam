@@ -118,6 +118,7 @@ fn start() -> Result(Nil, String) {
     registry.start(registry.Config(
       launcher:,
       client:,
+      token: bot_token,
       bot_user: me.user_id,
       allowed:,
       idle_ms: idle_minutes * 60_000,

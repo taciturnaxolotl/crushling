@@ -11,16 +11,22 @@ import gleam/string
 fn assistant(id: String, text: String, calls: List(event.ToolCall)) {
   event.MessageEvent(
     "updated",
-    event.Message(id, "s1", event.Assistant, text, calls, []),
+    event.Message(id, "s1", event.Assistant, text, calls, [], []),
   )
 }
 
 fn tool_result(call_id: String, is_error: Bool) {
   event.MessageEvent(
     "created",
-    event.Message("t" <> call_id, "s1", event.Tool, "", [], [
-      event.ToolResult(call_id, "bash", "out", is_error),
-    ]),
+    event.Message(
+      "t" <> call_id,
+      "s1",
+      event.Tool,
+      "",
+      [],
+      [event.ToolResult(call_id, "bash", "out", is_error)],
+      [],
+    ),
   )
 }
 
@@ -62,7 +68,7 @@ pub fn other_sessions_and_runs_ignored_test() {
   let foreign =
     event.MessageEvent(
       "updated",
-      event.Message("x", "s2", event.Assistant, "nope", [], []),
+      event.Message("x", "s2", event.Assistant, "nope", [], [], []),
     )
   let other_run =
     event.RunCompleteEvent(event.RunComplete("s1", "r0", "m", "", "", False))
@@ -238,9 +244,11 @@ pub fn answer_and_note_test() {
     render.note(feed([done("", "", False)]), False)
   let assert None = render.note(feed([done("hi", "", False)]), True)
   let assert Some("_stopped._") = render.note(feed([done("", "", True)]), True)
-  let assert Some("_the run failed: rate_limited_") =
-    render.note(feed([done("", "rate_limited", False)]), False)
-    |> option.map(string.replace(_, "\\_", "_"))
+  let assert Some(limited) =
+    render.note(feed([done("", "429 rate_limit_error", False)]), False)
+  let assert True =
+    string.starts_with(limited, "_The model provider is rate limiting us.")
+  let assert True = string.ends_with(limited, "> `429 rate_limit_error`")
   let partial =
     render.note(
       feed([assistant("m", "half", []), done("", "boom", False)]),
@@ -287,4 +295,25 @@ pub fn chunk_keeps_fences_balanced_test() {
     let assert 0 = fences % 2
     let assert True = string.length(c) <= 120
   })
+}
+
+pub fn explain_test() {
+  let cause = fn(reason) { render.explain(reason).0 }
+  let assert "The conversation got too long for the model" =
+    cause(
+      "bad request: 400 {\"message\":\"prompt is too long: 241668 tokens > 200000 maximum\"}",
+    )
+  let assert "The model provider rejected crushling's login" =
+    cause("unauthorized: authentication failed")
+  let assert "The model provider is rate limiting us" =
+    cause("429 Too Many Requests: rate_limit_error")
+  let assert "The model provider is having trouble" =
+    cause("529 overloaded_error")
+  let assert "The model provider refused the request" =
+    cause(
+      "bad request: 400 max_tokens: 128000 > 64000, which is the maximum allowed",
+    )
+  let assert "Lost touch with the agent partway through" =
+    cause("lost the connection mid-run")
+  let assert "Something went wrong" = cause("boom")
 }

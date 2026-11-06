@@ -23,6 +23,7 @@ oauth_config:
       - groups:history
       - im:history
       - chat:write
+      - files:read
       - files:write
   pkce_enabled: false
 settings:

@@ -19,6 +19,7 @@ import crushling/run.{type Run}
 import crushling/snapshot
 import gleam/dict
 import gleam/erlang/process.{type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
@@ -43,11 +44,18 @@ pub type Sink {
     upload: fn(String, String) -> Result(Nil, String),
     /// Called once per run after its reply is posted.
     finished: fn(Finished) -> Nil,
+    /// Start a new top-level thread with `intro` as its first message and
+    /// `title` as its session's name, for a subagent to work in. Returns a
+    /// sink for that thread and a link to it.
+    branch: fn(String, String) -> Result(#(Sink, String), String),
   )
 }
 
 pub type Finished {
   Finished(
+    /// Whether this was a prompt the bridge sent, rather than a turn crush
+    /// started by itself to read a subagent's report.
+    solicited: Bool,
     run_id: String,
     outcome: run.Outcome,
     /// The reply as posted, joined across messages.
@@ -83,6 +91,9 @@ pub type Message {
   Flush
   /// Periodic check that the active run is still making progress.
   Watchdog
+  /// Whether anything is going on: a run, a queued prompt, or a subagent
+  /// still working.
+  Busy(reply: Subject(Bool))
   Reconnect
   Gun(gun.Message)
 }
@@ -103,6 +114,28 @@ type Active {
     stalled: Bool,
     /// Said in place of "stopped" when the run was cancelled for a reason.
     cancel_note: Option(String),
+    /// False for a turn crush started on its own to read a subagent report.
+    solicited: Bool,
+  )
+}
+
+/// A subagent, shown in a Slack thread of its own.
+type Sub {
+  Sub(
+    /// The tool call that started it, its key in `subs`.
+    key: String,
+    /// The name crush gave a dispatched one, like "madeline-crush-server-api".
+    label: String,
+    /// What crush titled its session.
+    title: String,
+    run: Run,
+    /// Its thread, once opened, and the link to it.
+    sink: Option(Sink),
+    link: String,
+    plan_ts: Option(String),
+    shown: Option(render.Plan),
+    /// Set when its report arrives.
+    done: Bool,
   )
 }
 
@@ -132,6 +165,8 @@ type State {
     active: Option(Active),
     known: run.Known,
     flushing: Bool,
+    /// Subagents the agent dispatched, by their session id.
+    subs: dict.Dict(String, Sub),
     retries: Int,
     /// Whether the Slack session has its title: set for a session crushling
     /// created, and for one found in place after a restart.
@@ -194,6 +229,7 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       active: None,
       known: dict.new(),
       flushing: False,
+      subs: dict.new(),
       retries: 0,
       titled: False,
     )
@@ -218,6 +254,10 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     CancelFor(note) -> actor.continue(cancel(state, Some(note)))
     Flush -> actor.continue(flush(State(..state, flushing: False)))
     Watchdog -> actor.continue(watchdog(state))
+    Busy(reply) -> {
+      process.send(reply, is_busy(state))
+      actor.continue(state)
+    }
     Gun(message) -> actor.continue(on_gun(state, message))
     Stop -> {
       shutdown(state)
@@ -315,7 +355,7 @@ fn establish(state: State) -> Result(#(Conns, Ready), String) {
     gun.stream(events, client.events_path(workspace_id, state.client_id), [])
   let conns = Conns(requests:, events:, stream:)
   let setup = {
-    use _ <- result.try(call(conns, client.init_agent(workspace_id, False)))
+    use _ <- result.try(call(conns, client.init_agent(workspace_id, True)))
     use _ <- result.try(wait_ready(conns, workspace_id, ready_attempts))
     case state.session_id {
       Some(id) -> Ok(#(id, True))
@@ -425,6 +465,7 @@ fn send_prompt(
           last_event_ms: now,
           stalled: False,
           cancel_note: None,
+          solicited: True,
         )
       State(..state, active: Some(active))
     }
@@ -519,29 +560,327 @@ fn reconnect_soon(state: State) -> State {
 }
 
 fn on_event(state: State, event: event.Event) -> State {
-  case state.active {
+  let state = state |> track_subs(event) |> adopt_report_turn(event)
+  let state = case state.active {
     None -> state
     Some(active) -> {
       let run = run.apply(active.run, state.known, event)
       let active = Active(..active, run:, last_event_ms: now_ms())
-      let state = finish_if_done(State(..state, active: Some(active)))
-      case state.active, state.flushing {
-        None, _ | _, True -> state
-        Some(_), False -> {
-          process.send_after(state.self, state.config.flush_ms, Flush)
-          State(..state, flushing: True)
-        }
-      }
+      finish_if_done(State(..state, active: Some(active)))
+    }
+  }
+  case state.active != None || has_running_subs(state), state.flushing {
+    False, _ | _, True -> state
+    True, False -> {
+      process.send_after(state.self, state.config.flush_ms, Flush)
+      State(..state, flushing: True)
     }
   }
 }
 
+fn is_busy(state: State) -> Bool {
+  state.active != None || state.waiting != [] || has_running_subs(state)
+}
+
+fn has_running_subs(state: State) -> Bool {
+  dict.values(state.subs) |> list.any(fn(sub) { !sub.done })
+}
+
+fn session_id(state: State) -> String {
+  option.unwrap(state.session_id, "")
+}
+
+/// Crush wakes the parent with a turn of its own when a subagent reports
+/// and nothing is running. That turn carries no run id of ours, so adopt it
+/// as an unsolicited run when its report message appears.
+fn adopt_report_turn(state: State, event: event.Event) -> State {
+  let parent = session_id(state)
+  case state.active, event {
+    None, event.MessageEvent(op: "created", message:)
+      if message.session_id == parent && message.reports != []
+    -> {
+      state.config.sink.working(True)
+      process.send_after(state.self, watchdog_ms, Watchdog)
+      let now = now_ms()
+      let active =
+        Active(
+          run: run.new(message.session_id, ""),
+          plan_ts: None,
+          shown: None,
+          base: None,
+          working_since_ms: now,
+          last_event_ms: now,
+          stalled: False,
+          cancel_note: None,
+          solicited: False,
+        )
+      State(..state, active: Some(active))
+    }
+    _, _ -> state
+  }
+}
+
+/// The label crush gave a dispatched subagent, from the tool's result:
+/// `Started subagent "madeline-crush-server-api". …`
+fn started_label(content: String) -> Result(String, Nil) {
+  case string.split_once(content, "Started subagent \"") {
+    Ok(#(_, rest)) ->
+      case string.split_once(rest, "\"") {
+        Ok(#(label, _)) -> Ok(label)
+        Error(Nil) -> Error(Nil)
+      }
+    Error(Nil) -> Error(Nil)
+  }
+}
+
+/// Follow subagents. Each runs in a child session, `<message id>$$<tool
+/// call id>`, whether started with `agent` (the parent waits) or
+/// `agent_dispatch` (it reports back later). Session events give it a
+/// title, a dispatch result gives it a name, its own messages are its
+/// progress, and its own run_complete finishes it.
+fn track_subs(state: State, event: event.Event) -> State {
+  let parent = session_id(state)
+  case event {
+    event.SessionEvent(id:, parent_session_id:, title:)
+      if parent_session_id == parent && parent != ""
+    ->
+      case call_id(id) {
+        Ok(call) ->
+          upsert_sub(state, call, id, fn(sub) {
+            case title {
+              "" | "New Agent Session" -> sub
+              title -> Sub(..sub, title:)
+            }
+          })
+        Error(Nil) -> state
+      }
+    event.MessageEvent(message:, ..) if message.session_id == parent ->
+      list.fold(message.tool_results, state, fn(state, result) {
+        case result.name, started_label(result.content) {
+          "agent_dispatch", Ok(label) ->
+            case dict.get(state.subs, result.tool_call_id) {
+              Ok(sub) ->
+                State(
+                  ..state,
+                  subs: dict.insert(
+                    state.subs,
+                    result.tool_call_id,
+                    Sub(..sub, label:),
+                  ),
+                )
+              Error(Nil) -> state
+            }
+          _, _ -> state
+        }
+      })
+    event.MessageEvent(message: event.Message(session_id: child, ..), ..)
+    | event.FileEvent(event.FileVersion(session_id: child, ..)) ->
+      case dict.get(state.subs, call_id(child) |> result.unwrap("")) {
+        Ok(sub) -> {
+          let sub = Sub(..sub, run: run.apply(sub.run, state.known, event))
+          State(..state, subs: dict.insert(state.subs, sub.key, sub))
+        }
+        Error(Nil) -> state
+      }
+    event.RunCompleteEvent(done) ->
+      case dict.get(state.subs, call_id(done.session_id) |> result.unwrap("")) {
+        Ok(sub) if !sub.done -> {
+          let sub = Sub(..sub, run: run.apply(sub.run, state.known, event))
+          let sub = case run.is_done(sub.run) {
+            True -> finish_sub(state.config, Sub(..sub, done: True))
+            False -> sub
+          }
+          State(..state, subs: dict.insert(state.subs, sub.key, sub))
+        }
+        _ -> state
+      }
+    _ -> state
+  }
+}
+
+fn call_id(session_id: String) -> Result(String, Nil) {
+  case string.split_once(session_id, "$$") {
+    Ok(#(_, call)) -> Ok(call)
+    Error(Nil) -> Error(Nil)
+  }
+}
+
+fn upsert_sub(
+  state: State,
+  call: String,
+  session_id: String,
+  update: fn(Sub) -> Sub,
+) -> State {
+  let sub = case dict.get(state.subs, call) {
+    Ok(sub) -> sub
+    Error(Nil) ->
+      Sub(
+        key: call,
+        label: "",
+        title: "",
+        run: run.new(session_id, ""),
+        sink: None,
+        link: "",
+        plan_ts: None,
+        shown: None,
+        done: False,
+      )
+  }
+  State(..state, subs: dict.insert(state.subs, call, update(sub)))
+}
+
+fn finish_sub(config: Config, sub: Sub) -> Sub {
+  let sub = show_sub(config, sub)
+  report_back(config, sub)
+  sub
+}
+
+const names = [
+  "Ada", "Grace", "Alan", "Edsger", "Barbara", "Margaret", "Linus", "Radia",
+  "Ken", "Dennis", "Frances", "Donald", "Leslie", "Hedy", "Niklaus", "Katherine",
+]
+
+/// What to call a subagent: the first name crush gave a dispatched one
+/// ("madeline-crush-server-api" is Madeline), otherwise one picked from its
+/// call id so it stays the same. And what it is working on.
+fn sub_name(sub: Sub) -> #(String, String) {
+  let scope = case sub.title {
+    "" -> "a task"
+    title -> title
+  }
+  case string.split_once(sub.label, "-") {
+    Ok(#(first, rest)) -> #(string.capitalise(first), case sub.title {
+      "" -> rest
+      title -> title
+    })
+    Error(Nil) -> {
+      let hash =
+        string.to_utf_codepoints(sub.key)
+        |> list.fold(0, fn(acc, cp) {
+          acc * 31 + string.utf_codepoint_to_int(cp)
+        })
+      let index = int.absolute_value(hash) % list.length(names)
+      let name = list.drop(names, index) |> list.first |> result.unwrap("Ada")
+      #(name, scope)
+    }
+  }
+}
+
+/// Open the subagent's thread if needed, keep its plan card current, and
+/// once it is done post what it found.
+fn show_sub(config: Config, sub: Sub) -> Sub {
+  // A thread opens once there is a step to show; a subagent that answers
+  // without any tools reports back without one.
+  let sub = case sub.sink, render.plan(sub.run, config.root) {
+    None, Some(_) -> {
+      let #(name, scope) = sub_name(sub)
+      case
+        config.sink.branch(
+          "*" <> name <> "* is working on _" <> scope <> "_",
+          name <> ": " <> scope,
+        )
+      {
+        Ok(#(branch, link)) -> {
+          branch.working(True)
+          Sub(..sub, sink: Some(branch), link:)
+        }
+        Error(reason) -> {
+          warn("crushling: couldn't open a subagent thread: " <> reason)
+          sub
+        }
+      }
+    }
+    _, _ -> sub
+  }
+  case sub.sink, render.plan(sub.run, config.root) {
+    Some(branch), Some(plan) if Some(plan) != sub.shown ->
+      case sub.plan_ts {
+        Some(ts) ->
+          case branch.update_plan(ts, plan) {
+            Ok(Nil) -> Sub(..sub, shown: Some(plan))
+            Error(_) -> sub
+          }
+        None ->
+          case branch.post_plan(plan) {
+            Ok(ts) -> Sub(..sub, plan_ts: Some(ts), shown: Some(plan))
+            Error(_) -> sub
+          }
+      }
+    _, _ -> sub
+  }
+}
+
+/// Post the subagent's answer in its own thread, and a short note with a
+/// link in the main one.
+fn report_back(config: Config, sub: Sub) -> Nil {
+  let #(name, scope) = sub_name(sub)
+  let #(failed, output) = case sub.run.outcome {
+    Some(run.Errored(error)) -> #(True, error)
+    Some(run.Cancelled) -> #(True, "stopped")
+    _ -> #(False, render.answer(sub.run) |> string.join("\n\n"))
+  }
+  case sub.sink {
+    Some(branch) -> {
+      list.each(render.chunk(output, render.message_limit), fn(chunk) {
+        let _ = branch.post(chunk)
+        Nil
+      })
+      branch.working(False)
+    }
+    None -> Nil
+  }
+  let verb = case failed {
+    True -> "ran into trouble with"
+    False -> "finished"
+  }
+  let where = case sub.link {
+    "" -> ""
+    link -> " · <" <> link <> "|see its thread>"
+  }
+  let summary =
+    string.split(string.trim(output), "\n")
+    |> list.filter(fn(line) { string.trim(line) != "" })
+    |> list.take(3)
+    |> list.map(fn(line) { "> " <> line })
+    |> string.join("\n")
+  let _ =
+    config.sink.post(
+      "*"
+      <> name
+      <> "* "
+      <> verb
+      <> " _"
+      <> scope
+      <> "_"
+      <> where
+      <> "\n"
+      <> summary,
+    )
+  Nil
+}
+
 /// Re-render the in-progress run if it changed since it was last shown.
 fn flush(state: State) -> State {
-  case state.active {
+  let subs =
+    dict.map_values(state.subs, fn(_, sub) {
+      case sub.done {
+        True -> sub
+        False -> show_sub(state.config, sub)
+      }
+    })
+  let state = State(..state, subs:)
+  let state = case state.active {
     Some(active) ->
       State(..state, active: Some(show_progress(state.config, active)))
     None -> state
+  }
+  // Keep flushing while subagents work after the main run has ended.
+  case state.active == None && has_running_subs(state) {
+    True -> {
+      process.send_after(state.self, state.config.flush_ms * 2, Flush)
+      State(..state, flushing: True)
+    }
+    False -> state
   }
 }
 
@@ -725,6 +1064,7 @@ fn finish(state: State, active: Active) -> Nil {
       }
   }
   sink.finished(Finished(
+    solicited: active.solicited,
     run_id: active.run.run_id,
     outcome: option.unwrap(active.run.outcome, run.Cancelled),
     text: string.join(messages, "\n"),

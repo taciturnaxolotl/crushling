@@ -127,6 +127,7 @@ pub fn run_args(policy: Policy, key: String) -> List(String) {
     ["--env", "HOME=" <> workspace <> "/.home"],
     ["--env", "XDG_DATA_HOME=" <> workspace <> "/.home/.local/share"],
     ["--env", "XDG_CACHE_HOME=" <> workspace <> "/.home/.cache"],
+    ["--env", "HONCHO_CONFIG_DIR=" <> workspace <> "/.home/.honcho"],
     // The bridge owns the lifecycle; the server must not exit on its own
     // while a thread is quiet.
     ["--env", "CRUSH_SERVER_IDLE_TIMEOUT=31536000"],
