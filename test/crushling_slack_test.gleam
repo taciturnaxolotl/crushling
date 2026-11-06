@@ -31,6 +31,8 @@ pub fn command_test() {
   let assert slack.StopCommand = slack.command("!stop")
   let assert slack.StopCommand = slack.command("Cancel")
   let assert slack.HelpCommand = slack.command(" !help ")
+  let assert slack.PauseCommand = slack.command("!pause")
+  let assert slack.ResumeCommand = slack.command("!Resume")
   let assert slack.SideComment = slack.command("## not for the bot")
   let assert slack.NotACommand = slack.command("stop the server")
 }
@@ -328,9 +330,111 @@ pub fn repo_helpers_test() {
     snapshot.web_url("git@github.com:owner/repo.git")
   let assert "https://github.com/owner/repo" =
     snapshot.web_url("https://github.com/owner/repo.git")
+  let assert "https://github.com/owner/repo" =
+    snapshot.web_url("ssh://git@github.com/owner/repo.git")
+  // tangled: the owner is a DID and the knot serves no page there.
+  let tangled = "git@knot.dunkirk.sh:did:plc:krxbvxvis5skq7jj6eot23ul/crushling"
+  let assert "crushling" = snapshot.repo_name(tangled)
+  let assert "" = snapshot.web_url(tangled)
+  let assert "source" = snapshot.repo_name("/tmp/x/source")
   let assert snapshot.RepoInfo(
     url: "https://github.com/owner/repo",
     branch: "fix",
     base: "main",
   ) = snapshot.parse_repo_info("https://github.com/owner/repo\nfix\nmain\n")
+}
+
+pub fn pause_and_resume_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let path =
+    "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json"
+  let assert Ok(Nil) = meta.write(path, meta.new(True))
+  let r = start_registry(launches)
+  let say = fn(ts, text, mention) {
+    registry.Received(
+      registry.Incoming("C9", "1.0", ts, "U1", text, mention, []),
+    )
+  }
+  // Pausing a thread that is asleep only changes what it listens to.
+  process.send(r, say("2.0", "!pause", False))
+  process.sleep(50)
+  let assert Error(Nil) = process.receive(launches, 50)
+  let assert Ok(meta.Meta(paused: True, ..)) = meta.read(path)
+  // Paused, a plain reply is chatter...
+  process.send(r, say("3.0", "keep going", False))
+  let assert Error(Nil) = process.receive(launches, 100)
+  // ...but a mention still reaches the agent.
+  process.send(r, say("4.0", "<@UBOT> one thing", True))
+  let assert Ok(Launched(_)) = process.receive(launches, 1000)
+  // `!resume` needs no mention.
+  process.send(r, say("5.0", "!resume", False))
+  process.sleep(50)
+  let assert Ok(meta.Meta(paused: False, follow: True, ..)) = meta.read(path)
+  process.send(r, say("6.0", "carry on", False))
+  let assert Ok(Launched(_)) = process.receive(launches, 1000)
+  Nil
+}
+
+pub fn paused_code_channels_need_a_mention_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/"
+        <> registry.key("CPAUSE", "code")
+        <> ".json",
+      meta.Meta(..meta.new(True), origin_channel: "C7", origin_ts: "1.0"),
+    )
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/" <> registry.key("C7", "1.0") <> ".json",
+      meta.Meta(..meta.new(True), paused: True, code_channel: "CPAUSE"),
+    )
+  let r = start_registry(launches)
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("CPAUSE", "9.0", "9.0", "U1", "hey", False, []),
+    ),
+  )
+  let assert Error(Nil) = process.receive(launches, 100)
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("CPAUSE", "9.1", "9.1", "U1", "<@UBOT> hey", True, []),
+    ),
+  )
+  let assert Ok(Launched(_)) = process.receive(launches, 1000)
+  Nil
+}
+
+pub fn the_seeded_request_is_not_run_twice_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  // CSEED was opened at 100.0 for C9's thread.
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/"
+        <> registry.key("CSEED", "code")
+        <> ".json",
+      meta.Meta(
+        ..meta.new(True),
+        cursor: "100.0",
+        origin_channel: "C9",
+        origin_ts: "1.0",
+      ),
+    )
+  let r = start_registry(launches)
+  let say = fn(ts, text, mention) {
+    registry.Received(
+      registry.Incoming("CSEED", ts, ts, "U1", text, mention, []),
+    )
+  }
+  // Slack's copy of the request, mention and all.
+  process.send(r, say("100.5", "<@UBOT> fix it", True))
+  let assert Error(Nil) = process.receive(launches, 100)
+  process.send(r, say("130.0", "and the tests", False))
+  let assert Ok(Launched(key)) = process.receive(launches, 1000)
+  let assert True = key == registry.key("C9", "1.0")
 }

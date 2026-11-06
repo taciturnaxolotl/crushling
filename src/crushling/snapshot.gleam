@@ -141,50 +141,71 @@ pub fn repo_numstat(dir: String) -> String {
   against_base(dir, "--numstat")
 }
 
-/// "owner/repo" from a clone URL, for titles and the context bar.
-pub fn repo_name(url: String) -> String {
-  let path = case string.split_once(url, "://") {
+/// The host and path of a clone URL, without a trailing `.git`: from
+/// `https://host/path`, `ssh://git@host/path`, `git@host:path`, or a local
+/// path (host "").
+fn host_and_path(url: String) -> #(String, String) {
+  let url = string.trim(url)
+  let #(host, path) = case string.split_once(url, "://") {
     Ok(#(_, rest)) ->
       case string.split_once(rest, "/") {
-        Ok(#(_, path)) -> path
-        Error(Nil) -> rest
+        Ok(#(host, path)) -> #(host, path)
+        Error(Nil) -> #(rest, "")
       }
-    // git@github.com:owner/repo.git
     Error(Nil) ->
-      case string.split_once(url, ":") {
-        Ok(#(_, path)) -> path
-        // A local path: its last part.
-        Error(Nil) ->
-          string.split(url, "/")
-          |> list.filter(fn(part) { part != "" })
-          |> list.last
-          |> result.unwrap(url)
+      case string.starts_with(url, "/") || string.starts_with(url, ".") {
+        True -> #("", url)
+        False ->
+          case string.split_once(url, ":") {
+            Ok(#(host, path)) -> #(host, path)
+            Error(Nil) -> #("", url)
+          }
       }
+  }
+  let host = case string.split_once(host, "@") {
+    Ok(#(_, host)) -> host
+    Error(Nil) -> host
   }
   let path = case string.ends_with(path, ".git") {
     True -> string.drop_end(path, 4)
     False -> path
   }
-  string.trim(path) |> string.replace("//", "/")
+  #(string.lowercase(host), path)
 }
 
-/// A browsable URL for a clone URL, when it is a GitHub-style host.
+fn segments(path: String) -> List(String) {
+  string.split(path, "/") |> list.filter(fn(part) { part != "" })
+}
+
+/// A short name for a clone URL, for titles and the context bar:
+/// "owner/repo", or just "repo" when the owner isn't readable (a local
+/// path, or a DID as on tangled).
+pub fn repo_name(url: String) -> String {
+  let #(host, path) = host_and_path(url)
+  case list.reverse(segments(path)) {
+    [] -> ""
+    [repo, owner, ..] if host != "" ->
+      case string.contains(owner, ":") {
+        True -> repo
+        False -> owner <> "/" <> repo
+      }
+    [repo, ..] -> repo
+  }
+}
+
+/// Hosts that serve a repository's page at `https://host/owner/repo`.
+const browsable_hosts = [
+  "github.com", "gitlab.com", "codeberg.org", "bitbucket.org",
+]
+
+/// A browsable URL for a clone URL, when the host is one known to serve
+/// repositories at their path; "" otherwise.
 pub fn web_url(url: String) -> String {
-  case string.starts_with(url, "https://") {
-    True ->
-      case string.ends_with(url, ".git") {
-        True -> string.drop_end(url, 4)
-        False -> url
-      }
-    False ->
-      case string.split_once(url, "@") {
-        Ok(#(_, rest)) ->
-          case string.split_once(rest, ":") {
-            Ok(#(host, path)) -> web_url("https://" <> host <> "/" <> path)
-            Error(Nil) -> ""
-          }
-        Error(Nil) -> ""
-      }
+  let #(host, path) = host_and_path(url)
+  case list.contains(browsable_hosts, host), segments(path) {
+    True, [_, _, ..] as parts ->
+      "https://" <> host <> "/" <> string.join(parts, "/")
+    _, _ -> ""
   }
 }
 

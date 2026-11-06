@@ -38,6 +38,9 @@ The Slack app needs Socket Mode, the `app_mention` and `message.channels`,
 
 Mention the bot to start a thread; reply in the thread to continue it; reply
 `stop` to cancel the current run. A direct message starts a thread too.
+`!pause` makes a thread or code channel answer only when the bot is
+mentioned; `!resume` (no mention needed) has it follow along again. A paused
+agent still catches up on what was said when it is next mentioned.
 
 When the agent clones a repository (`git clone` or `gh repo clone` through
 `bash`), the work moves to a code channel opened from the thread: replies go
