@@ -26,8 +26,11 @@ import slackline/api/agents/conversations_set_view
 import slackline/api/agents/sessions_rename
 import slackline/api/agents/sessions_set_status
 import slackline/api/chat
+import slackline/api/chat/append_stream
 import slackline/api/chat/post_ephemeral
 import slackline/api/chat/post_message
+import slackline/api/chat/start_stream
+import slackline/api/chat/stop_stream
 import slackline/api/chat/update
 import slackline/api/conversations
 import slackline/api/conversations/history
@@ -75,11 +78,7 @@ fn plan_blocks(plan: render.Plan) -> List(block.Block) {
       block.PlanTask(
         task_id: task.id,
         title: task.title,
-        status: case task.status {
-          render.InProgress -> block.TaskInProgress
-          render.Complete -> block.TaskComplete
-          render.Failed -> block.TaskError
-        },
+        status: task_status(task.status),
         details: rich(task.details),
         output: rich(task.output),
         sources: None,
@@ -88,6 +87,42 @@ fn plan_blocks(plan: render.Plan) -> List(block.Block) {
       )
     })
   [block.plan(plan.title, tasks, [])]
+}
+
+/// A streamed message's pieces as Slack's streaming API wants them.
+fn stream_chunks(chunks: List(render.Chunk)) -> List(chat.StreamChunk) {
+  list.map(chunks, fn(chunk) {
+    case chunk {
+      render.ChunkText(text) -> chat.MarkdownTextChunk(text:)
+      render.ChunkTitle(title) -> chat.PlanUpdateChunk(title:)
+      render.ChunkTask(task) ->
+        chat.TaskUpdateChunk(
+          id: task.id,
+          title: task.title,
+          status: task_status(task.status),
+          hide_title: None,
+          icon: None,
+          details: optional(task.details),
+          output: optional(task.output),
+          sources: None,
+        )
+    }
+  })
+}
+
+fn task_status(status: render.TaskStatus) -> block.TaskStatus {
+  case status {
+    render.InProgress -> block.TaskInProgress
+    render.Complete -> block.TaskComplete
+    render.Failed -> block.TaskError
+  }
+}
+
+fn optional(text: String) -> Option(String) {
+  case text {
+    "" -> None
+    text -> Some(text)
+  }
 }
 
 /// Where a sink posts.
@@ -149,6 +184,37 @@ pub fn sink(
     chat.update(channel:, ts:)
     |> update.text(fallback(text))
     |> update.blocks(blocks)
+    |> httpc.send(client)
+    |> result.replace(Nil)
+  }
+  // A streamed message: one message per run, the agent's text and its
+  // steps as they happen. Slack only streams into a thread or into a code
+  // channel's top level.
+  let start = fn(chunks) {
+    send(fn() {
+      let call =
+        chat.start_stream(channel:)
+        |> start_stream.chunks(stream_chunks(chunks))
+        |> start_stream.task_display_mode(chat.Plan)
+      case thread_ts {
+        Some(ts) -> start_stream.thread_ts(call, ts)
+        None -> call
+      }
+      |> httpc.send(client)
+      |> result.map(fn(started) { started.ts })
+    })
+  }
+  let append = fn(ts, chunks) {
+    use <- send
+    chat.append_stream(channel:, ts:)
+    |> append_stream.chunks(stream_chunks(chunks))
+    |> httpc.send(client)
+    |> result.replace(Nil)
+  }
+  let stop = fn(ts, chunks) {
+    use <- send
+    chat.stop_stream(channel:, ts:)
+    |> stop_stream.chunks(stream_chunks(chunks))
     |> httpc.send(client)
     |> result.replace(Nil)
   }
@@ -228,6 +294,9 @@ pub fn sink(
         }
       }
     },
+    start_stream: start,
+    append_stream: append,
+    stop_stream: stop,
     post: fn(markdown) { post(markdown, markdown_blocks(markdown)) },
     upload: fn(name, content) {
       case in_code_channel {

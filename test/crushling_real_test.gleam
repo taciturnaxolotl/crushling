@@ -277,6 +277,9 @@ fn sink(calls: Subject(Call)) -> thread.Sink {
     working: fn(_) { Nil },
     title: fn(_) { Nil },
     post_plan: fn(plan) { progress(plan_text(plan)) },
+    start_stream: fn(_) { Error("no streaming in this test") },
+    append_stream: fn(_, _) { Ok(Nil) },
+    stop_stream: fn(_, _) { Ok(Nil) },
     update_plan: fn(_, plan) {
       process.send(calls, Progress(plan_text(plan)))
       Ok(Nil)
@@ -604,6 +607,9 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> thread.Sink {
     working: fn(_) { Nil },
     title: fn(_) { Nil },
     post_plan: fn(plan) { post(render.plan_markdown(plan)) },
+    start_stream: fn(_) { Error("no streaming in this test") },
+    append_stream: fn(_, _) { Ok(Nil) },
+    stop_stream: fn(_, _) { Ok(Nil) },
     update_plan: fn(_, _) { Ok(Nil) },
     post:,
     upload: fn(_, _) { Ok(Nil) },
@@ -722,6 +728,9 @@ fn code_sink(calls: Subject(CodeCall), in_channel: Bool) -> thread.Sink {
     working: fn(_) { Nil },
     title: fn(_) { Nil },
     post_plan: fn(plan) { post(render.plan_markdown(plan)) },
+    start_stream: fn(_) { Error("no streaming in this test") },
+    append_stream: fn(_, _) { Ok(Nil) },
+    stop_stream: fn(_, _) { Ok(Nil) },
     update_plan: fn(_, _) { Ok(Nil) },
     post:,
     upload: fn(_, _) { Ok(Nil) },

@@ -9,9 +9,11 @@
 
 import crushling/run.{type Run}
 import crushling/snapshot
+import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 
 /// Slack's markdown block accepts up to 12,000 characters; stay well under.
@@ -48,18 +50,26 @@ pub type Plan {
 pub fn plan(run: Run, root: String) -> Option(Plan) {
   case run.tools {
     [] -> None
-    tools -> {
-      let count = list.length(tools)
-      let title = case run.outcome {
-        None -> "Working"
-        Some(run.Completed(_)) -> "Done · " <> steps(count)
-        Some(run.Errored(_)) -> "Failed · " <> steps(count)
-        Some(run.Cancelled) -> "Stopped · " <> steps(count)
-      }
-      let tasks = list.map(tools, task(_, root, run.outcome))
-      Some(Plan(title:, tasks: fold(tasks)))
-    }
+    _ -> Some(Plan(title: progress_title(run), tasks: tasks(run, root)))
   }
+}
+
+/// The plan card's title for the run as it stands: "Working" while it runs,
+/// then how much it did.
+pub fn progress_title(run: Run) -> String {
+  let count = list.length(run.tools)
+  case run.outcome {
+    None -> "Working"
+    Some(run.Completed(_)) -> "Done · " <> steps(count)
+    Some(run.Errored(_)) -> "Failed · " <> steps(count)
+    Some(run.Cancelled) -> "Stopped · " <> steps(count)
+  }
+}
+
+/// One row per tool call, the most recent kept and earlier ones folded.
+pub fn tasks(run: Run, root: String) -> List(Task) {
+  let rows = list.map(run.tools, task(_, root, run.outcome))
+  fold(rows)
 }
 
 fn steps(count: Int) -> String {
@@ -92,7 +102,13 @@ fn fold(tasks: List(Task)) -> List(Task) {
 fn task(tool: run.Tool, root: String, outcome: Option(run.Outcome)) -> Task {
   let status = case tool.status, outcome {
     run.Succeeded, _ -> Complete
-    run.Failed, _ -> Failed
+    run.Failed, None -> Failed
+    run.Failed, Some(run.Errored(_)) -> Failed
+    // A command that failed and was worked around isn't how the run ended,
+    // so it doesn't leave a failed row, and with it Slack's warning badge,
+    // on a run that finished fine.
+    run.Failed, Some(run.Completed(_)) -> Complete
+    run.Failed, Some(run.Cancelled) -> Failed
     // A tool still running when the run ended never will finish.
     run.Running, Some(run.Completed(_)) -> Complete
     run.Running, Some(_) -> Failed
@@ -174,13 +190,18 @@ fn clip(text: String) -> String {
   }
 }
 
-/// The answer, split into messages. Empty when there is nothing to say.
-pub fn answer(run: Run) -> List(String) {
-  let text = case run.text(run), run.outcome {
+/// The reply as one piece of markdown: what the agent said, or, when it said
+/// nothing, what crush reported it finished with.
+pub fn reply(run: Run) -> String {
+  case run.text(run), run.outcome {
     "", Some(run.Completed(text)) -> string.trim(text)
     streamed, _ -> streamed
   }
-  case text {
+}
+
+/// The answer, split into messages. Empty when there is nothing to say.
+pub fn answer(run: Run) -> List(String) {
+  case reply(run) {
     "" -> []
     text -> chunk(text, message_limit)
   }
@@ -431,5 +452,116 @@ fn last_index(haystack: String, needle: String) -> Result(Int, Nil) {
       let assert Ok(last) = list.last(parts)
       Ok(string.length(haystack) - string.length(last) - string.length(needle))
     }
+  }
+}
+
+/// A piece of a streamed message: the agent's text as it arrives, a new
+/// title for the plan, or one of its tasks as it changes.
+pub type Chunk {
+  ChunkText(text: String)
+  ChunkTitle(title: String)
+  ChunkTask(task: Task)
+}
+
+/// What a streamed message has already been told.
+pub type Shown {
+  Shown(
+    /// The text shown, by message id: crush rewrites a message as it grows.
+    sent: dict.Dict(String, String),
+    tasks: dict.Dict(String, Task),
+    title: String,
+    /// The text shown so far, in order, to know what is left to post.
+    text: String,
+  )
+}
+
+pub fn empty_shown() -> Shown {
+  Shown(sent: dict.new(), tasks: dict.new(), title: "", text: "")
+}
+
+/// What a streamed message still has to be told, and what it will show once
+/// it has been.
+pub type Pending {
+  Pending(chunks: List(Chunk), shown: Shown)
+}
+
+/// The next pieces of a run as it streams: the text said since it was last
+/// shown, the tasks that changed, and a new plan title.
+pub fn pending(run: Run, root: String, shown: Shown) -> Pending {
+  let #(text_chunks, sent, said) =
+    list.fold(
+      run.messages(run, True),
+      #([], shown.sent, shown.text),
+      fn(acc, pair) {
+        let #(id, text) = pair
+        let #(chunks, sent, said) = acc
+        let before = dict.get(sent, id) |> result.unwrap("")
+        // A message only grows as it streams, so what is new is what follows
+        // what was shown; only the text is held to one message's worth.
+        case
+          string.starts_with(text, before),
+          string.length(said) < message_limit
+        {
+          True, True ->
+            case string.drop_start(text, string.length(before)) {
+              "" -> acc
+              tail -> {
+                // A new message follows the one before it, as the reply would.
+                let delta = case before, said {
+                  "", "" -> tail
+                  "", _ -> "\n\n" <> tail
+                  _, _ -> tail
+                }
+                #(
+                  [ChunkText(delta), ..chunks],
+                  dict.insert(sent, id, text),
+                  said <> delta,
+                )
+              }
+            }
+          _, _ -> acc
+        }
+      },
+    )
+  let #(task_chunks, tasks) =
+    list.fold(tasks(run, root), #([], shown.tasks), fn(acc, task) {
+      let #(chunks, seen) = acc
+      let seen = dict.insert(seen, task.id, task)
+      case dict.get(shown.tasks, task.id) == Ok(task) {
+        True -> #(chunks, seen)
+        False -> #([ChunkTask(task), ..chunks], seen)
+      }
+    })
+  // A run with no tool call has no plan, and so no title to show.
+  let title = case run.tools {
+    [] -> ""
+    _ -> progress_title(run)
+  }
+  let named = case title, title == shown.title {
+    "", _ -> []
+    _, True -> []
+    _, False -> [ChunkTitle(title)]
+  }
+  Pending(
+    chunks: list.append(
+      list.reverse(text_chunks),
+      list.append(list.reverse(task_chunks), named),
+    ),
+    shown: Shown(sent:, tasks:, title:, text: said),
+  )
+}
+
+/// The part of `reply` a stream hasn't shown yet.
+pub fn remainder(reply: String, shown: String) -> String {
+  case shown {
+    // Nothing was streamed, so the message only carries the plan.
+    "" -> reply
+    _ ->
+      case string.starts_with(reply, shown) {
+        True -> string.drop_start(reply, string.length(shown)) |> string.trim
+        // The text was rewritten under the stream, so it already says what
+        // the agent said; don't say it twice.
+        False -> ""
+      }
   }
 }
