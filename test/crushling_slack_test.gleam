@@ -1,0 +1,171 @@
+import crushling/launcher
+import crushling/registry
+import crushling/slack
+import crushling/socket
+import gleam/erlang/process
+import gleam/json
+import gleam/set
+import gleam/string
+import slackline
+import slackline/app
+import slackline/event
+
+pub fn prompt_text_test() {
+  let assert "fix the build" =
+    slack.prompt_text("<@UBOT> fix the build", "UBOT")
+  let assert "see https://x.dev/a?b=1&c=2 and <@U2>" =
+    slack.prompt_text(
+      "<@UBOT> see <https://x.dev/a?b=1&amp;c=2|x.dev> and <@U2>",
+      "UBOT",
+    )
+  let assert "if a < b && c > d" =
+    slack.prompt_text("if a &lt; b &amp;&amp; c &gt; d", "UBOT")
+  let assert "mail mailto:a@b.c in <#C1|general>" =
+    slack.prompt_text("mail <mailto:a@b.c|a@b.c> in <#C1|general>", "UBOT")
+  let assert "" = slack.prompt_text("  <@UBOT>  ", "UBOT")
+}
+
+pub fn is_stop_test() {
+  let assert True = slack.is_stop("stop")
+  let assert True = slack.is_stop("Cancel")
+  let assert False = slack.is_stop("stop the server")
+}
+
+fn decode_event(raw: String) -> event.Event {
+  let assert Ok(decoded) = json.parse(raw, event.event_decoder())
+  decoded
+}
+
+pub fn mention_starts_a_thread_test() {
+  let mention =
+    decode_event(
+      "{\"type\":\"app_mention\",\"user\":\"U1\",\"text\":\"<@UBOT> hi\",\"ts\":\"10.1\",\"channel\":\"C1\",\"event_ts\":\"10.1\"}",
+    )
+  let assert Ok(registry.Incoming(
+    "C1",
+    "10.1",
+    "10.1",
+    "U1",
+    "<@UBOT> hi",
+    True,
+  )) = socket.incoming(mention, "UBOT")
+
+  let in_thread =
+    decode_event(
+      "{\"type\":\"app_mention\",\"user\":\"U1\",\"text\":\"<@UBOT> hi\",\"ts\":\"11.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\"}",
+    )
+  let assert Ok(registry.Incoming(thread_ts: "10.1", ts: "11.1", ..)) =
+    socket.incoming(in_thread, "UBOT")
+}
+
+pub fn thread_replies_route_test() {
+  let reply =
+    decode_event(
+      "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"more\",\"ts\":\"12.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
+    )
+  let assert Ok(registry.Incoming("C1", "10.1", "12.1", "U1", "more", False)) =
+    socket.incoming(reply, "UBOT")
+
+  // The app_mention for the same message is the one that counts.
+  let mentioning =
+    decode_event(
+      "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"<@UBOT> more\",\"ts\":\"12.2\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
+    )
+  let assert Error(Nil) = socket.incoming(mentioning, "UBOT")
+
+  let top_level =
+    decode_event(
+      "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"hello all\",\"ts\":\"13.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
+    )
+  let assert Error(Nil) = socket.incoming(top_level, "UBOT")
+
+  let from_bot =
+    decode_event(
+      "{\"type\":\"message\",\"user\":\"U9\",\"bot_id\":\"B1\",\"text\":\"echo\",\"ts\":\"14.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
+    )
+  let assert Error(Nil) = socket.incoming(from_bot, "UBOT")
+}
+
+pub fn direct_messages_start_threads_test() {
+  let dm =
+    decode_event(
+      "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"hi\",\"ts\":\"20.1\",\"channel\":\"D1\",\"channel_type\":\"im\"}",
+    )
+  let assert Ok(registry.Incoming("D1", "20.1", "20.1", "U1", "hi", True)) =
+    socket.incoming(dm, "UBOT")
+}
+
+type Launch {
+  Launched(String)
+  Stopped(String)
+}
+
+/// A registry whose launcher always fails, so no agent is ever needed,
+/// and whose Slack calls go nowhere.
+fn start_registry(launches: process.Subject(Launch)) {
+  let assert Ok(client) =
+    slackline.new("xoxb-test")
+    |> slackline.with_base_url("http://127.0.0.1:1/api")
+  let fake =
+    launcher.Launcher(
+      launch: fn(key) {
+        process.send(launches, Launched(key))
+        Error("no agents in this test")
+      },
+      stop: fn(key) { process.send(launches, Stopped(key)) },
+    )
+  let assert Ok(r) =
+    registry.start(registry.Config(
+      launcher: fake,
+      client:,
+      bot_user: "UBOT",
+      allowed: set.from_list(["U1"]),
+      idle_ms: 50,
+      flush_ms: 50,
+    ))
+  r
+}
+
+fn message(user: String, ts: String, text: String, mention: Bool) {
+  registry.Received(registry.Incoming("C1", "10.1", ts, user, text, mention))
+}
+
+pub fn registry_routing_test() {
+  let launches = process.new_subject()
+  let r = start_registry(launches)
+  let expected = registry.key("C1", "10.1")
+
+  // Someone not on the allowlist can't start anything.
+  process.send(r, message("U2", "10.1", "<@UBOT> hi", True))
+  // A reply in a thread the bot isn't in is ignored.
+  process.send(r, message("U1", "10.2", "hello", False))
+  // A bare mention has no prompt.
+  process.send(r, message("U1", "10.3", "<@UBOT>", True))
+  let assert Error(Nil) = process.receive(launches, 100)
+
+  process.send(r, message("U1", "10.4", "<@UBOT> do it", True))
+  let assert Ok(Launched(key)) = process.receive(launches, 1000)
+  let assert True = key == expected
+
+  // The launch failed, so the thread is forgotten; a redelivery of the same
+  // message is still ignored, and a new mention tries again.
+  process.sleep(50)
+  process.send(r, message("U1", "10.4", "<@UBOT> do it", True))
+  let assert Error(Nil) = process.receive(launches, 100)
+  process.send(r, message("U1", "10.5", "<@UBOT> again", True))
+  let assert Ok(Launched(_)) = process.receive(launches, 1000)
+  let assert Error(Nil) = process.receive(launches, 100)
+  Nil
+}
+
+pub fn stop_button_reaches_the_registry_test() {
+  let registry = process.new_subject()
+  let router = socket.router(registry, "UBOT")
+  let frame =
+    "{\"envelope_id\":\"e1\",\"type\":\"interactive\",\"accepts_response_payload\":false,\"payload\":{\"type\":\"block_actions\",\"user\":{\"id\":\"U1\",\"username\":\"k\",\"team_id\":\"T1\"},\"api_app_id\":\"A1\",\"token\":\"t\",\"container\":{\"type\":\"message\",\"message_ts\":\"11.1\",\"channel_id\":\"C1\",\"is_ephemeral\":false,\"thread_ts\":\"10.1\"},\"trigger_id\":\"x\",\"team\":{\"id\":\"T1\",\"domain\":\"d\"},\"channel\":{\"id\":\"C1\",\"name\":\"c\"},\"actions\":[{\"action_id\":\"crushling_stop\",\"block_id\":\"b\",\"text\":{\"type\":\"plain_text\",\"text\":\"Stop\"},\"value\":\"run-1\",\"style\":\"danger\",\"type\":\"button\",\"action_ts\":\"12.0\"}]}}"
+  let assert app.Send(frame: ack, after:) = app.handle_socket(router, frame)
+  let assert True = string.contains(ack, "e1")
+  after()
+  let assert Ok(registry.StopPressed("C1", "10.1", "U1")) =
+    process.receive(registry, 1000)
+}

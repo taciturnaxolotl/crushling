@@ -23,15 +23,21 @@
 import crushling/credentials
 import crushling/crush/client
 import crushling/gun
+import crushling/launcher
 import crushling/provider
+import crushling/registry
+import crushling/render
 import crushling/run
+import crushling/snapshot
 import crushling/thread
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/set
 import gleam/string
+import slackline
 
 @external(erlang, "real_server_ffi", "enabled")
 fn enabled() -> Bool
@@ -104,6 +110,7 @@ pub fn real_server_test_() -> Dynamic {
       to_dynamic([
         with_timeout(600, fn() { queued_prompts_and_bash_diff(wiring) }),
         with_timeout(600, fn() { survives_server_restart(wiring) }),
+        with_timeout(600, fn() { registry_launches_and_idles(wiring) }),
       ])
     }
   }
@@ -246,15 +253,21 @@ fn teardown(env: Env) -> Nil {
 }
 
 fn sink(calls: Subject(Call)) -> thread.Sink {
+  let progress = fn(text) {
+    process.send(calls, Progress(text))
+    Ok("ts" <> int.to_string(unique()))
+  }
+  let plan_text = fn(plan: render.Plan) { render.plan_markdown(plan) }
   thread.Sink(
-    post: fn(text) {
-      process.send(calls, Progress(text))
-      Ok("ts" <> int.to_string(unique()))
-    },
-    update: fn(_, text) {
-      process.send(calls, Progress(text))
+    status: fn(_) { Nil },
+    post_plan: fn(plan) { progress(plan_text(plan)) },
+    update_plan: fn(_, plan) {
+      process.send(calls, Progress(plan_text(plan)))
       Ok(Nil)
     },
+    post: progress,
+    post_controls: fn(_) { Ok("controls") },
+    delete: fn(_) { Nil },
     upload: fn(_, _) { Ok(Nil) },
     finished: fn(finished) { process.send(calls, Done(finished)) },
   )
@@ -322,7 +335,7 @@ fn queued_prompts_and_bash_diff(wiring: Wiring) -> Nil {
   let second = await_finished(calls)
   let assert run.Completed(_) = second.outcome
   let assert True = says(second, "BETA")
-  let assert ["notes.txt"] = second.files
+  let assert [snapshot.Change("notes.txt", Ok(1), Ok(0))] = second.changes
   let assert True = string.contains(second.patch, "+second line")
 
   // Snapshot shell calls must not end up in the agent's history, and the
@@ -385,4 +398,70 @@ fn survives_server_restart(wiring: Wiring) -> Nil {
   let assert True = says(after, "GAMMA")
 
   process.send(t, thread.Stop)
+}
+
+type Launch {
+  Launched(String)
+  Stopped(String)
+}
+
+/// A mention through the registry and the local launcher: an agent comes up,
+/// runs the prompt, and is stopped once the thread goes idle. Slack itself
+/// is unreachable here, so replies fail quietly; the launcher is what is
+/// observed.
+fn registry_launches_and_idles(wiring: Wiring) -> Nil {
+  let root =
+    "/tmp/crushling-real-registry-"
+    <> int.to_string(int.absolute_value(unique()))
+  let local = launcher.local(root, wiring.backend, wiring.credentials)
+  let launches = process.new_subject()
+  let watched =
+    launcher.Launcher(
+      launch: fn(key) {
+        let result = local.launch(key)
+        process.send(launches, Launched(key))
+        result
+      },
+      stop: fn(key) {
+        local.stop(key)
+        process.send(launches, Stopped(key))
+      },
+    )
+  use <-
+    guarded(_, fn() {
+      let _ =
+        sh("/tmp", "pkill -9 -f 'crush server --host unix://" <> root <> "'")
+      let _ = sh("/tmp", "rm -rf '" <> root <> "'")
+      Nil
+    })
+  let assert Ok(client) =
+    slackline.new("xoxb-test")
+    |> slackline.with_base_url("http://127.0.0.1:1/api")
+  let assert Ok(r) =
+    registry.start(registry.Config(
+      launcher: watched,
+      client:,
+      bot_user: "UBOT",
+      allowed: set.from_list(["U1"]),
+      idle_ms: 500,
+      flush_ms: 250,
+    ))
+  process.send(
+    r,
+    registry.Received(registry.Incoming(
+      "C1",
+      "10.1",
+      "10.1",
+      "U1",
+      "<@UBOT> Reply with exactly the word DELTA and nothing else. Use no tools.",
+      True,
+    )),
+  )
+  let assert Ok(Launched(key)) = process.receive(launches, 60_000)
+  let assert True = key == registry.key("C1", "10.1")
+  let assert Ok(Stopped(stopped)) = process.receive(launches, 240_000)
+  let assert True = stopped == key
+  // The session survives: its messages are still in the workspace.
+  let assert True = file_exists(root <> "/" <> key <> "/work/.crush/crush.db")
+  Nil
 }

@@ -58,3 +58,13 @@ pub fn error_message_test() {
   let assert "agent busy" = client.error_message("{\"message\":\"agent busy\"}")
   let assert "oops" = client.error_message("oops")
 }
+
+pub fn latest_session_call_test() {
+  let call = client.latest_session("w")
+  let assert "/v1/workspaces/w/sessions" = call.path
+  let assert Ok(Some("b")) =
+    call.parse(
+      "[{\"id\":\"a\",\"updated_at\":5},{\"id\":\"b\",\"updated_at\":9},{\"id\":\"child\",\"parent_session_id\":\"b\",\"updated_at\":20}]",
+    )
+  let assert Ok(None) = call.parse("[]")
+}

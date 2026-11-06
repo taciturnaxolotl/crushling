@@ -1,9 +1,11 @@
 import crushling/crush/event
 import crushling/render
 import crushling/run
+import crushling/snapshot
 import gleam/dict
+import gleam/int
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleam/string
 
 fn assistant(id: String, text: String, calls: List(event.ToolCall)) {
@@ -82,8 +84,8 @@ pub fn tools_track_status_test() {
       tool_result("c2", True),
     ])
   let assert [
-    run.Tool("c1", "bash", "go test ./...", run.Succeeded),
-    run.Tool("c2", "view", "/workspace/a.go", run.Failed),
+    run.Tool("c1", "bash", _, "go test ./...", run.Succeeded, "out"),
+    run.Tool("c2", "view", _, "/workspace/a.go", run.Failed, "out"),
   ] = r.tools
 }
 
@@ -134,9 +136,9 @@ pub fn known_baseline_carries_between_runs_test() {
     string.contains(run.patch(second, "/workspace"), "-two\n+three\n")
 }
 
-pub fn progress_render_test() {
+pub fn plan_render_test() {
   let calls =
-    list.map(["1", "2", "3", "4", "5"], fn(i) {
+    list.map(["1", "2"], fn(i) {
       event.ToolCall(
         "c" <> i,
         "bash",
@@ -144,39 +146,107 @@ pub fn progress_render_test() {
         True,
       )
     })
-  let r =
-    feed([assistant("m1", "Working on it.", calls), tool_result("c5", False)])
-  let assert "Working on it.\n\n_2 earlier tool calls_\n> ▸ bash `step 3`\n> ▸ bash `step 4`\n> ✓ bash `step 5`" =
-    render.progress(r, 1000)
-  let assert "_thinking…_" = render.progress(feed([]), 1000)
-}
-
-pub fn progress_tail_reopens_fence_test() {
-  let text = "intro\n```\n" <> string.repeat("code line\n", 50) <> "more"
-  let r = feed([assistant("m1", text, [])])
-  let out = render.progress(r, 120)
-  let assert True = string.length(out) <= 120
-  let assert True = string.starts_with(out, "…\n```\n")
-}
-
-pub fn final_render_test() {
+  let edit =
+    event.ToolCall(
+      "c3",
+      "edit",
+      "{\"file_path\":\"/workspace/src/a.go\"}",
+      True,
+    )
   let r =
     feed([
-      assistant("m1", "All done.", [event.ToolCall("c1", "edit", "{}", True)]),
-      file("/workspace/a.txt", "one\n", 0),
-      file("/workspace/a.txt", "two\n", 1),
-      done("All done.", "", False),
+      assistant("m1", "Working on it.", list.append(calls, [edit])),
+      tool_result("c1", False),
+      tool_result("c3", False),
     ])
-  let assert ["All done.\n\n_1 tool call · changed `a.txt`_"] =
-    render.final(r, ["a.txt"])
-  let assert ["oops\n\n:warning: run failed: boom"] =
-    render.final(
-      feed([assistant("m", "oops", []), done("", "boom", False)]),
-      [],
+  let assert Some(render.Plan("Working", [one, two, three])) =
+    render.plan(r, "/workspace")
+  let assert render.Task(
+    "c1",
+    "Running a command",
+    render.Complete,
+    "step 1",
+    "out",
+  ) = one
+  let assert render.Task(status: render.InProgress, output: "", ..) = two
+  // File tools don't echo their boilerplate result, and paths are relative.
+  let assert render.Task(
+    "c3",
+    "Editing a file",
+    render.Complete,
+    "src/a.go",
+    "",
+  ) = three
+  let assert None = render.plan(feed([assistant("m", "hi", [])]), "/w")
+
+  let completed = run.apply(r, dict.new(), done("Working on it.", "", False))
+  let assert Some(render.Plan("Done · 3 steps", [_, two, _])) =
+    render.plan(completed, "/workspace")
+  let assert render.Task(status: render.Complete, ..) = two
+  let failed = run.apply(r, dict.new(), done("", "boom", False))
+  let assert Some(render.Plan(
+    "Failed · 3 steps",
+    [_, render.Task(status: render.Failed, ..), _],
+  )) = render.plan(failed, "/workspace")
+}
+
+pub fn plan_folds_many_steps_test() {
+  let calls =
+    int.range(from: 50, to: 0, with: [], run: fn(acc, i) {
+      [event.ToolCall("c" <> int.to_string(i), "ls", "{}", True), ..acc]
+    })
+  let assert Some(render.Plan(_, tasks)) =
+    render.plan(feed([assistant("m", "", calls)]), "/w")
+  let assert 40 = list.length(tasks)
+  let assert [render.Task("earlier", _, _, _, "11 earlier steps"), ..] = tasks
+}
+
+pub fn titles_test() {
+  let assert "Reading a file" = render.title("view")
+  let assert "Asking the language server" = render.title("lsp_definition")
+  let assert "Linear save issue" = render.title("mcp_linear_save_issue")
+  let assert "Some new tool" = render.title("some_new_tool")
+}
+
+pub fn answer_and_note_test() {
+  let assert ["All done."] =
+    render.answer(
+      feed([assistant("m1", "All done.", []), done("x", "", False)]),
     )
-  let assert ["_no reply_"] = render.final(feed([done("", "", False)]), [])
-  let assert ["fallback"] =
-    render.final(feed([done("fallback", "", False)]), [])
+  let assert ["fallback"] = render.answer(feed([done("fallback", "", False)]))
+  let assert [] = render.answer(feed([done("", "", False)]))
+
+  let assert Some("_no reply._") =
+    render.note(feed([done("", "", False)]), False)
+  let assert None = render.note(feed([done("hi", "", False)]), True)
+  let assert Some("_stopped._") = render.note(feed([done("", "", True)]), True)
+  let assert Some("_the run failed: rate_limited_") =
+    render.note(feed([done("", "rate_limited", False)]), False)
+    |> option.map(string.replace(_, "\\_", "_"))
+  let partial =
+    render.note(
+      feed([assistant("m", "half", []), done("", "boom", False)]),
+      True,
+    )
+  let assert Some(text) = partial
+  let assert True = string.contains(text, "may be partial")
+}
+
+pub fn changes_line_test() {
+  let assert None = render.changes([])
+  let assert Some("_changed `a.go` +3 −1, `bin/x` (binary)_") =
+    render.changes([
+      snapshot.Change("a.go", Ok(3), Ok(1)),
+      snapshot.Change("bin/x", Error(Nil), Error(Nil)),
+    ])
+}
+
+pub fn numstat_test() {
+  let assert [
+    snapshot.Change("a.go", Ok(3), Ok(1)),
+    snapshot.Change("bin/x", Error(Nil), Error(Nil)),
+    snapshot.Change("tab\tname", Ok(1), Ok(0)),
+  ] = snapshot.parse_numstat("3\t1\ta.go\n-\t-\tbin/x\n1\t0\ttab\tname\n")
 }
 
 pub fn chunk_test() {

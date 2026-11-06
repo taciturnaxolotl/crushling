@@ -13,7 +13,29 @@ unless enabled:
 They cover queued prompt order, diffs of `bash` edits, history staying
 clean, and the bridge surviving a server killed mid-run.
 
-Nothing has talked to Slack yet.
+The Slack side runs on slackline over Socket Mode. It hasn't been run against
+a real workspace yet.
+
+## Running it
+
+    gleam run
+
+Configuration is from the environment or `.env`; see the table at the top of
+`src/crushling.gleam`. The minimum for trying it locally:
+
+    SLACK_BOT_TOKEN=xoxb-...
+    SLACK_APP_TOKEN=xapp-...
+    CRUSHLING_ALLOWED_USERS=U012345
+    CRUSHLING_BACKEND=hyper-key        # or claude / hyper with a seeded login
+    CRUSHLING_LAUNCHER=local           # unsandboxed: agents run as you
+
+The Slack app needs Socket Mode, the `app_mention` and `message.channels`,
+`message.groups`, `message.im` events, and the scopes `app_mentions:read`,
+`chat:write`, `reactions:write`, `files:write`, `channels:history`,
+`groups:history`, `im:history`.
+
+Mention the bot to start a thread; reply in the thread to continue it; reply
+`stop` to cancel the current run. A direct message starts a thread too.
 
 ## Providers
 
@@ -54,6 +76,11 @@ single use, so the two would revoke each other.
 | `crushling/snapshot` | Shell commands that snapshot the workspace into a private bare repo under `.crush/` and diff two snapshots. |
 | `crushling/provider` | Claude, Hyper login, or Hyper key: the container's crush.json, env, and login. |
 | `crushling/credentials` | The one refresher of a login; keeps a managed token fresh in every watched container config. |
+| `crushling` | Entry point: reads the settings, starts credentials, the registry and Socket Mode. |
+| `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; turns events into `Incoming`. |
+| `crushling/registry` | Thread key to actor; allowlist, dedupe, `stop`, lazy launch, idle shutdown. |
+| `crushling/slack` | The `Sink` over chat.postMessage/update with markdown blocks and file uploads; prompt text cleanup. |
+| `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). |
 | `crushling/sandbox` | `docker run` arguments, a policy fingerprint label, adopt/start/recreate, stop (warm) and remove (cold). |
 
 ## Decisions worth knowing
@@ -86,18 +113,13 @@ single use, so the two would revoke each other.
 
 ## Left
 
-1. The Slack `Sink`, on `slackline`: `chat.postMessage` and `chat.update` with
-   a markdown block, file upload for patches, and Socket Mode routing
-   `app_mention` and thread replies to thread actors.
-2. A registry: thread key to actor, `sandbox.ensure` before starting a
-   thread, idle timers for the warm and cold tiers, and a user allowlist.
-3. The sandbox image (Nix, with `crush` in it) and the `~/dots` module:
+1. Try it in a real workspace, with `CRUSHLING_LAUNCHER=local` first.
+2. The sandbox image (Nix, with `crush` in it) and the `~/dots` module:
    `runsc-uds` runtime, `sbx-egress` network and firewall rules, prune
-   filter, service user with a pinned uid.
-4. Run the Claude and Hyper-login end-to-end tests once crushling logins
-   are seeded. The registry must `credentials.watch` each container's
-   `sandbox.host_crush_data(...)/crush.json` before starting it, and
-   `unwatch` when it is removed.
-5. Optional: a small transport interface on the thread actor, tested with
-   event sequences recorded from a real server, for edge cases the gated
-   tests can't trigger on cue.
+   filter, service user with a pinned uid. Check that a socket in a bind
+   mount works under gVisor with `--host-uds=create`.
+3. Run the Claude and Hyper-login end-to-end tests once crushling logins are
+   seeded.
+4. Smaller things: a cold tier that removes long-idle containers; a prompt
+   the thread actor fails to send never counts as finished, so that thread
+   never idles; a Cancel button in addition to replying `stop`.

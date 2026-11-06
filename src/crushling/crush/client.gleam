@@ -6,7 +6,9 @@ import crushling/gun
 import gleam/bit_array
 import gleam/dynamic/decode.{type Decoder}
 import gleam/http.{type Method, Delete, Get, Post}
+import gleam/int
 import gleam/json.{type Json}
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/uri
 
@@ -291,5 +293,37 @@ pub fn session_messages(
     None,
     200,
     Ok,
+  )
+}
+
+/// The most recently updated top-level session, if any. A workspace belongs
+/// to one Slack thread, so after a restart this is the thread's
+/// conversation.
+pub fn latest_session(workspace_id: String) -> Call(Option(String)) {
+  let decoder =
+    decode.list({
+      use id <- decode.field("id", decode.string)
+      use parent <- decode.optional_field(
+        "parent_session_id",
+        "",
+        decode.optional(decode.string) |> decode.map(option.unwrap(_, "")),
+      )
+      use updated <- decode.optional_field("updated_at", 0, decode.int)
+      decode.success(#(id, parent, updated))
+    })
+    |> decode.map(fn(sessions) {
+      sessions
+      |> list.filter(fn(session) { session.1 == "" })
+      |> list.sort(fn(a, b) { int.compare(b.2, a.2) })
+      |> list.first
+      |> option.from_result
+      |> option.map(fn(session) { session.0 })
+    })
+  Call(
+    Get,
+    workspace(workspace_id) <> "/sessions",
+    None,
+    200,
+    parse_with(decoder),
   )
 }

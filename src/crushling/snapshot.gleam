@@ -1,9 +1,16 @@
 //// Workspace snapshots in a private git repository under `.crush/`, so a
 //// run's diff covers every change however it was made, `bash` included,
 //// without touching the workspace's own repository. The commands run
-//// through the server's shell endpoint, inside the sandbox.
+//// through the server's shell endpoint, on the agent's side of any sandbox.
+////
+//// Every snapshot is written from a fresh index, so the workspace's
+//// `.gitignore` always applies: a build output ignored after it first
+//// appeared is not carried along. Binary files are listed but their
+//// contents are left out of the patch.
 
+import gleam/int
 import gleam/list
+import gleam/result
 import gleam/string
 
 const dir = ".crush/crushling-snap"
@@ -14,15 +21,20 @@ fn git(args: String) -> String {
 
 /// Prints the tree id of the workspace as it is now.
 pub fn take() -> String {
+  let index = "GIT_INDEX_FILE=" <> dir <> "/snapshot-index "
   "[ -d "
   <> dir
   <> " ] || { git init -q --bare "
   <> dir
   <> " && printf '/.crush/\\n/.home/\\n' > "
   <> dir
-  <> "/info/exclude; } && "
+  <> "/info/exclude; } && rm -f "
+  <> dir
+  <> "/snapshot-index && "
+  <> index
   <> git("add -A >/dev/null")
   <> " && "
+  <> index
   <> git("write-tree")
 }
 
@@ -40,15 +52,35 @@ fn is_hex(text: String) -> Bool {
 }
 
 pub fn diff(from: String, to: String) -> String {
-  git("diff --no-color --no-ext-diff --binary " <> from <> " " <> to)
+  git("diff --no-color --no-ext-diff " <> from <> " " <> to)
 }
 
-pub fn changed_files(from: String, to: String) -> String {
-  git("diff --name-only " <> from <> " " <> to)
+pub fn numstat(from: String, to: String) -> String {
+  git("diff --numstat --no-color " <> from <> " " <> to)
 }
 
-pub fn parse_files(output: String) -> List(String) {
+pub type Change {
+  /// Lines added and removed; both errors for a binary file.
+  Change(path: String, added: Result(Int, Nil), removed: Result(Int, Nil))
+}
+
+/// Parse `git diff --numstat`: `added<TAB>removed<TAB>path`, with `-` for
+/// binary files.
+pub fn parse_numstat(output: String) -> List(Change) {
   string.split(output, "\n")
-  |> list.map(string.trim)
-  |> list.filter(fn(line) { line != "" })
+  |> list.filter_map(fn(line) {
+    case string.split(line, "\t") {
+      [added, removed, first, ..rest] ->
+        Ok(Change(
+          path: string.join([first, ..rest], "\t"),
+          added: int.parse(added),
+          removed: int.parse(removed),
+        ))
+      _ -> Error(Nil)
+    }
+  })
+}
+
+pub fn is_binary(change: Change) -> Bool {
+  result.is_error(change.added)
 }
