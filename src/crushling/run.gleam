@@ -24,6 +24,9 @@ pub type Tool {
     /// The raw JSON input, for renderers that want more than `summary`.
     input: String,
     summary: String,
+    /// What the agent said the call is for, when the tool asks for one
+    /// (bash's `description`, a sub-agent's `label`).
+    description: String,
     status: ToolStatus,
     /// The result text, once it arrives.
     output: String,
@@ -131,13 +134,28 @@ fn upsert_tool(tools: List(Tool), call: event.ToolCall) -> List(Tool) {
     True ->
       list.map(tools, fn(tool) {
         case tool.id == call.id {
-          True -> Tool(..tool, name: call.name, input: call.input, summary:)
+          True ->
+            Tool(
+              ..tool,
+              name: call.name,
+              input: call.input,
+              summary:,
+              description: describe_input(call.input),
+            )
           False -> tool
         }
       })
     False ->
       list.append(tools, [
-        Tool(call.id, call.name, call.input, summary, Running, ""),
+        Tool(
+          id: call.id,
+          name: call.name,
+          input: call.input,
+          summary:,
+          description: describe_input(call.input),
+          status: Running,
+          output: "",
+        ),
       ])
   }
 }
@@ -148,12 +166,21 @@ const salient_fields = [
 
 /// The one input field that says what a tool call is doing, cut to a line.
 pub fn summarize_input(input: String) -> String {
+  pick(input, salient_fields)
+}
+
+/// The agent's own description of the call, if the tool takes one.
+pub fn describe_input(input: String) -> String {
+  pick(input, ["description", "label"])
+}
+
+fn pick(input: String, names: List(String)) -> String {
   let fields =
     json.parse(input, decode.dict(decode.string, decode.dynamic))
     |> option.from_result
     |> option.unwrap(dict.new())
   let picked =
-    list.find_map(salient_fields, fn(name) {
+    list.find_map(names, fn(name) {
       case dict.get(fields, name) {
         Ok(value) ->
           case decode.run(value, decode.string) {

@@ -1,5 +1,5 @@
-//// The Slack side of a thread: a `thread.Sink` that shows a run as a status,
-//// a plan card and markdown replies, and the helpers that turn a Slack
+//// The Slack side of a thread: a `thread.Sink` that shows a run as an agent
+//// session (Slack's "Working…" and Stop), a plan card and markdown replies, and the helpers that turn a Slack
 //// message back into a prompt.
 
 import crushling/render
@@ -12,8 +12,9 @@ import gleam/order
 import gleam/result
 import gleam/string
 import slackline
-import slackline/api/assistant
-import slackline/api/assistant/threads_set_status
+import slackline/api/agents
+import slackline/api/agents/sessions_rename
+import slackline/api/agents/sessions_set_status
 import slackline/api/chat
 import slackline/api/chat/post_ephemeral
 import slackline/api/chat/post_message
@@ -21,7 +22,6 @@ import slackline/api/chat/update
 import slackline/api/conversations
 import slackline/api/conversations/replies
 import slackline/api/files/complete_upload_external
-import slackline/api/reactions
 import slackline/block
 import slackline/httpc
 
@@ -40,11 +40,6 @@ fn send(run: fn() -> Result(a, slackline.Error)) -> Result(a, String) {
   httpc.retrying(attempts: 3, run:)
   |> result.map_error(slackline.describe_error)
 }
-
-const loading_messages = [
-  "is reading the thread", "is looking around", "is thinking it over",
-  "is working on it", "is checking its work",
-]
 
 fn markdown_blocks(markdown: String) -> List(block.Block) {
   [block.markdown(markdown, [])]
@@ -109,16 +104,20 @@ pub fn sink(
     |> result.replace(Nil)
   }
   thread.Sink(
-    status: fn(status) {
-      // Best effort: the status is decoration, and Slack clears it itself
-      // when the bot posts.
-      let call =
-        assistant.threads_set_status(channel_id: channel, thread_ts:, status:)
-      let call = case status {
-        "" -> call
-        _ -> threads_set_status.loading_messages(call, loading_messages)
+    working: fn(working) {
+      case working {
+        // Slack shows "Working…" with its Stop control until the session
+        // is set back to active; posting no longer clears it.
+        True -> session_status(client, channel, thread_ts, agents.Processing)
+        False -> session_status(client, channel, thread_ts, agents.Active)
       }
-      let _ = httpc.send(call, client)
+    },
+    title: fn(title) {
+      let _ =
+        agents.sessions_rename(title:)
+        |> sessions_rename.channel_id(channel)
+        |> sessions_rename.thread_ts(thread_ts)
+        |> httpc.send(client)
       Nil
     },
     post_plan: fn(plan) {
@@ -160,6 +159,31 @@ pub fn sink(
   )
 }
 
+/// Set the thread's agent session status. Best effort: it is decoration,
+/// and Slack times a working session out after an hour regardless.
+fn session_status(
+  client: slackline.Client,
+  channel: String,
+  thread_ts: String,
+  status: agents.AgentStatus,
+) -> Nil {
+  let _ =
+    agents.sessions_set_status(status:)
+    |> sessions_set_status.channel_id(channel)
+    |> sessions_set_status.thread_ts(thread_ts)
+    |> httpc.send(client)
+  Nil
+}
+
+/// Mark the thread's agent session as ready for the next prompt.
+pub fn session_done(
+  client: slackline.Client,
+  channel: String,
+  thread_ts: String,
+) -> Nil {
+  session_status(client, channel, thread_ts, agents.Active)
+}
+
 /// Reply to one user only, such as for `!help`.
 pub fn whisper(
   client: slackline.Client,
@@ -172,16 +196,6 @@ pub fn whisper(
     chat.post_ephemeral(channel:, user:, text:)
     |> post_ephemeral.thread_ts(thread_ts)
     |> httpc.send(client)
-  Nil
-}
-
-pub fn react(
-  client: slackline.Client,
-  channel: String,
-  ts: String,
-  name: String,
-) -> Nil {
-  let _ = reactions.add(channel:, name:, timestamp: ts) |> httpc.send(client)
   Nil
 }
 

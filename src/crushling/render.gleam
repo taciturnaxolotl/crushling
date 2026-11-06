@@ -21,8 +21,8 @@ pub const message_limit = 11_000
 /// with too many tasks is rejected.
 const max_tasks = 40
 
-/// Plan task details and outputs are kept to a line.
-const line_limit = 96
+/// Plan task details and outputs are kept to a short line.
+const line_limit = 72
 
 pub type TaskStatus {
   InProgress
@@ -98,76 +98,19 @@ fn task(tool: run.Tool, root: String, outcome: Option(run.Outcome)) -> Task {
     run.Running, Some(_) -> Failed
     run.Running, None -> InProgress
   }
-  let details =
+  let arg =
     tool.summary
     |> string.replace(root <> "/", "")
+    |> string.replace(root, ".")
+    |> first_line
     |> clip
-  Task(
-    id: tool.id,
-    title: title(tool.name),
-    status:,
-    details:,
-    output: output(tool, status),
-  )
-}
-
-/// Slack drops an assistant status longer than this.
-const status_limit = 50
-
-/// The thread's status while `tool` runs, such as "is running `go test`…",
-/// kept within Slack's limit by clipping the argument rather than the verb.
-pub fn status(tool: run.Tool, root: String) -> String {
-  let arg = tool.summary |> string.replace(root <> "/", "")
-  let #(prefix, arg, suffix) = case tool.name {
-    "bash" -> #("is running `", first_line(arg), "`…")
-    "view" -> #("is reading ", basename(arg), "…")
-    "write" -> #("is writing ", basename(arg), "…")
-    "edit" | "multiedit" -> #("is editing ", basename(arg), "…")
-    "grep" | "rg" -> #("is searching for ", arg, "…")
-    "glob" | "ls" -> #("is looking for files…", "", "")
-    "fetch" | "agentic_fetch" | "web_fetch" | "download" -> #(
-      "is reading ",
-      host(arg),
-      "…",
-    )
-    "web_search" -> #("is searching the web…", "", "")
-    "agent" | "agent_dispatch" -> #("is running a sub-agent…", "", "")
-    "todos" -> #("is updating its plan…", "", "")
-    _ -> #("is " <> string.lowercase(title(tool.name)) <> "…", "", "")
+  // A described call reads as a sentence and needs nothing under it; a
+  // generic title ("Reading a file") gets its argument as details.
+  let #(title, details) = case tool.description {
+    "" -> #(title(tool.name), arg)
+    description -> #(string.capitalise(clip(description)), "")
   }
-  fit(prefix, arg, suffix)
-}
-
-fn fit(prefix: String, arg: String, suffix: String) -> String {
-  case arg {
-    "" -> string.slice(prefix, 0, status_limit)
-    arg -> {
-      let room = status_limit - string.length(prefix) - string.length(suffix)
-      let arg = case string.length(arg) > room {
-        True -> string.slice(arg, 0, int.max(room - 1, 0)) <> "…"
-        False -> arg
-      }
-      prefix <> arg <> suffix
-    }
-  }
-}
-
-fn basename(path: String) -> String {
-  case string.split(path, "/") |> list.last {
-    Ok("") | Error(Nil) -> path
-    Ok(name) -> name
-  }
-}
-
-fn host(url: String) -> String {
-  let rest = case string.split_once(url, "://") {
-    Ok(#(_, rest)) -> rest
-    Error(Nil) -> url
-  }
-  case string.split_once(rest, "/") {
-    Ok(#(host, _)) -> host
-    Error(Nil) -> rest
-  }
+  Task(id: tool.id, title:, status:, details:, output: output(tool, status))
 }
 
 /// What a tool is doing, in words rather than its name.
@@ -203,18 +146,12 @@ fn humanize(name: String) -> String {
   }
 }
 
-/// The result, cut to a line. File tools announce success in boilerplate,
-/// so they show nothing unless they failed.
+/// Only a failure says anything under its row: the first line of the
+/// error. Successful output is the agent's to summarise in its answer.
 fn output(tool: run.Tool, status: TaskStatus) -> String {
-  case status, tool.name {
-    InProgress, _ -> ""
-    Complete, "view"
-    | Complete, "write"
-    | Complete, "edit"
-    | Complete, "multiedit"
-    | Complete, "todos"
-    -> ""
-    _, _ -> first_line(tool.output) |> clip
+  case status {
+    Failed -> first_line(tool.output) |> clip
+    _ -> ""
   }
 }
 

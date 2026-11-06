@@ -29,8 +29,11 @@ import gleam/string
 /// by a test double in tests.
 pub type Sink {
   Sink(
-    /// Show a working status on the thread, or clear it with "".
-    status: fn(String) -> Nil,
+    /// Mark the thread's agent session as working (Slack shows "Working…"
+    /// and its Stop control) or as ready for the next prompt.
+    working: fn(Bool) -> Nil,
+    /// Name the session, from the prompt that started it.
+    title: fn(String) -> Nil,
     /// Post the plan card, returning its id (Slack's `ts`).
     post_plan: fn(render.Plan) -> Result(String, String),
     update_plan: fn(String, render.Plan) -> Result(Nil, String),
@@ -72,6 +75,9 @@ pub type Config {
 pub type Message {
   Prompt(text: String)
   Cancel
+  /// Cancel the running turn and anything queued, closing the run with
+  /// `note` rather than the usual "stopped".
+  CancelFor(note: String)
   Stop
   Setup
   Flush
@@ -89,11 +95,14 @@ type Active {
     shown: Option(render.Plan),
     /// The workspace snapshot taken just before the prompt was sent.
     base: Option(String),
-    /// The status last shown, so it is only set when it changes.
-    status: String,
+    /// When the session was last marked working: Slack lets it lapse after
+    /// an hour, so a long run marks it again.
+    working_since_ms: Int,
     last_event_ms: Int,
     /// Whether the stall note has been posted for this run.
     stalled: Bool,
+    /// Said in place of "stopped" when the run was cancelled for a reason.
+    cancel_note: Option(String),
   )
 }
 
@@ -102,7 +111,7 @@ type Conns {
 }
 
 type Ready {
-  Ready(workspace_id: String, session_id: String)
+  Ready(workspace_id: String, session_id: String, resumed: Bool)
 }
 
 type State {
@@ -124,6 +133,9 @@ type State {
     known: run.Known,
     flushing: Bool,
     retries: Int,
+    /// Whether the Slack session has its title: set for a session crushling
+    /// created, and for one found in place after a restart.
+    titled: Bool,
   )
 }
 
@@ -133,6 +145,22 @@ const max_retries = 8
 const stall_ms = 600_000
 
 const watchdog_ms = 60_000
+
+/// Slack drops a session out of working after an hour; mark it again well
+/// before.
+const rework_ms = 1_800_000
+
+/// A session title from the first prompt: its first line, kept short.
+fn session_title(prompt: String) -> String {
+  let line = case string.split_once(string.trim(prompt), "\n") {
+    Ok(#(first, _)) -> first
+    Error(Nil) -> string.trim(prompt)
+  }
+  case string.length(line) > 60 {
+    True -> string.slice(line, 0, 59) <> "…"
+    False -> line
+  }
+}
 
 @external(erlang, "crushling_ffi", "monotonic_ms")
 fn now_ms() -> Int
@@ -167,6 +195,7 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       known: dict.new(),
       flushing: False,
       retries: 0,
+      titled: False,
     )
     |> actor.initialised
     |> actor.selecting(selector)
@@ -185,17 +214,8 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       State(..state, waiting: list.append(state.waiting, [text]))
       |> send_next
       |> actor.continue
-    Cancel -> {
-      case state.ready, state.conns, state.active {
-        Some(ready), Some(conns), Some(_) -> {
-          let _ =
-            call(conns, client.cancel(ready.workspace_id, ready.session_id))
-          Nil
-        }
-        _, _, _ -> Nil
-      }
-      actor.continue(State(..state, waiting: []))
-    }
+    Cancel -> actor.continue(cancel(state, None))
+    CancelFor(note) -> actor.continue(cancel(state, Some(note)))
     Flush -> actor.continue(flush(State(..state, flushing: False)))
     Watchdog -> actor.continue(watchdog(state))
     Gun(message) -> actor.continue(on_gun(state, message))
@@ -203,6 +223,17 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       shutdown(state)
       actor.stop()
     }
+  }
+}
+
+fn cancel(state: State, note: Option(String)) -> State {
+  case state.ready, state.conns, state.active {
+    Some(ready), Some(conns), Some(active) -> {
+      let _ = call(conns, client.cancel(ready.workspace_id, ready.session_id))
+      let active = Active(..active, cancel_note: note)
+      State(..state, waiting: [], active: Some(active))
+    }
+    _, _, _ -> State(..state, waiting: [])
   }
 }
 
@@ -287,16 +318,19 @@ fn establish(state: State) -> Result(#(Conns, Ready), String) {
     use _ <- result.try(call(conns, client.init_agent(workspace_id, False)))
     use _ <- result.try(wait_ready(conns, workspace_id, ready_attempts))
     case state.session_id {
-      Some(id) -> Ok(id)
+      Some(id) -> Ok(#(id, True))
       None ->
         case call(conns, client.latest_session(workspace_id)) {
-          Ok(Some(id)) -> Ok(id)
-          _ -> call(conns, client.create_session(workspace_id, config.title))
+          Ok(Some(id)) -> Ok(#(id, True))
+          _ ->
+            call(conns, client.create_session(workspace_id, config.title))
+            |> result.map(fn(id) { #(id, False) })
         }
     }
   }
   case setup {
-    Ok(session_id) -> Ok(#(conns, Ready(workspace_id:, session_id:)))
+    Ok(#(session_id, resumed)) ->
+      Ok(#(conns, Ready(workspace_id:, session_id:, resumed:)))
     Error(error) -> Error(fail(error))
   }
 }
@@ -372,7 +406,12 @@ fn send_prompt(
     )
   {
     Ok(Nil) -> {
-      state.config.sink.status("is thinking")
+      state.config.sink.working(True)
+      case state.titled {
+        True -> Nil
+        False -> state.config.sink.title(session_title(text))
+      }
+      let state = State(..state, titled: True)
       process.send_after(state.self, watchdog_ms, Watchdog)
       let run = run.new(ready.session_id, run_id)
       let now = now_ms()
@@ -382,9 +421,10 @@ fn send_prompt(
           plan_ts: None,
           shown: None,
           base:,
-          status: "is thinking",
+          working_since_ms: now,
           last_event_ms: now,
           stalled: False,
+          cancel_note: None,
         )
       State(..state, active: Some(active))
     }
@@ -510,53 +550,35 @@ fn watchdog(state: State) -> State {
     None -> state
     Some(active) -> {
       process.send_after(state.self, watchdog_ms, Watchdog)
-      case !active.stalled && now_ms() - active.last_event_ms > stall_ms {
-        False -> state
+      let now = now_ms()
+      case !active.stalled && now - active.last_event_ms > stall_ms {
+        False ->
+          case !active.stalled && now - active.working_since_ms > rework_ms {
+            True -> {
+              state.config.sink.working(True)
+              State(
+                ..state,
+                active: Some(Active(..active, working_since_ms: now)),
+              )
+            }
+            False -> state
+          }
         True -> {
           let _ =
             state.config.sink.post(
               "_no word from the agent in 10 minutes; it may be stuck. Reply `!stop` to stop it._",
             )
-          state.config.sink.status("")
-          State(
-            ..state,
-            active: Some(Active(..active, stalled: True, status: "")),
-          )
+          state.config.sink.working(False)
+          State(..state, active: Some(Active(..active, stalled: True)))
         }
       }
     }
   }
 }
 
-/// The thread status for what the run is doing now: the newest tool still
-/// running, else thinking.
-fn current_status(active: Active, root: String) -> String {
-  case
-    list.find(list.reverse(active.run.tools), fn(tool) {
-      tool.status == run.Running
-    })
-  {
-    Ok(tool) -> render.status(tool, root)
-    Error(Nil) -> "is thinking"
-  }
-}
-
-fn show_status(config: Config, active: Active) -> Active {
-  let status = current_status(active, config.root)
-  case status == active.status {
-    True -> active
-    False -> {
-      config.sink.status(status)
-      Active(..active, status:)
-    }
-  }
-}
-
-/// Post or update the plan card, and keep the thread's status on what the
-/// run is doing. Posting a message clears the status, so it is set again
-/// after.
+/// Post or update the plan card.
 fn show_progress(config: Config, active: Active) -> Active {
-  show_status(config, show_plan(config, active))
+  show_plan(config, active)
 }
 
 fn show_plan(config: Config, active: Active) -> Active {
@@ -576,9 +598,7 @@ fn show_plan(config: Config, active: Active) -> Active {
           }
         None ->
           case sink.post_plan(plan) {
-            Ok(ts) ->
-              // Posting cleared the status; show_status sets it again.
-              Active(..active, plan_ts: Some(ts), shown: Some(plan), status: "")
+            Ok(ts) -> Active(..active, plan_ts: Some(ts), shown: Some(plan))
             Error(reason) -> {
               warn("crushling: plan post failed: " <> reason)
               active
@@ -667,7 +687,13 @@ fn finish(state: State, active: Active) -> Nil {
   let answer = render.answer(active.run)
   let answered = answer != []
   let closing =
-    [render.changes(changes), render.note(active.run, answered)]
+    [
+      render.changes(changes),
+      case active.run.outcome, active.cancel_note {
+        Some(run.Cancelled), Some(note) -> Some("_" <> note <> "_")
+        _, _ -> render.note(active.run, answered)
+      },
+    ]
     |> option.values
   // The file summary and any note ride on the last answer message when
   // there is one, so a run ends in a single message.
@@ -684,7 +710,7 @@ fn finish(state: State, active: Active) -> Nil {
       Error(reason) -> warn("crushling: post failed: " <> reason)
     }
   })
-  sink.status("")
+  sink.working(False)
 
   case patch, string.byte_size(patch) > max_patch_bytes {
     "", _ -> Nil

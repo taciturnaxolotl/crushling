@@ -23,9 +23,18 @@ pub fn router(
 ) -> app.App {
   app.unverified()
   |> app.on_event(fn(event, _delivery) {
-    case incoming(event, bot_user) {
-      Ok(message) -> process.send(registry, registry.Received(message))
-      Error(Nil) -> Nil
+    case event {
+      // Slack's own stop control, shown while a session is processing.
+      event.AgentSessionStopped(channel:, user:, thread_ts: Some(thread_ts), ..) ->
+        process.send(
+          registry,
+          registry.StopRequested(channel, thread_ts, option.unwrap(user, "")),
+        )
+      _ ->
+        case incoming(event, bot_user) {
+          Ok(message) -> process.send(registry, registry.Received(message))
+          Error(Nil) -> Nil
+        }
     }
   })
 }

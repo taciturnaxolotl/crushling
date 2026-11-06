@@ -18,6 +18,7 @@
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
 //// | `CRUSHLING_ROOT` | where thread workspaces live; default `~/.local/state/crushling/threads` |
 //// | `CRUSHLING_IDLE_MINUTES` | idle time before a thread's agent is stopped; default 15 |
+//// | `CRUSHLING_SHUTDOWN_GRACE_SECONDS` | on SIGTERM, how long running turns get to finish before they are cancelled; default 60 |
 //// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc-uds`, `sbx-egress` |
 
 import crushling/credentials
@@ -137,9 +138,30 @@ fn start() -> Result(Nil, String) {
     <> int.to_string(set.size(allowed))
     <> " allowed users",
   )
-  socket.run(app_token, socket.router(registry, me.user_id))
+  let grace_s =
+    int.parse(setting("CRUSHLING_SHUTDOWN_GRACE_SECONDS", "60"))
+    |> result.unwrap(60)
+  let router = socket.router(registry, me.user_id)
+  let socket = process.spawn_unlinked(fn() { socket.run(app_token, router) })
+
+  let terminate = process.new_subject()
+  use _ <- result.try(install_sigterm(terminate))
+  let _ = process.receive_forever(terminate)
+
+  // Take no new work, give running turns their grace period, then stop
+  // every agent before exiting.
+  io.println("crushling: shutting down")
+  process.kill(socket)
+  let done = process.new_subject()
+  process.send(registry, registry.Shutdown(grace_s * 1000, done))
+  let _ = process.receive(done, grace_s * 1000 + 60_000)
+  io.println("crushling: stopped")
+  halt(0)
   Ok(Nil)
 }
+
+@external(erlang, "crushling_signal", "install")
+fn install_sigterm(subject: process.Subject(Nil)) -> Result(Nil, String)
 
 fn allowed_users() -> Result(set.Set(String), String) {
   let users =

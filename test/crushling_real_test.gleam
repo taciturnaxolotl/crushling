@@ -111,6 +111,7 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { queued_prompts_and_bash_diff(wiring) }),
         with_timeout(600, fn() { survives_server_restart(wiring) }),
         with_timeout(600, fn() { registry_launches_and_idles(wiring) }),
+        with_timeout(600, fn() { shutdown_cancels_and_stops(wiring) }),
       ])
     }
   }
@@ -259,7 +260,8 @@ fn sink(calls: Subject(Call)) -> thread.Sink {
   }
   let plan_text = fn(plan: render.Plan) { render.plan_markdown(plan) }
   thread.Sink(
-    status: fn(_) { Nil },
+    working: fn(_) { Nil },
+    title: fn(_) { Nil },
     post_plan: fn(plan) { progress(plan_text(plan)) },
     update_plan: fn(_, plan) {
       process.send(calls, Progress(plan_text(plan)))
@@ -375,7 +377,8 @@ fn survives_server_restart(wiring: Wiring) -> Nil {
       "Use the bash tool to run: sleep 30\nThen reply with exactly the word DONE.",
     ),
   )
-  await_progress(calls, "sleep")
+  // A step still running, which is the sleep.
+  await_progress(calls, "▸")
 
   kill(env.server)
   let server = start_server(env.socket, env.log, env.home, env.server_env)
@@ -425,6 +428,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
         local.stop(key)
         process.send(launches, Stopped(key))
       },
+      exists: local.exists,
     )
   use <-
     guarded(_, fn() {
@@ -463,5 +467,73 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
   let assert True = stopped == key
   // The session survives: its messages are still in the workspace.
   let assert True = file_exists(root <> "/" <> key <> "/work/.crush/crush.db")
+  Nil
+}
+
+/// Shutdown mid-run: the turn gets its grace period, is then cancelled, and
+/// the agent is stopped before the registry reports done.
+fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
+  let root =
+    "/tmp/crushling-real-shutdown-"
+    <> int.to_string(int.absolute_value(unique()))
+  let local = launcher.local(root, wiring.backend, wiring.credentials)
+  let launches = process.new_subject()
+  let watched =
+    launcher.Launcher(
+      launch: fn(key) {
+        let result = local.launch(key)
+        process.send(launches, Launched(key))
+        result
+      },
+      stop: fn(key) {
+        local.stop(key)
+        process.send(launches, Stopped(key))
+      },
+      exists: local.exists,
+    )
+  use <-
+    guarded(_, fn() {
+      let _ =
+        sh("/tmp", "pkill -9 -f 'crush server --host unix://" <> root <> "'")
+      let _ = sh("/tmp", "rm -rf '" <> root <> "'")
+      Nil
+    })
+  let assert Ok(client) =
+    slackline.new("xoxb-test")
+    |> slackline.with_base_url("http://127.0.0.1:1/api")
+  let assert Ok(r) =
+    registry.start(registry.Config(
+      launcher: watched,
+      client:,
+      bot_user: "UBOT",
+      allowed: set.from_list(["U1"]),
+      idle_ms: 600_000,
+      flush_ms: 250,
+      mode: client.Sysadmin,
+    ))
+  process.send(
+    r,
+    registry.Received(registry.Incoming(
+      "C1",
+      "20.1",
+      "20.1",
+      "U1",
+      "<@UBOT> Use the bash tool to run: sleep 120\nThen reply DONE.",
+      True,
+    )),
+  )
+  let assert Ok(Launched(key)) = process.receive(launches, 60_000)
+  // Give the turn time to start its command.
+  process.sleep(15_000)
+  let done = process.new_subject()
+  process.send(r, registry.Shutdown(2000, done))
+  let assert Ok(Stopped(stopped)) = process.receive(launches, 60_000)
+  let assert True = stopped == key
+  let assert Ok(Nil) = process.receive(done, 60_000)
+  let assert "" =
+    string.trim(sh(
+      "/tmp",
+      "pgrep -f 'crush server --host unix://" <> root <> "'",
+    ))
   Nil
 }
