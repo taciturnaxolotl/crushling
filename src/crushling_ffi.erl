@@ -1,7 +1,8 @@
 -module(crushling_ffi).
 
--export([line_at/2, uuid_v4/0, monotonic_ms/0, log_warning/1, exec/3, sha256_hex/1,
-         file_exists/1, mkdir_p/1, write_private/2]).
+-export([line_at/2, uuid_v4/0, monotonic_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
+         file_exists/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
+         claude_version/0]).
 
 line_at(Lines, Index) ->
     element(Index + 1, Lines).
@@ -15,6 +16,11 @@ uuid_v4() ->
 
 monotonic_ms() ->
     erlang:monotonic_time(millisecond).
+
+%% Logged at notice, the lowest level the default handler prints.
+log_info(Text) ->
+    logger:notice("~ts", [Text]),
+    nil.
 
 log_warning(Text) ->
     logger:warning("~ts", [Text]),
@@ -73,4 +79,50 @@ write_private(Path, Content) ->
             end;
         {error, R} ->
             {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
+    end.
+
+%% A setting from the environment, else from ./.env.
+getenv(Name) ->
+    N = unicode:characters_to_list(Name),
+    case os:getenv(N) of
+        false -> dotenv(N);
+        "" -> dotenv(N);
+        V -> {ok, unicode:characters_to_binary(V)}
+    end.
+
+dotenv(Name) ->
+    case file:read_file(".env") of
+        {ok, Bin} ->
+            Lines = string:split(unicode:characters_to_list(Bin), "\n", all),
+            Found = [unquote(string:trim(V))
+                     || Line <- Lines,
+                        [K, V] <- [string:split(Line, "=")],
+                        string:trim(K) =:= Name],
+            case [V || V <- Found, V =/= ""] of
+                [V | _] -> {ok, unicode:characters_to_binary(V)};
+                [] -> {error, nil}
+            end;
+        {error, _} ->
+            {error, nil}
+    end.
+
+unquote([$" | Rest]) -> string:trim(Rest, trailing, "\"");
+unquote([$' | Rest]) -> string:trim(Rest, trailing, "'");
+unquote(Value) -> Value.
+
+expand_home(<<"~/", Rest/binary>>) ->
+    unicode:characters_to_binary([os:getenv("HOME"), "/", Rest]);
+expand_home(Path) ->
+    Path.
+
+%% The installed Claude Code's version, or crush's floor without one.
+claude_version() ->
+    case os:find_executable("claude") of
+        false -> <<"2.1.282">>;
+        Claude ->
+            Out = os:cmd(Claude ++ " --version 2>/dev/null"),
+            case re:run(Out, "[0-9]+\\.[0-9]+\\.[0-9]+", [{capture, first, binary}]) of
+                {match, [V]} -> V;
+                nomatch -> <<"2.1.282">>
+            end
     end.

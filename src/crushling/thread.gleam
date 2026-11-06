@@ -29,14 +29,19 @@ import gleam/string
 /// by a test double in tests.
 pub type Sink {
   Sink(
-    /// Post a new message to the thread, returning its id (Slack's `ts`).
+    /// Show a working status on the thread, or clear it with "".
+    status: fn(String) -> Nil,
+    /// Post the plan card, returning its id (Slack's `ts`).
+    post_plan: fn(render.Plan) -> Result(String, String),
+    update_plan: fn(String, render.Plan) -> Result(Nil, String),
+    /// Post a markdown message.
     post: fn(String) -> Result(String, String),
-    /// Replace the text of a message posted earlier.
-    update: fn(String, String) -> Result(Nil, String),
+    /// Post the controls for a run (a Stop button), returning their id.
+    post_controls: fn(String) -> Result(String, String),
+    delete: fn(String) -> Nil,
     /// Attach a file to the thread: name, then contents.
     upload: fn(String, String) -> Result(Nil, String),
-    /// Called once per run after its reply is posted, for reactions,
-    /// metrics, or tests.
+    /// Called once per run after its reply is posted.
     finished: fn(Finished) -> Nil,
   )
 }
@@ -47,7 +52,7 @@ pub type Finished {
     outcome: run.Outcome,
     /// The reply as posted, joined across messages.
     text: String,
-    files: List(String),
+    changes: List(snapshot.Change),
     patch: String,
   )
 }
@@ -77,8 +82,11 @@ pub type Message {
 type Active {
   Active(
     run: Run,
-    ts: Option(String),
-    shown: String,
+    /// The plan card, once posted, and what it last showed.
+    plan_ts: Option(String),
+    shown: Option(render.Plan),
+    /// The Stop button message.
+    controls_ts: Option(String),
     /// The workspace snapshot taken just before the prompt was sent.
     base: Option(String),
   )
@@ -102,7 +110,8 @@ type State {
     scratch: String,
     conns: Option(Conns),
     ready: Option(Ready),
-    /// Kept across reconnects; sessions live in the sandbox's database.
+    /// Kept across reconnects; sessions live in the sandbox's database, so
+    /// a fresh actor for the same workspace picks up the latest one.
     session_id: Option(String),
     /// Prompts not yet sent, oldest first.
     waiting: List(String),
@@ -265,7 +274,11 @@ fn establish(state: State) -> Result(#(Conns, Ready), String) {
     use _ <- result.try(wait_ready(conns, workspace_id, ready_attempts))
     case state.session_id {
       Some(id) -> Ok(id)
-      None -> call(conns, client.create_session(workspace_id, config.title))
+      None ->
+        case call(conns, client.latest_session(workspace_id)) {
+          Ok(Some(id)) -> Ok(id)
+          _ -> call(conns, client.create_session(workspace_id, config.title))
+        }
     }
   }
   case setup {
@@ -312,7 +325,7 @@ fn settle_orphan(state: State, conns: Conns, ready: Ready) -> State {
 fn fail_everything(state: State, reason: String) -> State {
   let _ = case state.waiting, state.active {
     [], None -> Ok("")
-    _, _ -> state.config.sink.post(":warning: " <> reason)
+    _, _ -> state.config.sink.post("_" <> reason <> "_")
   }
   State(..state, waiting: [], active: None)
 }
@@ -345,8 +358,11 @@ fn send_prompt(
     )
   {
     Ok(Nil) -> {
+      state.config.sink.status("is thinking")
       let run = run.new(ready.session_id, run_id)
-      State(..state, active: Some(Active(run:, ts: None, shown: "", base:)))
+      let active =
+        Active(run:, plan_ts: None, shown: None, controls_ts: None, base:)
+      State(..state, active: Some(active))
     }
     Error(client.Transport(_)) -> {
       process.send(state.self, Reconnect)
@@ -355,7 +371,7 @@ fn send_prompt(
     Error(error) -> {
       let _ =
         state.config.sink.post(
-          ":warning: couldn't send that: " <> describe(error),
+          "_couldn't send that to the agent: " <> describe(error) <> "_",
         )
       send_next(state)
     }
@@ -460,31 +476,52 @@ fn on_event(state: State, event: event.Event) -> State {
 fn flush(state: State) -> State {
   case state.active {
     Some(active) ->
-      State(..state, active: Some(show_progress(state.config.sink, active)))
+      State(..state, active: Some(show_progress(state.config, active)))
     None -> state
   }
 }
 
-fn show_progress(sink: Sink, active: Active) -> Active {
-  let text = render.progress(active.run, render.message_limit)
-  let started = run.text(active.run) != "" || active.run.tools != []
-  case active.ts, started, text == active.shown {
-    _, False, _ | _, _, True -> active
-    None, True, False ->
-      case sink.post(text) {
-        Ok(ts) -> Active(..active, ts: Some(ts), shown: text)
-        Error(reason) -> {
-          warn("crushling: post failed: " <> reason)
-          active
-        }
-      }
-    Some(ts), True, False ->
-      case sink.update(ts, text) {
-        Ok(Nil) -> Active(..active, shown: text)
-        Error(reason) -> {
-          warn("crushling: update failed: " <> reason)
-          active
-        }
+/// Post or update the plan card. The first time it appears, the Stop button
+/// goes up with it. Posting a message clears the thread's status, so it is
+/// set again while the run carries on.
+fn show_progress(config: Config, active: Active) -> Active {
+  let sink = config.sink
+  case render.plan(active.run, config.root) {
+    None -> active
+    Some(plan) if Some(plan) == active.shown -> active
+    Some(plan) ->
+      case active.plan_ts {
+        Some(ts) ->
+          case sink.update_plan(ts, plan) {
+            Ok(Nil) -> Active(..active, shown: Some(plan))
+            Error(reason) -> {
+              warn("crushling: plan update failed: " <> reason)
+              active
+            }
+          }
+        None ->
+          case sink.post_plan(plan) {
+            Ok(ts) -> {
+              let controls_ts = case sink.post_controls(active.run.run_id) {
+                Ok(ts) -> Some(ts)
+                Error(reason) -> {
+                  warn("crushling: controls failed: " <> reason)
+                  None
+                }
+              }
+              sink.status("is working")
+              Active(
+                ..active,
+                plan_ts: Some(ts),
+                shown: Some(plan),
+                controls_ts:,
+              )
+            }
+            Error(reason) -> {
+              warn("crushling: plan post failed: " <> reason)
+              active
+            }
+          }
       }
   }
 }
@@ -508,19 +545,23 @@ fn finish_if_done(state: State) -> State {
   }
 }
 
+/// A patch bigger than this is not attached; Slack won't preview it, and a
+/// change that size is better read in the workspace.
+const max_patch_bytes = 400_000
+
 /// The run's changes: from workspace snapshots when they work, so edits
 /// made through `bash` are included, otherwise from the file events.
-fn changes(state: State, active: Active) -> #(List(String), String) {
+fn changes(state: State, active: Active) -> #(List(snapshot.Change), String) {
   let from_snapshots = case active.base, state.conns, state.ready {
     Some(base), Some(conns), Some(ready) -> {
       use after <- result.try(
         take_snapshot(state, conns, ready) |> option.to_result(Nil),
       )
-      use names <- result.try(shell(
+      use numstat <- result.try(shell(
         state,
         conns,
         ready,
-        snapshot.changed_files(base, after),
+        snapshot.numstat(base, after),
       ))
       use patch <- result.try(shell(
         state,
@@ -528,7 +569,7 @@ fn changes(state: State, active: Active) -> #(List(String), String) {
         ready,
         snapshot.diff(base, after),
       ))
-      Ok(#(snapshot.parse_files(names), patch))
+      Ok(#(snapshot.parse_numstat(numstat), patch))
     }
     _, _, _ -> Error(Nil)
   }
@@ -536,39 +577,64 @@ fn changes(state: State, active: Active) -> #(List(String), String) {
     Ok(found) -> found
     Error(Nil) -> {
       let root = state.config.root
-      let files =
-        run.changes(active.run, root) |> list.map(fn(change) { change.path })
-      #(files, run.patch(active.run, root))
+      let changes =
+        run.changes(active.run, root)
+        |> list.map(fn(change) {
+          snapshot.Change(change.path, Error(Nil), Error(Nil))
+        })
+      #(changes, run.patch(active.run, root))
     }
   }
 }
 
 fn finish(state: State, active: Active) -> Nil {
-  let sink = state.config.sink
-  let #(files, patch) = changes(state, active)
-  let chunks = render.final(active.run, files)
-  let rest = case active.ts, chunks {
-    Some(ts), [first, ..rest] ->
-      case sink.update(ts, first) {
-        Ok(Nil) -> rest
-        Error(reason) -> {
-          warn("crushling: final update failed: " <> reason)
-          chunks
-        }
+  let config = state.config
+  let sink = config.sink
+  let #(changes, patch) = changes(state, active)
+
+  // The plan card settles into its final state, and the Stop button goes.
+  case active.plan_ts, render.plan(active.run, config.root) {
+    Some(ts), Some(plan) ->
+      case sink.update_plan(ts, plan) {
+        Ok(Nil) -> Nil
+        Error(reason) -> warn("crushling: plan update failed: " <> reason)
       }
-    _, _ -> chunks
+    _, _ -> Nil
   }
-  list.each(rest, fn(chunk) {
-    case sink.post(chunk) {
+  case active.controls_ts {
+    Some(ts) -> sink.delete(ts)
+    None -> Nil
+  }
+
+  let answer = render.answer(active.run)
+  let answered = answer != []
+  let closing =
+    [render.changes(changes), render.note(active.run, answered)]
+    |> option.values
+  // The file summary and any note ride on the last answer message when
+  // there is one, so a run ends in a single message.
+  let messages = case list.reverse(answer), closing {
+    [], [] -> []
+    [], closing -> [string.join(closing, "\n")]
+    [last, ..earlier], [] -> list.reverse([last, ..earlier])
+    [last, ..earlier], closing ->
+      list.reverse([last <> "\n\n" <> string.join(closing, "\n"), ..earlier])
+  }
+  list.each(messages, fn(text) {
+    case sink.post(text) {
       Ok(_) -> Nil
       Error(reason) -> warn("crushling: post failed: " <> reason)
     }
   })
-  case patch {
-    "" -> Nil
-    patch ->
+  sink.status("")
+
+  case patch, string.byte_size(patch) > max_patch_bytes {
+    "", _ -> Nil
+    _, True ->
+      warn("crushling: patch too large to attach: " <> active.run.run_id)
+    patch, False ->
       case
-        sink.upload(string.slice(active.run.run_id, 0, 8) <> ".patch", patch)
+        sink.upload(string.slice(active.run.run_id, 0, 8) <> ".diff", patch)
       {
         Ok(Nil) -> Nil
         Error(reason) -> warn("crushling: upload failed: " <> reason)
@@ -577,8 +643,8 @@ fn finish(state: State, active: Active) -> Nil {
   sink.finished(Finished(
     run_id: active.run.run_id,
     outcome: option.unwrap(active.run.outcome, run.Cancelled),
-    text: string.join(chunks, "\n"),
-    files:,
+    text: string.join(messages, "\n"),
+    changes:,
     patch:,
   ))
 }

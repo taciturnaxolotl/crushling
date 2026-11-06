@@ -18,7 +18,16 @@ pub type ToolStatus {
 }
 
 pub type Tool {
-  Tool(id: String, name: String, summary: String, status: ToolStatus)
+  Tool(
+    id: String,
+    name: String,
+    /// The raw JSON input, for renderers that want more than `summary`.
+    input: String,
+    summary: String,
+    status: ToolStatus,
+    /// The result text, once it arrives.
+    output: String,
+  )
 }
 
 pub type Outcome {
@@ -105,7 +114,7 @@ fn apply_message(run: Run, message: event.Message) -> Run {
           }
           list.map(tools, fn(tool) {
             case tool.id == result.tool_call_id {
-              True -> Tool(..tool, status:)
+              True -> Tool(..tool, status:, output: result.content)
               False -> tool
             }
           })
@@ -122,11 +131,14 @@ fn upsert_tool(tools: List(Tool), call: event.ToolCall) -> List(Tool) {
     True ->
       list.map(tools, fn(tool) {
         case tool.id == call.id {
-          True -> Tool(..tool, name: call.name, summary:)
+          True -> Tool(..tool, name: call.name, input: call.input, summary:)
           False -> tool
         }
       })
-    False -> list.append(tools, [Tool(call.id, call.name, summary, Running)])
+    False ->
+      list.append(tools, [
+        Tool(call.id, call.name, call.input, summary, Running, ""),
+      ])
   }
 }
 

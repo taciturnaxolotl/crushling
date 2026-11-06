@@ -1,0 +1,181 @@
+//// Socket Mode: one WebSocket to Slack, reopened whenever Slack asks or the
+//// connection drops, with every event turned into a `registry.Incoming`.
+
+import crushling/registry
+import crushling/slack
+import gleam/erlang/process.{type Subject}
+import gleam/http/request
+import gleam/option.{None, Some}
+import gleam/string
+import slackline
+import slackline/api/apps
+import slackline/app
+import slackline/event
+import slackline/httpc
+import slackline/interaction
+import stratus
+
+@external(erlang, "crushling_ffi", "log_warning")
+fn warn(text: String) -> Nil
+
+/// The router: Slack events in as `registry.Received`, Stop buttons as
+/// `registry.StopPressed`.
+pub fn router(
+  registry: Subject(registry.Message),
+  bot_user: String,
+) -> app.App {
+  app.unverified()
+  |> app.action(slack.stop_action, fn(_action, payload) {
+    case payload.container {
+      Some(interaction.MessageContainer(
+        channel_id: Some(channel),
+        thread_ts: Some(thread_ts),
+        ..,
+      )) ->
+        process.send(
+          registry,
+          registry.StopPressed(channel, thread_ts, payload.user.id),
+        )
+      _ -> Nil
+    }
+    app.ack()
+  })
+  |> app.on_event(fn(event, _delivery) {
+    case incoming(event, bot_user) {
+      Ok(message) -> process.send(registry, registry.Received(message))
+      Error(Nil) -> Nil
+    }
+  })
+}
+
+/// The messages worth routing: mentions, thread replies, and direct
+/// messages, from people rather than bots.
+pub fn incoming(
+  event: event.Event,
+  bot_user: String,
+) -> Result(registry.Incoming, Nil) {
+  let mentions_bot = fn(text) { string.contains(text, "<@" <> bot_user <> ">") }
+  case event {
+    event.AppMention(
+      channel:,
+      user: Some(user),
+      text: Some(text),
+      ts: Some(ts),
+      thread_ts:,
+      bot_id: None,
+      subtype: None,
+      ..,
+    ) ->
+      Ok(registry.Incoming(
+        channel:,
+        thread_ts: option.unwrap(thread_ts, ts),
+        ts:,
+        user:,
+        text:,
+        mention: True,
+      ))
+    event.MessageEvent(event.PlainMessage(
+      channel:,
+      user: Some(user),
+      text: Some(text),
+      ts: Some(ts),
+      thread_ts:,
+      channel_type:,
+      bot_id: None,
+      ..,
+    )) ->
+      case mentions_bot(text), thread_ts, channel_type {
+        // The app_mention event for the same message handles it.
+        True, _, _ -> Error(Nil)
+        // A direct message starts a thread, as a mention would.
+        False, _, Some(event.Im) ->
+          Ok(registry.Incoming(
+            channel:,
+            thread_ts: option.unwrap(thread_ts, ts),
+            ts:,
+            user:,
+            text:,
+            mention: True,
+          ))
+        False, Some(root), _ ->
+          Ok(registry.Incoming(
+            channel:,
+            thread_ts: root,
+            ts:,
+            user:,
+            text:,
+            mention: False,
+          ))
+        False, None, _ -> Error(Nil)
+      }
+    _ -> Error(Nil)
+  }
+}
+
+/// Connect and stay connected. Never returns.
+pub fn run(app_token: String, router: app.App) -> Nil {
+  case apps.connections_open() |> httpc.send(slackline.new(app_token)) {
+    Error(error) -> {
+      warn("crushling: connections.open: " <> slackline.describe_error(error))
+      process.sleep(5000)
+      run(app_token, router)
+    }
+    Ok(opened) -> {
+      session(opened.url, router)
+      process.sleep(1000)
+      run(app_token, router)
+    }
+  }
+}
+
+/// One WebSocket session; returns when it ends for any reason. stratus only
+/// reports a clean close, so the connection process is monitored as well.
+fn session(url: String, router: app.App) -> Nil {
+  let url = case url {
+    "wss://" <> rest -> "https://" <> rest
+    "ws://" <> rest -> "http://" <> rest
+    url -> url
+  }
+  let done = process.new_subject()
+  case request.to(url) {
+    Error(Nil) -> warn("crushling: bad Socket Mode url")
+    Ok(req) -> {
+      let started =
+        stratus.new(request: req, state: Nil)
+        |> stratus.on_message(fn(state, message, connection) {
+          case message {
+            stratus.Text(frame) ->
+              case app.handle_socket(router, frame) {
+                app.Send(frame: reply, after:) -> {
+                  let _ = stratus.send_text_message(connection, reply)
+                  process.spawn_unlinked(after)
+                  stratus.continue(state)
+                }
+                app.Reconnect(_) -> {
+                  process.send(done, Nil)
+                  stratus.stop()
+                }
+                app.Ignore -> stratus.continue(state)
+              }
+            _ -> stratus.continue(state)
+          }
+        })
+        |> stratus.on_close(fn(_, _) { process.send(done, Nil) })
+        |> stratus.start
+      case started {
+        Error(error) ->
+          warn("crushling: Socket Mode connect: " <> string.inspect(error))
+        Ok(started) -> {
+          let monitor = process.monitor(started.pid)
+          let selector =
+            process.new_selector()
+            |> process.select(done)
+            |> process.select_specific_monitor(monitor, fn(_) { Nil })
+          let _ = process.selector_receive_forever(selector)
+          process.demonitor_process(monitor)
+          Nil
+        }
+      }
+    }
+  }
+}

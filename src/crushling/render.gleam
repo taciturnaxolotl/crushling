@@ -1,142 +1,290 @@
-//// Turn a run into Markdown for Slack: a live progress view while it runs,
-//// and the final reply split into messages that fit Slack's limits.
+//// How a run looks in Slack, following gorkie's layout:
+////
+//// - while it works, a plan card with one task row per tool call;
+//// - when it finishes, the answer as its own messages, split to fit, with a
+////   line naming the files it changed;
+//// - when it fails, a note saying whether what is above is partial.
+////
+//// Everything here is pure; `crushling/slack` turns it into blocks.
 
 import crushling/run.{type Run}
+import crushling/snapshot
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/string
 
 /// Slack's markdown block accepts up to 12,000 characters; stay well under.
 pub const message_limit = 11_000
 
-const tools_shown = 3
+/// Rows past this many are folded into one, as gorkie does; a plan block
+/// with too many tasks is rejected.
+const max_tasks = 40
 
-pub fn progress(run: Run, limit: Int) -> String {
-  let status = case list.reverse(run.tools) {
-    [] -> "_thinking…_"
-    recent ->
-      list.take(recent, tools_shown)
-      |> list.reverse
-      |> list.map(tool_line)
-      |> string.join("\n")
-  }
-  let hidden = list.length(run.tools) - tools_shown
-  let status = case hidden > 0 {
-    True -> "_" <> int.to_string(hidden) <> " earlier tool calls_\n" <> status
-    False -> status
-  }
-  case run.text(run) {
-    "" -> status
-    text -> tail(text, limit - string.length(status) - 2) <> "\n\n" <> status
-  }
+/// Plan task details and outputs are kept to a line.
+const line_limit = 96
+
+pub type TaskStatus {
+  InProgress
+  Complete
+  Failed
 }
 
-fn tool_line(tool: run.Tool) -> String {
-  let mark = case tool.status {
-    run.Running -> "▸"
-    run.Succeeded -> "✓"
-    run.Failed -> "✗"
-  }
-  let summary = case tool.summary {
-    "" -> ""
-    summary -> " `" <> string.replace(summary, "`", "'") <> "`"
-  }
-  "> " <> mark <> " " <> tool.name <> summary
+pub type Task {
+  Task(
+    id: String,
+    title: String,
+    status: TaskStatus,
+    details: String,
+    output: String,
+  )
 }
 
-/// The end of `text`, cut at a line boundary, with any open code fence
-/// reopened so the markdown still renders.
-fn tail(text: String, limit: Int) -> String {
-  case string.length(text) <= limit {
-    True -> text
-    False -> {
-      let budget = int.max(0, limit - 8)
-      let cut = string.slice(text, string.length(text) - budget, budget)
-      let cut = case string.split_once(cut, "\n") {
-        Ok(#(_, rest)) -> rest
-        Error(Nil) -> cut
+pub type Plan {
+  Plan(title: String, tasks: List(Task))
+}
+
+/// The plan card, or `None` before the run has done anything worth showing.
+pub fn plan(run: Run, root: String) -> Option(Plan) {
+  case run.tools {
+    [] -> None
+    tools -> {
+      let count = list.length(tools)
+      let title = case run.outcome {
+        None -> "Working"
+        Some(run.Completed(_)) -> "Done · " <> steps(count)
+        Some(run.Errored(_)) -> "Failed · " <> steps(count)
+        Some(run.Cancelled) -> "Stopped · " <> steps(count)
       }
-      let prefix = case odd_fences(text) != odd_fences(cut) {
-        True -> "```\n"
-        False -> ""
-      }
-      "…\n" <> prefix <> cut
+      let tasks = list.map(tools, task(_, root, run.outcome))
+      Some(Plan(title:, tasks: fold(tasks)))
     }
   }
 }
 
-fn odd_fences(text: String) -> Bool {
-  int.is_odd(fence_count(text))
+fn steps(count: Int) -> String {
+  case count {
+    1 -> "1 step"
+    n -> int.to_string(n) <> " steps"
+  }
 }
 
-fn fence_count(text: String) -> Int {
-  string.split(text, "\n")
-  |> list.count(fn(line) { string.starts_with(string.trim_start(line), "```") })
+/// Keep the most recent rows and fold the earlier ones into a single row.
+fn fold(tasks: List(Task)) -> List(Task) {
+  let count = list.length(tasks)
+  case count > max_tasks {
+    False -> tasks
+    True -> {
+      let hidden = count - max_tasks + 1
+      let earlier =
+        Task(
+          id: "earlier",
+          title: "Earlier steps",
+          status: Complete,
+          details: "",
+          output: int.to_string(hidden) <> " earlier steps",
+        )
+      [earlier, ..list.drop(tasks, hidden)]
+    }
+  }
 }
 
-/// The final reply: the assistant's text and a footer naming the changed
-/// files, split into messages.
-pub fn final(run: Run, changed: List(String)) -> List(String) {
-  let body = case run.outcome {
-    Some(run.Completed(text)) ->
-      case run.text(run) {
-        "" -> text
-        streamed -> streamed
+fn task(tool: run.Tool, root: String, outcome: Option(run.Outcome)) -> Task {
+  let status = case tool.status, outcome {
+    run.Succeeded, _ -> Complete
+    run.Failed, _ -> Failed
+    // A tool still running when the run ended never will finish.
+    run.Running, Some(run.Completed(_)) -> Complete
+    run.Running, Some(_) -> Failed
+    run.Running, None -> InProgress
+  }
+  let details =
+    tool.summary
+    |> string.replace(root <> "/", "")
+    |> clip
+  Task(
+    id: tool.id,
+    title: title(tool.name),
+    status:,
+    details:,
+    output: output(tool, status),
+  )
+}
+
+/// What a tool is doing, in words rather than its name.
+pub fn title(name: String) -> String {
+  case name {
+    "bash" -> "Running a command"
+    "view" -> "Reading a file"
+    "write" -> "Writing a file"
+    "edit" | "multiedit" -> "Editing a file"
+    "ls" -> "Listing files"
+    "glob" -> "Finding files"
+    "grep" | "rg" -> "Searching the code"
+    "fetch" | "agentic_fetch" | "web_fetch" -> "Reading the web"
+    "web_search" -> "Searching the web"
+    "download" -> "Downloading"
+    "sourcegraph" -> "Searching public code"
+    "agent" | "agent_dispatch" -> "Running a sub-agent"
+    "todos" -> "Updating the plan"
+    "job_output" | "job_kill" -> "Checking a background job"
+    _ ->
+      case string.starts_with(name, "lsp_"), string.starts_with(name, "mcp_") {
+        True, _ -> "Asking the language server"
+        _, True -> humanize(string.drop_start(name, 4))
+        _, _ -> humanize(name)
       }
-    Some(run.Errored(error)) ->
-      run.text(run) <> "\n\n:warning: run failed: " <> error
-    Some(run.Cancelled) -> run.text(run) <> "\n\n_cancelled_"
-    None -> run.text(run)
   }
-  let footer = footer(run, changed)
-  let full = case string.trim(body), footer {
-    "", "" -> "_no reply_"
-    body, "" -> body
-    "", footer -> footer
-    body, footer -> body <> "\n\n" <> footer
-  }
-  chunk(full, message_limit)
 }
 
-fn footer(run: Run, changed: List(String)) -> String {
-  let tools = list.length(run.tools)
-  let files = list.map(changed, fn(path) { "`" <> path <> "`" })
-  let parts =
-    [
-      case tools {
-        0 -> ""
-        1 -> "1 tool call"
-        n -> int.to_string(n) <> " tool calls"
-      },
-      case files {
-        [] -> ""
-        files -> "changed " <> string.join(files, ", ")
-      },
-    ]
-    |> list.filter(fn(part) { part != "" })
-  case parts {
-    [] -> ""
-    parts -> "_" <> string.join(parts, " · ") <> "_"
+fn humanize(name: String) -> String {
+  case string.replace(name, "_", " ") |> string.trim {
+    "" -> "Using a tool"
+    words -> string.capitalise(words)
   }
+}
+
+/// The result, cut to a line. File tools announce success in boilerplate,
+/// so they show nothing unless they failed.
+fn output(tool: run.Tool, status: TaskStatus) -> String {
+  case status, tool.name {
+    InProgress, _ -> ""
+    Complete, "view"
+    | Complete, "write"
+    | Complete, "edit"
+    | Complete, "multiedit"
+    | Complete, "todos"
+    -> ""
+    _, _ -> first_line(tool.output) |> clip
+  }
+}
+
+fn first_line(text: String) -> String {
+  text
+  |> string.replace("<result>", "")
+  |> string.replace("</result>", "")
+  |> string.split("\n")
+  |> list.map(string.trim)
+  |> list.find(fn(line) { line != "" && !string.starts_with(line, "<") })
+  |> option.from_result
+  |> option.unwrap("")
+}
+
+fn clip(text: String) -> String {
+  let text = string.trim(text)
+  case string.length(text) > line_limit {
+    True -> string.slice(text, 0, line_limit - 1) <> "…"
+    False -> text
+  }
+}
+
+/// The answer, split into messages. Empty when there is nothing to say.
+pub fn answer(run: Run) -> List(String) {
+  let text = case run.text(run), run.outcome {
+    "", Some(run.Completed(text)) -> string.trim(text)
+    streamed, _ -> streamed
+  }
+  case text {
+    "" -> []
+    text -> chunk(text, message_limit)
+  }
+}
+
+/// A closing note, when the run didn't simply finish. `answered` is whether
+/// any of the answer was posted.
+pub fn note(run: Run, answered: Bool) -> Option(String) {
+  let did_work = run.tools != []
+  case run.outcome {
+    Some(run.Cancelled) -> Some("_stopped._")
+    Some(run.Errored(reason)) -> {
+      let reason = clip_reason(reason)
+      Some(case answered, did_work {
+        True, _ ->
+          "_the run failed partway ("
+          <> reason
+          <> "), so the reply above may be partial. Send a follow-up to carry on._"
+        False, True ->
+          "_the run failed ("
+          <> reason
+          <> "). The steps above show what got done; send a follow-up to carry on._"
+        False, False -> "_the run failed: " <> reason <> "_"
+      })
+    }
+    Some(run.Completed(_)) if !answered && !did_work -> Some("_no reply._")
+    _ -> None
+  }
+}
+
+fn clip_reason(reason: String) -> String {
+  let reason = string.trim(reason) |> string.replace("_", "\\_")
+  case string.length(reason) > 300 {
+    True -> string.slice(reason, 0, 299) <> "…"
+    False -> reason
+  }
+}
+
+/// A line naming what changed, with line counts.
+pub fn changes(changes: List(snapshot.Change)) -> Option(String) {
+  case changes {
+    [] -> None
+    changes -> {
+      let shown = list.take(changes, 8)
+      let more = list.length(changes) - list.length(shown)
+      let items =
+        list.map(shown, fn(change) {
+          let counts = case change.added, change.removed {
+            Ok(added), Ok(removed) ->
+              " +" <> int.to_string(added) <> " −" <> int.to_string(removed)
+            _, _ -> " (binary)"
+          }
+          "`" <> string.replace(change.path, "`", "'") <> "`" <> counts
+        })
+      let items = case more > 0 {
+        True -> list.append(items, ["and " <> int.to_string(more) <> " more"])
+        False -> items
+      }
+      Some("_changed " <> string.join(items, ", ") <> "_")
+    }
+  }
+}
+
+/// The same plan as plain markdown, for workspaces that reject plan blocks.
+pub fn plan_markdown(plan: Plan) -> String {
+  let rows =
+    list.map(plan.tasks, fn(task) {
+      let mark = case task.status {
+        InProgress -> "▸"
+        Complete -> "✓"
+        Failed -> "✗"
+      }
+      let details = case task.details {
+        "" -> ""
+        details -> " `" <> string.replace(details, "`", "'") <> "`"
+      }
+      "> " <> mark <> " " <> task.title <> details
+    })
+  "*"
+  <> plan.title
+  <> "*\n"
+  <> string.join(list.take(list.reverse(rows), 12) |> list.reverse, "\n")
 }
 
 /// Split text into pieces of at most `limit` characters, preferring
 /// paragraph then line boundaries, and closing and reopening code fences
 /// that a split would cut through.
 pub fn chunk(text: String, limit: Int) -> List(String) {
-  chunk_loop(text, limit, False, [])
+  chunk_loop(text, limit, None, [])
 }
 
 fn chunk_loop(
   text: String,
   limit: Int,
-  reopen: Bool,
+  reopen: Option(String),
   acc: List(String),
 ) -> List(String) {
   let text = case reopen {
-    True -> "```\n" <> text
-    False -> text
+    Some(fence) -> fence <> "\n" <> text
+    None -> text
   }
   case string.length(text) <= limit {
     True -> list.reverse([text, ..acc])
@@ -150,14 +298,27 @@ fn chunk_loop(
       }
       let head = string.slice(text, 0, at)
       let rest = string.drop_start(text, at) |> string.trim_start
-      let open = odd_fences(head)
+      let open = open_fence(head)
       let head = case open {
-        True -> head <> "\n```"
-        False -> head
+        Some(_) -> head <> "\n```"
+        None -> head
       }
       chunk_loop(rest, limit, open, [string.trim_end(head), ..acc])
     }
   }
+}
+
+/// The fence line (with its language) left open at the end of `text`.
+fn open_fence(text: String) -> Option(String) {
+  string.split(text, "\n")
+  |> list.fold(None, fn(open, line) {
+    let trimmed = string.trim_start(line)
+    case string.starts_with(trimmed, "```"), open {
+      True, None -> Some(string.trim(trimmed))
+      True, Some(_) -> None
+      False, _ -> open
+    }
+  })
 }
 
 fn last_index(haystack: String, needle: String) -> Result(Int, Nil) {

@@ -214,8 +214,18 @@ pub fn observe(policy: Policy, key: String) -> Result(Observed, Error) {
 
 /// Make sure the thread's container is running under the current policy and
 /// return the host path of its socket.
-pub fn ensure(policy: Policy, key: String) -> Result(String, Error) {
+///
+/// `before_start` runs once the container's crush.json is written and
+/// before crush starts, which is when a managed token has to be added: crush
+/// only adopts newer tokens from disk for a provider that had one when it
+/// loaded.
+pub fn ensure(
+  policy: Policy,
+  key: String,
+  before_start: fn() -> Result(Nil, String),
+) -> Result(String, Error) {
   use _ <- result.try(prepare(policy, key))
+  use _ <- result.try(before_start() |> result.map_error(Filesystem))
   use observed <- result.try(observe(policy, key))
   let name = container_name(key)
   use _ <- result.try(case decide(observed, policy) {
