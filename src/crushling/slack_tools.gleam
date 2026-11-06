@@ -25,11 +25,12 @@ import gleam/string
 import slackline
 import slackline/api/conversations
 import slackline/api/conversations/history
-import slackline/api/conversations/list as conversations_list
 import slackline/api/conversations/replies
 import slackline/api/files/complete_upload_external
 import slackline/api/users
+import slackline/api/users/conversations as users_conversations
 import slackline/api/users/info as users_info
+import slackline/conversation
 import slackline/httpc
 import slackline/message
 
@@ -121,7 +122,7 @@ pub fn tools() -> List(mcp.Tool) {
     ),
     mcp.Tool(
       "post_message",
-      "Post a message in the conversation you are working in, right away, without waiting for your turn to end. Use it for progress updates or a question; your final reply is posted for you. Slack markdown.",
+      "Post a progress update in the conversation you are working in while you keep working, such as what you found so far in a long task. Don't use it for your answer: your reply at the end of the turn is posted for you, so posting it here too shows it twice. Slack markdown.",
       schema([#("text", "string", "The message.")], ["text"]),
     ),
     mcp.Tool(
@@ -209,7 +210,12 @@ pub fn call(
         "" -> Error("there's nothing to post")
         text -> {
           use posted <- result.try(ask(thread, thread.Say(text, _)))
-          posted |> result.map(fn(ts) { "posted (ts " <> ts <> ")" })
+          posted
+          |> result.map(fn(ts) {
+            "posted (ts "
+            <> ts
+            <> "). People have read it, so don't repeat it in your reply; end the turn with only what is new, or nothing."
+          })
         }
       }
     "share_file" ->
@@ -296,18 +302,16 @@ fn line(context: Context, message: message.Message) -> Result(String, Nil) {
 }
 
 fn list_channels(context: Context) -> Result(String, String) {
-  use found <- result.try(
-    conversations.list()
-    |> conversations_list.types(["public_channel", "private_channel"])
-    |> conversations_list.exclude_archived(True)
-    |> conversations_list.limit(1000)
-    |> httpc.send(context.client)
-    |> result.map_error(slack.describe),
-  )
+  // users.conversations lists only what the bot is in, unlike
+  // conversations.list, whose `is_member` Slack doesn't always fill in.
+  let first =
+    users.conversations()
+    |> users_conversations.types(["public_channel", "private_channel"])
+    |> users_conversations.exclude_archived(True)
+    |> users_conversations.limit(200)
+  use channels <- result.try(all_channels(context, first, [], 10))
   let lines =
-    option.unwrap(found.channels, [])
-    |> list.filter(fn(channel) { channel.is_member == Some(True) })
-    |> list.map(fn(channel) {
+    list.map(channels, fn(channel) {
       "#"
       <> option.unwrap(channel.name, "?")
       <> " ("
@@ -321,6 +325,22 @@ fn list_channels(context: Context) -> Result(String, String) {
   case lines {
     [] -> Ok("(you aren't in any channels)")
     lines -> Ok(string.join(lines, "\n"))
+  }
+}
+
+fn all_channels(
+  context: Context,
+  call: slackline.Call(users.Conversations, users.ConversationsResponse),
+  found: List(conversation.Conversation),
+  pages_left: Int,
+) -> Result(List(conversation.Conversation), String) {
+  use page <- result.try(
+    httpc.send(call, context.client) |> result.map_error(slack.describe),
+  )
+  let found = list.append(found, option.unwrap(page.channels, []))
+  case pages_left > 1, slackline.next_page(call, page.response_metadata) {
+    True, Some(next) -> all_channels(context, next, found, pages_left - 1)
+    _, _ -> Ok(found)
   }
 }
 
