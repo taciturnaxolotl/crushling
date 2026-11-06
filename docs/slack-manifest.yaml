@@ -11,6 +11,8 @@ features:
   bot_user:
     display_name: crushling
     always_online: true
+  code_channels:
+    enabled: true
   agent_view:
     agent_description: So cuuuuute 💖
     suggested_prompts: []
@@ -20,11 +22,15 @@ oauth_config:
       - app_mentions:read
       - assistant:write
       - channels:history
+      - channels:read
       - groups:history
+      - groups:read
       - im:history
       - chat:write
+      - code_channels:manage
       - files:read
       - files:write
+      - users:read
   pkce_enabled: false
 settings:
   event_subscriptions:

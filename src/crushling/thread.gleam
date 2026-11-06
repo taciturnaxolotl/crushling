@@ -48,7 +48,23 @@ pub type Sink {
     /// `title` as its session's name, for a subagent to work in. Returns a
     /// sink for that thread and a link to it.
     branch: fn(String, String) -> Result(#(Sink, String), String),
+    /// Move the work to a code channel named `name`, for the repository in
+    /// workspace directory `repo`. Returns the channel's sink and id. Only
+    /// a thread can move; a code channel answers with an error.
+    open_code_channel: fn(String, String) -> Result(#(Sink, String), String),
+    /// Set the code channel's context bar. A thread ignores it.
+    context: fn(List(ContextItem)) -> Nil,
+    /// Set the code channel's Code tab: a unified diff, the base branch and
+    /// the head branch. A thread ignores it.
+    code: fn(String, String, String) -> Nil,
+    /// The channel posts go to, and the thread's ts ("" for a code
+    /// channel's top level).
+    conversation: #(String, String),
   )
+}
+
+pub type ContextItem {
+  ContextItem(key: String, label: String, icon: String, url: String)
 }
 
 pub type Finished {
@@ -60,6 +76,8 @@ pub type Finished {
     outcome: run.Outcome,
     /// The reply as posted, joined across messages.
     text: String,
+    /// The last message of the reply, or "" when nothing was posted.
+    reply_ts: String,
     changes: List(snapshot.Change),
     patch: String,
   )
@@ -77,11 +95,30 @@ pub type Config {
     /// Yolo skips permission prompts; sysadmin also lifts crush's block
     /// list of dangerous commands.
     mode: client.PermissionMode,
+    /// The repository the thread works on, once it moved to a code
+    /// channel: its directory in the workspace. "" for a plain thread.
+    repo: String,
+    /// Whether `sink` is the repository's code channel. A thread with a
+    /// `repo` that isn't has had its channel archived, and moves to a new
+    /// one with its next prompt.
+    in_code_channel: Bool,
   )
 }
 
 pub type Message {
   Prompt(text: String)
+  /// Where the thread is talking now: the channel, the thread's ts ("" in
+  /// a code channel), and the workspace path as the agent sees it.
+  Where(reply: Subject(#(String, String, String)))
+  /// Post a message where the thread is talking, for the agent's own
+  /// tools; replies with the message's ts.
+  Say(text: String, reply: Subject(Result(String, String)))
+  /// Move the work to a code channel, for the agent's own tools.
+  OpenCodeChannel(
+    name: String,
+    repo: String,
+    reply: Subject(Result(String, String)),
+  )
   Cancel
   /// Cancel the running turn and anything queued, closing the run with
   /// `note` rather than the usual "stopped".
@@ -134,6 +171,8 @@ type Sub {
     link: String,
     plan_ts: Option(String),
     shown: Option(render.Plan),
+    /// The ids of its messages already posted in its thread.
+    posted: List(String),
     /// Set when its report arrives.
     done: Bool,
   )
@@ -167,6 +206,10 @@ type State {
     flushing: Bool,
     /// Subagents the agent dispatched, by their session id.
     subs: dict.Dict(String, Sub),
+    /// The repository directory once the work is in a code channel.
+    repo: Option(String),
+    /// Move to a new code channel with the next prompt.
+    reopen: Bool,
     retries: Int,
     /// Whether the Slack session has its title: set for a session crushling
     /// created, and for one found in place after a restart.
@@ -230,6 +273,11 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       known: dict.new(),
       flushing: False,
       subs: dict.new(),
+      repo: case config.repo, config.in_code_channel {
+        "", _ | _, False -> None
+        repo, True -> Some(repo)
+      },
+      reopen: config.repo != "" && !config.in_code_channel,
       retries: 0,
       titled: False,
     )
@@ -250,6 +298,20 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       State(..state, waiting: list.append(state.waiting, [text]))
       |> send_next
       |> actor.continue
+    Where(reply) -> {
+      let #(channel, thread_ts) = state.config.sink.conversation
+      process.send(reply, #(channel, thread_ts, state.config.root))
+      actor.continue(state)
+    }
+    Say(text, reply) -> {
+      process.send(reply, state.config.sink.post(text))
+      actor.continue(state)
+    }
+    OpenCodeChannel(name, repo, reply) -> {
+      let #(state, result) = move_to(state, repo, name)
+      process.send(reply, result)
+      actor.continue(state)
+    }
     Cancel -> actor.continue(cancel(state, None))
     CancelFor(note) -> actor.continue(cancel(state, Some(note)))
     Flush -> actor.continue(flush(State(..state, flushing: False)))
@@ -467,7 +529,11 @@ fn send_prompt(
           cancel_note: None,
           solicited: True,
         )
-      State(..state, active: Some(active))
+      let state = State(..state, active: Some(active))
+      case state.reopen {
+        True -> move_to_code_channel(State(..state, reopen: False))
+        False -> state
+      }
     }
     Error(client.Transport(_)) -> {
       process.send(state.self, Reconnect)
@@ -566,7 +632,9 @@ fn on_event(state: State, event: event.Event) -> State {
     Some(active) -> {
       let run = run.apply(active.run, state.known, event)
       let active = Active(..active, run:, last_event_ms: now_ms())
-      finish_if_done(State(..state, active: Some(active)))
+      State(..state, active: Some(active))
+      |> move_on_clone(event)
+      |> finish_if_done
     }
   }
   case state.active != None || has_running_subs(state), state.flushing {
@@ -574,6 +642,184 @@ fn on_event(state: State, event: event.Event) -> State {
     True, False -> {
       process.send_after(state.self, state.config.flush_ms, Flush)
       State(..state, flushing: True)
+    }
+  }
+}
+
+/// When a bash call that cloned a repository succeeds in a plain thread,
+/// move the work to a code channel for that repository.
+fn move_on_clone(state: State, event: event.Event) -> State {
+  case state.repo, state.active, event {
+    None, Some(active), event.MessageEvent(message:, ..)
+      if message.role == event.Tool
+    -> {
+      let cloned =
+        list.any(message.tool_results, fn(result) {
+          !result.is_error
+          && list.any(active.run.tools, fn(tool) {
+            tool.id == result.tool_call_id
+            && tool.name == "bash"
+            && snapshot.is_clone(tool.input)
+          })
+        })
+      case cloned {
+        True -> move_to_code_channel(state)
+        False -> state
+      }
+    }
+    _, _, _ -> state
+  }
+}
+
+fn shell_now(state: State, command: String) -> Result(String, Nil) {
+  case state.conns, state.ready {
+    Some(conns), Some(ready) -> shell(state, conns, ready, command)
+    _, _ -> Error(Nil)
+  }
+}
+
+fn move_to_code_channel(state: State) -> State {
+  move_to(state, "", "").0
+}
+
+/// Move the work to a code channel for the repository in workspace
+/// directory `repo`, named `name`. With no `repo` the first repository in
+/// the workspace is used, and with no `name` the channel is named after
+/// the repository. Returns the channel's id.
+fn move_to(
+  state: State,
+  repo: String,
+  name: String,
+) -> #(State, Result(String, String)) {
+  let repo = case repo {
+    "" ->
+      shell_now(state, snapshot.list_repos())
+      |> result.unwrap("")
+      |> string.split("\n")
+      |> list.map(string.trim)
+      |> list.find(fn(line) { line != "" })
+      |> result.unwrap("")
+    repo -> repo
+  }
+  let is_repo =
+    repo != ""
+    && shell_now(state, snapshot.is_repo(repo)) |> result.map(string.trim)
+    == Ok("yes")
+  case state.repo, is_repo {
+    Some(_), _ -> #(state, Error("the work is already in a code channel"))
+    None, False -> #(
+      state,
+      Error(case repo {
+        "" -> "there is no git repository in the workspace; clone one first"
+        repo -> repo <> " is not a git repository"
+      }),
+    )
+    None, True -> {
+      let info =
+        shell_now(state, snapshot.repo_info(repo))
+        |> result.map(snapshot.parse_repo_info)
+        |> result.unwrap(snapshot.RepoInfo("", "", ""))
+      let repo_name = case snapshot.repo_name(info.url) {
+        "" -> string.replace(repo, "./", "")
+        name -> name
+      }
+      let name = case string.trim(name) {
+        "" -> repo_name
+        name -> name
+      }
+      let old = state.config.sink
+      case old.open_code_channel(name, repo) {
+        Error(reason) -> {
+          warn("crushling: staying in the thread: " <> reason)
+          // Don't try again for every later clone in this thread.
+          #(State(..state, repo: Some(repo)), Error(reason))
+        }
+        Ok(#(channel_sink, channel)) -> {
+          let _ =
+            old.post(
+              "_working on `" <> repo_name <> "` in <#" <> channel <> ">_",
+            )
+          let working = state.active != None
+          old.working(False)
+          channel_sink.working(working)
+          let config = Config(..state.config, sink: channel_sink)
+          let state = State(..state, config:, repo: Some(repo))
+          // The plan card starts over in the channel.
+          let active =
+            option.map(state.active, fn(active) {
+              case active.plan_ts, render.plan(active.run, config.root) {
+                Some(ts), Some(plan) -> {
+                  let _ =
+                    old.update_plan(
+                      ts,
+                      render.Plan(..plan, title: "Moved to the code channel"),
+                    )
+                  Nil
+                }
+                _, _ -> Nil
+              }
+              Active(..active, plan_ts: None, shown: None)
+            })
+          let state = State(..state, active:)
+          update_code_view(state, info)
+          #(state, Ok(channel))
+        }
+      }
+    }
+  }
+}
+
+/// Refresh the code channel's context bar and Code tab from the repo.
+fn update_code_view(state: State, info: snapshot.RepoInfo) -> Nil {
+  case state.repo {
+    None -> Nil
+    Some(repo) -> {
+      let sink = state.config.sink
+      let changes =
+        shell_now(state, snapshot.repo_numstat(repo))
+        |> result.map(snapshot.parse_numstat)
+        |> result.unwrap([])
+      let web = snapshot.web_url(info.url)
+      let link = fn(path) {
+        case web {
+          "" -> ""
+          web -> web <> path
+        }
+      }
+      let items =
+        [
+          case snapshot.repo_name(info.url) {
+            "" -> Error(Nil)
+            name -> Ok(ContextItem("repo", name, "folder", link("")))
+          },
+          case info.branch {
+            "" | "HEAD" -> Error(Nil)
+            branch ->
+              Ok(ContextItem(
+                "branch",
+                branch,
+                "branch",
+                link("/tree/" <> branch),
+              ))
+          },
+          case changes {
+            [] -> Error(Nil)
+            [_] -> Ok(ContextItem("changes", "1 file changed", "code", ""))
+            many ->
+              Ok(ContextItem(
+                "changes",
+                int.to_string(list.length(many)) <> " files changed",
+                "code",
+                "",
+              ))
+          },
+        ]
+        |> result.values
+      sink.context(items)
+      case shell_now(state, snapshot.repo_diff(repo)) {
+        Ok("") | Error(Nil) -> Nil
+        Ok(diff) -> sink.code(diff, info.base, info.branch)
+      }
     }
   }
 }
@@ -723,6 +969,7 @@ fn upsert_sub(
         link: "",
         plan_ts: None,
         shown: None,
+        posted: [],
         done: False,
       )
   }
@@ -731,7 +978,9 @@ fn upsert_sub(
 
 fn finish_sub(config: Config, sub: Sub) -> Sub {
   let sub = show_sub(config, sub)
-  report_back(config, sub)
+  let streamed = run.messages(sub.run, True)
+  let sub = post_sub_messages(sub, True)
+  report_back(config, sub, streamed)
   sub
 }
 
@@ -792,7 +1041,7 @@ fn show_sub(config: Config, sub: Sub) -> Sub {
     }
     _, _ -> sub
   }
-  case sub.sink, render.plan(sub.run, config.root) {
+  let sub = case sub.sink, render.plan(sub.run, config.root) {
     Some(branch), Some(plan) if Some(plan) != sub.shown ->
       case sub.plan_ts {
         Some(ts) ->
@@ -808,22 +1057,59 @@ fn show_sub(config: Config, sub: Sub) -> Sub {
       }
     _, _ -> sub
   }
+  post_sub_messages(sub, sub.done)
+}
+
+/// Post what the subagent said between its tool calls in its thread, each
+/// message once it is complete, so the thread reads as its working notes.
+fn post_sub_messages(sub: Sub, done: Bool) -> Sub {
+  case sub.sink {
+    None -> sub
+    Some(branch) -> {
+      let fresh =
+        run.messages(sub.run, done)
+        |> list.filter(fn(message) { !list.contains(sub.posted, message.0) })
+      list.fold(fresh, sub, fn(sub, message) {
+        let #(id, text) = message
+        list.each(render.chunk(text, render.message_limit), fn(chunk) {
+          let _ = branch.post(chunk)
+          Nil
+        })
+        Sub(..sub, posted: [id, ..sub.posted])
+      })
+    }
+  }
 }
 
 /// Post the subagent's answer in its own thread, and a short note with a
 /// link in the main one.
-fn report_back(config: Config, sub: Sub) -> Nil {
+fn report_back(
+  config: Config,
+  sub: Sub,
+  streamed: List(#(String, String)),
+) -> Nil {
   let #(name, scope) = sub_name(sub)
-  let #(failed, output) = case sub.run.outcome {
-    Some(run.Errored(error)) -> #(True, error)
-    Some(run.Cancelled) -> #(True, "stopped")
-    _ -> #(False, render.answer(sub.run) |> string.join("\n\n"))
+  // Its messages are already in its thread; what is left to post there is
+  // an error, or a final answer that never streamed.
+  let #(failed, output, extra) = case sub.run.outcome, list.last(streamed) {
+    Some(run.Errored(error)), _ -> #(True, error, error)
+    Some(run.Cancelled), _ -> #(True, "stopped", "stopped")
+    _, Ok(#(_, last)) -> #(False, last, "")
+    _, Error(Nil) -> {
+      let answer = render.answer(sub.run) |> string.join("\n\n")
+      #(False, answer, answer)
+    }
   }
   case sub.sink {
     Some(branch) -> {
-      list.each(render.chunk(output, render.message_limit), fn(chunk) {
-        let _ = branch.post(chunk)
-        Nil
+      list.each(render.chunk(extra, render.message_limit), fn(chunk) {
+        case string.trim(chunk) {
+          "" -> Nil
+          _ -> {
+            let _ = branch.post(chunk)
+            Nil
+          }
+        }
       })
       branch.working(False)
     }
@@ -973,6 +1259,24 @@ const max_patch_bytes = 400_000
 /// The run's changes: from workspace snapshots when they work, so edits
 /// made through `bash` are included, otherwise from the file events.
 fn changes(state: State, active: Active) -> #(List(snapshot.Change), String) {
+  case state.repo {
+    // In a code channel the repository's own history is the reference:
+    // the Code tab holds the diff, so nothing is attached.
+    Some(repo) -> {
+      let numstat =
+        shell_now(state, snapshot.repo_numstat(repo))
+        |> result.map(snapshot.parse_numstat)
+        |> result.unwrap([])
+      #(numstat, "")
+    }
+    None -> workspace_changes(state, active)
+  }
+}
+
+fn workspace_changes(
+  state: State,
+  active: Active,
+) -> #(List(snapshot.Change), String) {
   let from_snapshots = case active.base, state.conns, state.ready {
     Some(base), Some(conns), Some(ready) -> {
       use after <- result.try(
@@ -1012,6 +1316,16 @@ fn finish(state: State, active: Active) -> Nil {
   let config = state.config
   let sink = config.sink
   let #(changes, patch) = changes(state, active)
+  case state.repo {
+    Some(repo) ->
+      update_code_view(
+        state,
+        shell_now(state, snapshot.repo_info(repo))
+          |> result.map(snapshot.parse_repo_info)
+          |> result.unwrap(snapshot.RepoInfo("", "", "")),
+      )
+    None -> Nil
+  }
 
   // The plan card settles into its final state.
   case active.plan_ts, render.plan(active.run, config.root) {
@@ -1043,12 +1357,16 @@ fn finish(state: State, active: Active) -> Nil {
     [last, ..earlier], closing ->
       list.reverse([last <> "\n\n" <> string.join(closing, "\n"), ..earlier])
   }
-  list.each(messages, fn(text) {
-    case sink.post(text) {
-      Ok(_) -> Nil
-      Error(reason) -> warn("crushling: post failed: " <> reason)
-    }
-  })
+  let reply_ts =
+    list.fold(messages, "", fn(last, text) {
+      case sink.post(text) {
+        Ok(ts) -> ts
+        Error(reason) -> {
+          warn("crushling: post failed: " <> reason)
+          last
+        }
+      }
+    })
   sink.working(False)
 
   case patch, string.byte_size(patch) > max_patch_bytes {
@@ -1068,6 +1386,7 @@ fn finish(state: State, active: Active) -> Nil {
     run_id: active.run.run_id,
     outcome: option.unwrap(active.run.outcome, run.Cancelled),
     text: string.join(messages, "\n"),
+    reply_ts:,
     changes:,
     patch:,
   ))

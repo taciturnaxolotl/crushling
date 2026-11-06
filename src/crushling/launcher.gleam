@@ -10,6 +10,7 @@ import crushling/credentials
 import crushling/provider
 import crushling/sandbox
 import gleam/erlang/process.{type Subject}
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -30,12 +31,24 @@ pub type Launcher {
     stop: fn(String) -> Nil,
     /// Whether the thread has a workspace, so it was started before.
     exists: fn(String) -> Bool,
+    /// The thread's workspace on this machine.
+    workspace: fn(String) -> String,
     /// Where the bridge keeps the thread's `meta`, outside the workspace.
     meta_path: fn(String) -> String,
     /// Where Slack attachments are saved: the host directory, and the same
     /// directory relative to the agent's workspace.
     attachments: fn(String) -> #(String, String),
   )
+}
+
+/// How a thread's agent reaches crushling's Slack tools: the base URL it
+/// connects to ("" for none), and each thread's environment for it.
+pub type Bridge {
+  Bridge(url: String, env: fn(String) -> List(String))
+}
+
+pub fn no_bridge() -> Bridge {
+  Bridge(url: "", env: fn(_) { [] })
 }
 
 /// Attachments live in the workspace, so the agent can open them, under a
@@ -59,11 +72,19 @@ fn unwatch(creds: Credentials, path: String) -> Nil {
   }
 }
 
-pub fn docker(policy: sandbox.Policy, creds: Credentials) -> Launcher {
+/// `policy.crush_config` should come from `provider.config_with` and the
+/// bridge's URL.
+pub fn docker(
+  policy: sandbox.Policy,
+  creds: Credentials,
+  bridge: Bridge,
+) -> Launcher {
   let config = fn(key) { sandbox.host_crush_data(policy, key) <> "/crush.json" }
   Launcher(
     launch: fn(key) {
-      sandbox.ensure(policy, key, fn() { watch(creds, config(key)) })
+      sandbox.ensure(policy, key, bridge.env(key), fn() {
+        watch(creds, config(key))
+      })
       |> result.map(fn(socket) { Launched(socket:, root: sandbox.workspace) })
       |> result.map_error(string.inspect)
     },
@@ -73,6 +94,7 @@ pub fn docker(policy: sandbox.Policy, creds: Credentials) -> Launcher {
       Nil
     },
     exists: fn(key) { file_exists(sandbox.host_workspace(policy, key)) },
+    workspace: fn(key) { sandbox.host_workspace(policy, key) },
     meta_path: fn(key) { policy.root <> "/" <> key <> "/crushling.json" },
     attachments: fn(key) {
       #(
@@ -115,6 +137,7 @@ pub fn local(
   root: String,
   backend: provider.Backend,
   creds: Credentials,
+  bridge: Bridge,
 ) -> Launcher {
   let dir = fn(key) { root <> "/" <> key }
   let socket = fn(key) { dir(key) <> "/crush.sock" }
@@ -127,7 +150,10 @@ pub fn local(
       use _ <- result.try(mkdir_p(base <> "/home/config"))
       use _ <- result.try(mkdir_p(base <> "/home/data"))
       use _ <- result.try(mkdir_p(base <> "/home/honcho"))
-      use _ <- result.try(write_private(config(key), provider.config(backend)))
+      use _ <- result.try(write_private(
+        config(key),
+        provider.config_with(backend, bridge.url),
+      ))
       use _ <- result.try(watch(creds, config(key)))
       // A server left over from an earlier bridge would keep the socket;
       // this waits for it to exit.
@@ -140,7 +166,7 @@ pub fn local(
         "HONCHO_CONFIG_DIR=" <> base <> "/home/honcho",
         "CRUSH_SERVER_IDLE_TIMEOUT=31536000",
         "CRUSH_SERVER_DETACH_GRACE=120",
-        ..provider.env(backend)
+        ..list.append(provider.env(backend), bridge.env(key))
       ]
       use os_pid <- result.try(start_server(
         socket(key),
@@ -156,6 +182,7 @@ pub fn local(
       stop_server(socket(key))
     },
     exists: fn(key) { file_exists(dir(key) <> "/work") },
+    workspace: fn(key) { dir(key) <> "/work" },
     meta_path: fn(key) { dir(key) <> "/crushling.json" },
     attachments: fn(key) {
       #(dir(key) <> "/work/" <> attachments_dir, attachments_dir)

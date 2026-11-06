@@ -24,13 +24,16 @@ import crushling/credentials
 import crushling/crush/client
 import crushling/gun
 import crushling/launcher
+import crushling/mcp
 import crushling/provider
 import crushling/registry
 import crushling/render
 import crushling/run
+import crushling/slack_tools
 import crushling/snapshot
 import crushling/thread
 import gleam/dynamic.{type Dynamic}
+import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
@@ -113,6 +116,8 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { registry_launches_and_idles(wiring) }),
         with_timeout(600, fn() { shutdown_cancels_and_stops(wiring) }),
         with_timeout(600, fn() { subagents_get_their_own_threads(wiring) }),
+        with_timeout(600, fn() { cloning_moves_to_a_code_channel(wiring) }),
+        with_timeout(600, fn() { agent_uses_slack_tools(wiring) }),
       ])
     }
   }
@@ -208,6 +213,10 @@ type Env {
 }
 
 fn setup(name: String, wiring: Wiring) -> Env {
+  setup_with(name, wiring, launcher.no_bridge())
+}
+
+fn setup_with(name: String, wiring: Wiring, bridge: launcher.Bridge) -> Env {
   let dir =
     "/tmp/crushling-real-"
     <> name
@@ -225,7 +234,8 @@ fn setup(name: String, wiring: Wiring) -> Env {
   let assert Ok(Nil) = mkdir_p(home <> "/config")
   let assert Ok(Nil) = mkdir_p(home <> "/data")
   let config = home <> "/data/crush.json"
-  let assert Ok(Nil) = write_private(config, provider.config(backend))
+  let assert Ok(Nil) =
+    write_private(config, provider.config_with(backend, bridge.url))
   case creds {
     Some(creds) -> {
       let assert Ok(Nil) = credentials.watch(creds, config)
@@ -233,7 +243,8 @@ fn setup(name: String, wiring: Wiring) -> Env {
     }
     None -> Nil
   }
-  let server_env = provider.env(backend)
+  let server_env =
+    list.append(provider.env(backend), bridge.env(string.inspect(unique())))
   let socket = dir <> "/crush.sock"
   let log = dir <> "/server.log"
   let server = start_server(socket, log, home, server_env)
@@ -272,6 +283,10 @@ fn sink(calls: Subject(Call)) -> thread.Sink {
     upload: fn(_, _) { Ok(Nil) },
     finished: fn(finished) { process.send(calls, Done(finished)) },
     branch: fn(_, _) { Error("no branches in this test") },
+    open_code_channel: fn(_, _) { Error("no code channels in this test") },
+    context: fn(_) { Nil },
+    code: fn(_, _, _) { Nil },
+    conversation: #("CTEST", "1.0"),
   )
 }
 
@@ -285,6 +300,8 @@ fn start_thread(env: Env) -> #(Subject(thread.Message), Subject(Call)) {
       sink: sink(calls),
       flush_ms: 250,
       mode: client.Sysadmin,
+      repo: "",
+      in_code_channel: False,
     ))
   #(t, calls)
 }
@@ -417,7 +434,13 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-registry-"
     <> int.to_string(int.absolute_value(unique()))
-  let local = launcher.local(root, wiring.backend, wiring.credentials)
+  let local =
+    launcher.local(
+      root,
+      wiring.backend,
+      wiring.credentials,
+      launcher.no_bridge(),
+    )
   let launches = process.new_subject()
   let watched =
     launcher.Launcher(
@@ -433,6 +456,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       exists: local.exists,
       meta_path: local.meta_path,
       attachments: local.attachments,
+      workspace: local.workspace,
     )
   use <-
     guarded(_, fn() {
@@ -484,7 +508,13 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-shutdown-"
     <> int.to_string(int.absolute_value(unique()))
-  let local = launcher.local(root, wiring.backend, wiring.credentials)
+  let local =
+    launcher.local(
+      root,
+      wiring.backend,
+      wiring.credentials,
+      launcher.no_bridge(),
+    )
   let launches = process.new_subject()
   let watched =
     launcher.Launcher(
@@ -500,6 +530,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       exists: local.exists,
       meta_path: local.meta_path,
       attachments: local.attachments,
+      workspace: local.workspace,
     )
   use <-
     guarded(_, fn() {
@@ -581,6 +612,10 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> thread.Sink {
       process.send(calls, Branched(intro, title))
       Ok(#(recording_sink(calls, True), "https://slack.example/thread"))
     },
+    open_code_channel: fn(_, _) { Error("no code channels in this test") },
+    context: fn(_) { Nil },
+    code: fn(_, _, _) { Nil },
+    conversation: #("CTEST", "1.0"),
   )
 }
 
@@ -598,6 +633,8 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
       sink: recording_sink(calls, False),
       flush_ms: 250,
       mode: client.Sysadmin,
+      repo: "",
+      in_code_channel: False,
     ))
   process.send(
     t,
@@ -661,4 +698,177 @@ fn collect_sub_calls(
           panic as { "stuck; saw " <> string.inspect(list.reverse(acc)) }
       }
   }
+}
+
+type CodeCall {
+  Opened(name: String, repo: String)
+  InThreadPost(String)
+  InChannelPost(String)
+  CodeView(diff: String)
+  CodeFinished(changes: List(snapshot.Change), patch: String)
+}
+
+fn code_sink(calls: Subject(CodeCall), in_channel: Bool) -> thread.Sink {
+  let post = fn(text) {
+    process.send(calls, case in_channel {
+      True -> InChannelPost(text)
+      False -> InThreadPost(text)
+    })
+    Ok("ts" <> int.to_string(unique()))
+  }
+  thread.Sink(
+    working: fn(_) { Nil },
+    title: fn(_) { Nil },
+    post_plan: fn(plan) { post(render.plan_markdown(plan)) },
+    update_plan: fn(_, _) { Ok(Nil) },
+    post:,
+    upload: fn(_, _) { Ok(Nil) },
+    finished: fn(finished) {
+      process.send(calls, CodeFinished(finished.changes, finished.patch))
+    },
+    branch: fn(_, _) { Error("no branches in this test") },
+    open_code_channel: fn(name, repo) {
+      case in_channel {
+        True -> Error("already in a code channel")
+        False -> {
+          process.send(calls, Opened(name, repo))
+          Ok(#(code_sink(calls, True), "CCODE"))
+        }
+      }
+    },
+    context: fn(_) { Nil },
+    code: fn(diff, _, _) {
+      case in_channel {
+        True -> process.send(calls, CodeView(diff))
+        False -> Nil
+      }
+    },
+    conversation: #("CTEST", "1.0"),
+  )
+}
+
+fn collect_code_calls(
+  calls: Subject(CodeCall),
+  acc: List(CodeCall),
+) -> List(CodeCall) {
+  case process.receive(calls, 240_000) {
+    Ok(CodeFinished(..) as call) -> list.reverse([call, ..acc])
+    Ok(call) -> collect_code_calls(calls, [call, ..acc])
+    Error(Nil) -> panic as { "stuck; saw " <> string.inspect(list.reverse(acc)) }
+  }
+}
+
+/// Cloning a repository moves the work to a code channel, whose Code tab
+/// shows the repository's changes instead of an attached patch.
+fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
+  use env <- with_env("code-channel", wiring)
+  let source = env.dir <> "/source"
+  let _ =
+    sh(
+      "/tmp",
+      "mkdir -p '"
+        <> source
+        <> "' && cd '"
+        <> source
+        <> "' && git init -q -b main && printf 'one\\n' > notes.txt && git add . && git -c user.name=t -c user.email=t@t commit -qm init",
+    )
+  let calls = process.new_subject()
+  let assert Ok(t) =
+    thread.start(thread.Config(
+      socket: env.socket,
+      root: env.work,
+      title: "crushling code channel test",
+      sink: code_sink(calls, False),
+      flush_ms: 250,
+      mode: client.Sysadmin,
+      repo: "",
+      in_code_channel: False,
+    ))
+  process.send(
+    t,
+    thread.Prompt(
+      "Use the bash tool to run exactly `git clone "
+      <> source
+      <> " demo`. Then use bash to append the line two to demo/notes.txt. Then reply with the word DONE.",
+    ),
+  )
+  let seen = collect_code_calls(calls, [])
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        Opened("source", repo) -> string.contains(repo, "demo")
+        _ -> False
+      }
+    })
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        InThreadPost(text) -> string.contains(text, "<#CCODE>")
+        _ -> False
+      }
+    })
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        InChannelPost(text) -> string.contains(string.uppercase(text), "DONE")
+        _ -> False
+      }
+    })
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        CodeView(diff) -> string.contains(diff, "+two")
+        _ -> False
+      }
+    })
+  let assert Ok(CodeFinished(
+    changes: [snapshot.Change("notes.txt", Ok(1), Ok(0))],
+    patch: "",
+  )) = list.last(seen)
+  process.send(t, thread.Stop)
+}
+
+/// The agent reaches crushling's Slack tools over MCP, with its own token.
+fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
+  let port = 17_000 + int.absolute_value(unique()) % 2000
+  let calls = process.new_subject()
+  let secret = "test-secret"
+  let assert Ok(Nil) =
+    mcp.start(
+      "127.0.0.1",
+      port,
+      secret,
+      slack_tools.tools(),
+      fn(key, name, arguments) {
+        process.send(calls, #(key, name, arguments))
+        Ok("posted")
+      },
+    )
+  let keys = process.new_subject()
+  let bridge =
+    launcher.Bridge(
+      url: "http://127.0.0.1:" <> int.to_string(port),
+      env: fn(key) {
+        process.send(keys, key)
+        mcp.env(secret, key)
+      },
+    )
+  let env = setup_with("mcp", wiring, bridge)
+  let assert Ok(key) = process.receive(keys, 1000)
+  use <- guarded(_, fn() { teardown(env) })
+  let #(t, finished) = start_thread(env)
+  process.send(
+    t,
+    thread.Prompt(
+      "Call the post_message tool from the slack MCP server with the text HELLO-MCP. Then reply with the word DONE.",
+    ),
+  )
+  let _ = await_finished(finished)
+  let assert Ok(#(called_key, "post_message", arguments)) =
+    process.receive(calls, 1000)
+  let assert True = called_key == key
+  let assert Ok(text) =
+    decode.run(arguments, decode.at(["text"], decode.string))
+  let assert True = string.contains(text, "HELLO-MCP")
+  process.send(t, thread.Stop)
 }

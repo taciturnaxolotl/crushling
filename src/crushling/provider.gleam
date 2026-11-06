@@ -38,6 +38,13 @@ pub fn env(backend: Backend) -> List(String) {
 /// The container's global crush.json: one provider and the models to use.
 /// For a login, `credentials.watch` adds the managed token to this file.
 pub fn config(backend: Backend) -> String {
+  config_with(backend, "")
+}
+
+/// The agent's crush.json, with crushling's Slack tools served from
+/// `mcp_url` (none when it is ""). The thread and its token come from the
+/// server's environment, so one file serves every thread.
+pub fn config_with(backend: Backend, mcp_url: String) -> String {
   let #(provider, entry, large, small) = case backend {
     Claude(large:, small:, ..) -> #("anthropic", [], large, small)
     Hyper(large:, small:, ..) -> #("hyper", [], large, small)
@@ -64,6 +71,32 @@ pub fn config(backend: Backend) -> String {
       "options",
       json.object([#("disabled_tools", json.array(["question"], json.string))]),
     ),
+    ..case mcp_url {
+      "" -> []
+      url -> [
+        #(
+          "mcp",
+          json.object([
+            #(
+              "slack",
+              json.object([
+                #("type", json.string("http")),
+                #("url", json.string(url <> "/mcp/$CRUSHLING_THREAD")),
+                #(
+                  "headers",
+                  json.object([
+                    #(
+                      "Authorization",
+                      json.string("Bearer $CRUSHLING_MCP_TOKEN"),
+                    ),
+                  ]),
+                ),
+              ]),
+            ),
+          ]),
+        ),
+      ]
+    }
   ])
   |> json.to_string
 }

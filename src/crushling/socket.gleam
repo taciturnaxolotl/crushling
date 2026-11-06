@@ -26,10 +26,15 @@ pub fn router(
   |> app.on_event(fn(event, _delivery) {
     case event {
       // Slack's own stop control, shown while a session is processing.
-      event.AgentSessionStopped(channel:, user:, thread_ts: Some(thread_ts), ..) ->
+      // A code channel's session has no thread.
+      event.AgentSessionStopped(channel:, user:, thread_ts:, ..) ->
         process.send(
           registry,
-          registry.StopRequested(channel, thread_ts, option.unwrap(user, "")),
+          registry.StopRequested(
+            channel,
+            option.unwrap(thread_ts, ""),
+            option.unwrap(user, ""),
+          ),
         )
       _ ->
         case incoming(event, bot_user) {
@@ -40,8 +45,9 @@ pub fn router(
   })
 }
 
-/// The messages worth routing: mentions, thread replies, and direct
-/// messages, from people rather than bots.
+/// The messages worth routing: mentions, thread replies, direct messages,
+/// and top-level messages (for code channels), from people rather than
+/// bots.
 pub fn incoming(
   event: event.Event,
   bot_user: String,
@@ -103,7 +109,18 @@ pub fn incoming(
             mention: False,
             files: slack.attachments(files),
           ))
-        False, None, _ -> Error(Nil)
+        // Top-level chatter, which only reaches the agent in one of its
+        // code channels.
+        False, None, _ ->
+          Ok(registry.Incoming(
+            channel:,
+            thread_ts: ts,
+            ts:,
+            user:,
+            text:,
+            mention: False,
+            files: slack.attachments(files),
+          ))
       }
     _ -> Error(Nil)
   }

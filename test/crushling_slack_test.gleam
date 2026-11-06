@@ -3,6 +3,7 @@ import crushling/launcher
 import crushling/meta
 import crushling/registry
 import crushling/slack
+import crushling/snapshot
 import crushling/socket
 import gleam/erlang/process
 import gleam/json
@@ -81,7 +82,14 @@ pub fn thread_replies_route_test() {
     decode_event(
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"hello all\",\"ts\":\"13.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
     )
-  let assert Error(Nil) = socket.incoming(top_level, "UBOT")
+  // Routed in case it is in a code channel; the registry drops it
+  // anywhere else.
+  let assert Ok(registry.Incoming(
+    thread_ts: "13.1",
+    ts: "13.1",
+    mention: False,
+    ..,
+  )) = socket.incoming(top_level, "UBOT")
 
   let from_bot =
     decode_event(
@@ -121,6 +129,7 @@ fn start_registry(launches: process.Subject(Launch)) {
         key == registry.key("C9", "1.0") || key == registry.key("C7", "1.0")
       },
       meta_path: fn(key) { "/tmp/crushling-registry-test/" <> key <> ".json" },
+      workspace: fn(key) { "/tmp/crushling-registry-test/" <> key },
       attachments: fn(key) {
         #("/tmp/crushling-registry-test/" <> key, ".slack")
       },
@@ -227,7 +236,7 @@ pub fn follow_mode_test() {
   let assert Ok(Nil) =
     meta.write(
       "/tmp/crushling-registry-test/" <> registry.key("C7", "1.0") <> ".json",
-      meta.Meta(follow: False, cursor: "3.0"),
+      meta.Meta(..meta.new(False), cursor: "3.0"),
     )
   let r = start_registry(launches)
   let reply = fn(ts, text, mention) {
@@ -263,4 +272,65 @@ pub fn follow_mode_test() {
   let assert Ok(meta.Meta(follow: False, ..)) =
     meta.read("/tmp/crushling-registry-test/" <> key <> ".json")
   Nil
+}
+
+pub fn code_channel_messages_reach_their_thread_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  // CCODE holds the work of C9's thread, which is on disk.
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/"
+        <> registry.key("CCODE", "code")
+        <> ".json",
+      meta.Meta(..meta.new(True), origin_channel: "C9", origin_ts: "1.0"),
+    )
+  let r = start_registry(launches)
+  // Top-level chatter in another channel reaches nobody.
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("C4", "8.0", "8.0", "U1", "hello all", False, []),
+    ),
+  )
+  let assert Error(Nil) = process.receive(launches, 100)
+  // In the code channel, an unmentioned top-level message is a prompt for
+  // the thread that moved there.
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("CCODE", "9.0", "9.0", "U1", "now the tests", False, []),
+    ),
+  )
+  let assert Ok(Launched(key)) = process.receive(launches, 1000)
+  let assert True = key == registry.key("C9", "1.0")
+}
+
+pub fn native_stop_in_a_code_channel_test() {
+  let registry = process.new_subject()
+  let router = socket.router(registry, "UBOT")
+  let frame =
+    "{\"envelope_id\":\"e3\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev2\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"CCODE\",\"user\":\"U1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
+  let assert app.Send(after:, ..) = app.handle_socket(router, frame)
+  after()
+  let assert Ok(registry.StopRequested("CCODE", "", "U1")) =
+    process.receive(registry, 1000)
+}
+
+pub fn repo_helpers_test() {
+  let assert True = snapshot.is_clone("cd /w && git clone https://x/y.git")
+  let assert True = snapshot.is_clone("gh repo clone owner/repo")
+  let assert False = snapshot.is_clone("git status")
+  let assert "owner/repo" =
+    snapshot.repo_name("https://github.com/owner/repo.git")
+  let assert "owner/repo" = snapshot.repo_name("git@github.com:owner/repo.git")
+  let assert "https://github.com/owner/repo" =
+    snapshot.web_url("git@github.com:owner/repo.git")
+  let assert "https://github.com/owner/repo" =
+    snapshot.web_url("https://github.com/owner/repo.git")
+  let assert snapshot.RepoInfo(
+    url: "https://github.com/owner/repo",
+    branch: "fix",
+    base: "main",
+  ) = snapshot.parse_repo_info("https://github.com/owner/repo\nfix\nmain\n")
 }

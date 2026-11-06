@@ -32,7 +32,7 @@ pub fn paths_test() {
 }
 
 pub fn run_args_test() {
-  let args = sandbox.run_args(policy(), "k")
+  let args = sandbox.run_args(policy(), "k", [])
   let pairs = list.window_by_2(args)
   let has = fn(a, b) { list.contains(pairs, #(a, b)) }
   let assert True = has("--name", "crushling-k")

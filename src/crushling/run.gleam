@@ -239,6 +239,26 @@ pub fn text(run: Run) -> String {
   |> string.join("\n\n")
 }
 
+/// The assistant's messages so far as id and text, without empty ones.
+/// While the run is going only messages followed by a later one are
+/// included, since the last may still be growing; `done` includes it too.
+pub fn messages(run: Run, done: Bool) -> List(#(String, String)) {
+  let order = case done || run.outcome != None {
+    True -> run.order
+    False -> list.take(run.order, list.length(run.order) - 1)
+  }
+  list.filter_map(order, fn(id) {
+    case dict.get(run.texts, id) {
+      Ok(text) ->
+        case string.trim(text) {
+          "" -> Error(Nil)
+          text -> Ok(#(id, text))
+        }
+      Error(Nil) -> Error(Nil)
+    }
+  })
+}
+
 pub type FileChange {
   Changed(path: String, diff: String)
   Unknown(path: String)

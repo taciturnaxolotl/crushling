@@ -84,3 +84,15 @@ and a base_url. Keys never enter the sandbox. Fallback: `--env-file` with a spen
 - Backup: atelier.backup.services.crushling.paths = [ "/storage/crushling/workspaces" ].
 - Agenix: secrets.nix entry, age.secrets.crushling with owner, secretsFile.
 - Stale comment at prattle:214 says kata; it's gVisor.
+
+## crushling's Slack tools
+
+The bridge serves each agent's Slack tools over HTTP. To let sandboxes reach
+them and nothing else on the host, bind the bridge to the network's gateway
+and allow only that port, ahead of the refuse rule:
+
+    iptables -I nixos-fw 1 -i br-sbx -d 172.30.0.1 -p tcp --dport 7469 -j nixos-fw-accept
+
+with `CRUSHLING_MCP_BIND=172.30.0.1` and
+`CRUSHLING_MCP_URL=http://172.30.0.1:7469`. Each thread's endpoint needs that
+thread's token, so one sandbox can't act for another.
