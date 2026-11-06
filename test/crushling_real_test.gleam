@@ -32,6 +32,7 @@ import crushling/run
 import crushling/slack_tools
 import crushling/snapshot
 import crushling/thread
+import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
@@ -118,6 +119,7 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { subagents_get_their_own_threads(wiring) }),
         with_timeout(600, fn() { cloning_moves_to_a_code_channel(wiring) }),
         with_timeout(600, fn() { agent_uses_slack_tools(wiring) }),
+        with_timeout(600, fn() { prompts_carry_images(wiring) }),
       ])
     }
   }
@@ -870,5 +872,34 @@ fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
   let assert Ok(text) =
     decode.run(arguments, decode.at(["text"], decode.string))
   let assert True = string.contains(text, "HELLO-MCP")
+  process.send(t, thread.Stop)
+}
+
+/// A prompt with an image attached reaches crush and runs; a model without
+/// vision gets the text alone.
+fn prompts_carry_images(wiring: Wiring) -> Nil {
+  use env <- with_env("image", wiring)
+  let #(t, calls) = start_thread(env)
+  // A 1x1 red PNG.
+  let assert Ok(png) =
+    bit_array.base64_decode(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+    )
+  process.send(
+    t,
+    thread.PromptWith(
+      "An image may be attached. Use no tools; reply with the word SEEN.",
+      [
+        client.Attachment(
+          path: ".slack/1.0/red.png",
+          name: "red.png",
+          mime_type: "image/png",
+          content: png,
+        ),
+      ],
+    ),
+  )
+  let finished = await_finished(calls)
+  let assert True = says(finished, "SEEN")
   process.send(t, thread.Stop)
 }

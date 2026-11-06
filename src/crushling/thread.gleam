@@ -107,6 +107,8 @@ pub type Config {
 
 pub type Message {
   Prompt(text: String)
+  /// A prompt with files the model should see directly, such as images.
+  PromptWith(text: String, attachments: List(client.Attachment))
   /// Where the thread is talking now: the channel, the thread's ts ("" in
   /// a code channel), and the workspace path as the agent sees it.
   Where(reply: Subject(#(String, String, String)))
@@ -200,7 +202,7 @@ type State {
     /// a fresh actor for the same workspace picks up the latest one.
     session_id: Option(String),
     /// Prompts not yet sent, oldest first.
-    waiting: List(String),
+    waiting: List(#(String, List(client.Attachment))),
     active: Option(Active),
     known: run.Known,
     flushing: Bool,
@@ -295,7 +297,14 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
     Setup | Reconnect -> actor.continue(connect(state))
     Prompt(text) ->
-      State(..state, waiting: list.append(state.waiting, [text]))
+      State(..state, waiting: list.append(state.waiting, [#(text, [])]))
+      |> send_next
+      |> actor.continue
+    PromptWith(text, attachments) ->
+      State(
+        ..state,
+        waiting: list.append(state.waiting, [#(text, attachments)]),
+      )
       |> send_next
       |> actor.continue
     Where(reply) -> {
@@ -482,8 +491,14 @@ fn fail_everything(state: State, reason: String) -> State {
 
 fn send_next(state: State) -> State {
   case state.active, state.ready, state.conns, state.waiting {
-    None, Some(ready), Some(conns), [text, ..rest] ->
-      send_prompt(State(..state, waiting: rest), conns, ready, text)
+    None, Some(ready), Some(conns), [#(text, attachments), ..rest] ->
+      send_prompt(
+        State(..state, waiting: rest),
+        conns,
+        ready,
+        text,
+        attachments,
+      )
     _, _, _, _ -> state
   }
 }
@@ -493,17 +508,19 @@ fn send_prompt(
   conns: Conns,
   ready: Ready,
   text: String,
+  attachments: List(client.Attachment),
 ) -> State {
   let run_id = uuid()
   let base = take_snapshot(state, conns, ready)
   case
     call(
       conns,
-      client.send_prompt(
+      client.send_prompt_with(
         workspace_id: ready.workspace_id,
         session_id: ready.session_id,
         run_id:,
         prompt: text,
+        attachments:,
       ),
     )
   {
@@ -537,7 +554,7 @@ fn send_prompt(
     }
     Error(client.Transport(_)) -> {
       process.send(state.self, Reconnect)
-      State(..state, waiting: [text, ..state.waiting])
+      State(..state, waiting: [#(text, attachments), ..state.waiting])
     }
     Error(error) -> {
       let _ =

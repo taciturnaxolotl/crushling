@@ -37,6 +37,27 @@ pub fn send_prompt_call_test() {
   let assert Ok(Nil) = call.parse("")
 }
 
+pub fn send_prompt_with_attachments_test() {
+  let call =
+    client.send_prompt_with(
+      workspace_id: "w",
+      session_id: "s",
+      run_id: "r",
+      prompt: "look",
+      attachments: [
+        client.Attachment(
+          path: ".slack/1.0/a.png",
+          name: "a.png",
+          mime_type: "image/png",
+          content: <<"hi":utf8>>,
+        ),
+      ],
+    )
+  let assert Some(body) = call.body
+  let assert "{\"session_id\":\"s\",\"run_id\":\"r\",\"prompt\":\"look\",\"attachments\":[{\"file_path\":\".slack/1.0/a.png\",\"file_name\":\"a.png\",\"mime_type\":\"image/png\",\"content\":\"aGk=\"}]}" =
+    json.to_string(body)
+}
+
 pub fn agent_ready_call_test() {
   let call = client.agent_ready("w")
   let assert http.Get = call.method

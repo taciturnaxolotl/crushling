@@ -2,10 +2,12 @@
 //// session (Slack's "Working…" and Stop), a plan card and markdown replies, and the helpers that turn a Slack
 //// message back into a prompt.
 
+import crushling/crush/client
 import crushling/gun
 import crushling/render
 import crushling/thread
 import gleam/bit_array
+import gleam/bool
 import gleam/erlang/process
 import gleam/float
 import gleam/http
@@ -633,7 +635,7 @@ pub fn save_attachments(
   files: List(Attachment),
   ts: String,
   dirs: #(String, String),
-) -> String {
+) -> #(String, List(client.Attachment)) {
   save_attachments_as(
     token,
     files,
@@ -649,69 +651,90 @@ pub fn save_earlier_attachments(
   token: String,
   earlier: List(#(String, List(Attachment))),
   dirs: #(String, String),
-) -> String {
-  list.map(earlier, fn(message) {
-    let #(ts, files) = message
-    save_attachments_as(
-      token,
-      files,
-      ts,
-      dirs,
-      "Attached to the earlier message at "
-        <> ts
-        <> ", saved in the workspace:\n",
-    )
-  })
-  |> list.filter(fn(text) { text != "" })
-  |> string.join("\n\n")
+) -> #(String, List(client.Attachment)) {
+  let saved =
+    list.map(earlier, fn(message) {
+      let #(ts, files) = message
+      save_attachments_as(
+        token,
+        files,
+        ts,
+        dirs,
+        "Attached to the earlier message at "
+          <> ts
+          <> ", saved in the workspace:\n",
+      )
+    })
+  #(
+    list.map(saved, fn(pair) { pair.0 })
+      |> list.filter(fn(text) { text != "" })
+      |> string.join("\n\n"),
+    list.flat_map(saved, fn(pair) { pair.1 }),
+  )
 }
 
+/// Image types models take directly, and how big such an image can be.
+const seen_images = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+
+const max_seen_image_bytes = 5_000_000
+
+/// Download `files` into the workspace. Returns a note for the prompt, and
+/// the images, which go along with the prompt for the model to see.
 fn save_attachments_as(
   token: String,
   files: List(Attachment),
   ts: String,
   dirs: #(String, String),
   heading: String,
-) -> String {
+) -> #(String, List(client.Attachment)) {
   let #(host_dir, agent_dir) = dirs
-  let lines =
+  let saved =
     list.map(files, fn(file) {
       let name = safe_name(file.name)
       let relative = agent_dir <> "/" <> safe_name(ts) <> "/" <> name
       let about = " (" <> file.mimetype <> ", " <> human_size(file.size) <> ")"
-      case file.size > max_attachment_bytes {
-        True -> "- " <> file.name <> about <> ": too large to fetch"
-        False ->
-          case download(token, file.url, 2) {
-            Error(reason) ->
-              "- "
-              <> file.name
-              <> about
-              <> ": couldn't fetch ("
-              <> reason
-              <> ")"
-            Ok(bytes) ->
+      let failed = fn(why) { #("- " <> file.name <> about <> ": " <> why, []) }
+      use <- bool.lazy_guard(file.size > max_attachment_bytes, fn() {
+        failed("too large to fetch")
+      })
+      case download(token, file.url, 2) {
+        Error(reason) -> failed("couldn't fetch (" <> reason <> ")")
+        Ok(bytes) ->
+          case
+            write_bytes(host_dir <> "/" <> safe_name(ts) <> "/" <> name, bytes)
+          {
+            Error(reason) -> failed("couldn't save (" <> reason <> ")")
+            Ok(Nil) ->
               case
-                write_bytes(
-                  host_dir <> "/" <> safe_name(ts) <> "/" <> name,
-                  bytes,
-                )
+                list.contains(seen_images, file.mimetype)
+                && bit_array.byte_size(bytes) <= max_seen_image_bytes
               {
-                Ok(Nil) -> "- `" <> relative <> "`" <> about
-                Error(reason) ->
-                  "- "
-                  <> file.name
-                  <> about
-                  <> ": couldn't save ("
-                  <> reason
-                  <> ")"
+                False -> #("- `" <> relative <> "`" <> about, [])
+                True -> #(
+                  "- `"
+                    <> relative
+                    <> "`"
+                    <> about
+                    <> ", attached for you to see",
+                  [
+                    client.Attachment(
+                      path: relative,
+                      name: file.name,
+                      mime_type: file.mimetype,
+                      content: bytes,
+                    ),
+                  ],
+                )
               }
           }
       }
     })
-  case lines {
-    [] -> ""
-    lines -> heading <> string.join(lines, "\n")
+  case list.map(saved, fn(pair) { pair.0 }) {
+    [] -> #("", [])
+    lines -> #(
+      heading <> string.join(lines, "\n"),
+      list.flat_map(saved, fn(pair) { pair.1 }),
+    )
   }
 }
 

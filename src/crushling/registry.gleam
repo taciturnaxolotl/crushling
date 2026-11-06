@@ -72,7 +72,12 @@ pub type Message {
     result: Result(Subject(thread.Message), String),
   )
   /// A prompt is ready to send: `ts` is the message it came from.
-  Prepared(key: String, ts: String, prompt: String)
+  Prepared(
+    key: String,
+    ts: String,
+    prompt: String,
+    attachments: List(client.Attachment),
+  )
   RunFinished(key: String)
   /// The thread posted a reply; its last message is `ts`.
   Replied(key: String, ts: String)
@@ -210,8 +215,8 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       }
     Started(key, generation, result) ->
       actor.continue(started(state, key, generation, result))
-    Prepared(key, ts, prompt) ->
-      actor.continue(prepared(state, key, ts, prompt))
+    Prepared(key, ts, prompt, attachments) ->
+      actor.continue(prepared(state, key, ts, prompt, attachments))
     StopRequested(channel, thread_ts, user) ->
       actor.continue(stop_requested(state, channel, thread_ts, user))
     Replied(key, ts) -> actor.continue(replied(state, key, ts))
@@ -637,10 +642,11 @@ fn pump(state: State, key: String) -> State {
         False -> ""
       }
       process.spawn_unlinked(fn() {
-        process.send(
-          self,
-          Prepared(key, next.ts, prepare(config, key, next, cursor, catch_up)),
-        )
+        process.send(self, {
+          let #(prompt, attachments) =
+            prepare(config, key, next, cursor, catch_up)
+          Prepared(key, next.ts, prompt, attachments)
+        })
       })
       let entry = Entry(..entry, backlog: rest, preparing: True)
       State(..state, threads: dict.insert(state.threads, key, entry))
@@ -658,7 +664,7 @@ fn prepare(
   incoming: Incoming,
   cursor: String,
   catch_up: String,
-) -> String {
+) -> #(String, List(client.Attachment)) {
   let request = slack.prompt_text(incoming.text, config.bot_user)
   let first =
     catch_up != "" && incoming.ts == incoming.thread_ts && cursor == ""
@@ -677,23 +683,31 @@ fn prepare(
       )
   }
   let dirs = config.launcher.attachments(key)
-  let earlier_files =
+  let #(earlier_files, earlier_seen) =
     slack.save_earlier_attachments(config.token, earlier, dirs)
-  let files =
+  let #(files, seen) =
     slack.save_attachments(config.token, incoming.files, incoming.ts, dirs)
   let from = case is_dm(incoming.channel) {
     True -> ""
     False -> "From <@" <> incoming.user <> ">:\n"
   }
-  [context, earlier_files, from <> request, files]
-  |> list.filter(fn(part) { string.trim(part) != "" })
-  |> string.join("\n\n")
+  let prompt =
+    [context, earlier_files, from <> request, files]
+    |> list.filter(fn(part) { string.trim(part) != "" })
+    |> string.join("\n\n")
+  #(prompt, list.append(earlier_seen, seen))
 }
 
-fn prepared(state: State, key: String, ts: String, prompt: String) -> State {
+fn prepared(
+  state: State,
+  key: String,
+  ts: String,
+  prompt: String,
+  attachments: List(client.Attachment),
+) -> State {
   case dict.get(state.threads, key) {
     Ok(Entry(agent: Live(thread:, ..), ..) as entry) -> {
-      process.send(thread, thread.Prompt(prompt))
+      process.send(thread, thread.PromptWith(prompt, attachments))
       let meta = Meta(..entry.meta, cursor: ts)
       let _ = meta.write(state.config.launcher.meta_path(key), meta)
       let entry =
