@@ -1,3 +1,4 @@
+import crushling/crush/client
 import crushling/launcher
 import crushling/registry
 import crushling/slack
@@ -5,9 +6,7 @@ import crushling/socket
 import gleam/erlang/process
 import gleam/json
 import gleam/set
-import gleam/string
 import slackline
-import slackline/app
 import slackline/event
 
 pub fn prompt_text_test() {
@@ -25,10 +24,12 @@ pub fn prompt_text_test() {
   let assert "" = slack.prompt_text("  <@UBOT>  ", "UBOT")
 }
 
-pub fn is_stop_test() {
-  let assert True = slack.is_stop("stop")
-  let assert True = slack.is_stop("Cancel")
-  let assert False = slack.is_stop("stop the server")
+pub fn command_test() {
+  let assert slack.StopCommand = slack.command("!stop")
+  let assert slack.StopCommand = slack.command("Cancel")
+  let assert slack.HelpCommand = slack.command(" !help ")
+  let assert slack.SideComment = slack.command("## not for the bot")
+  let assert slack.NotACommand = slack.command("stop the server")
 }
 
 fn decode_event(raw: String) -> event.Event {
@@ -122,6 +123,7 @@ fn start_registry(launches: process.Subject(Launch)) {
       allowed: set.from_list(["U1"]),
       idle_ms: 50,
       flush_ms: 50,
+      mode: client.Sysadmin,
     ))
   r
 }
@@ -139,8 +141,10 @@ pub fn registry_routing_test() {
   process.send(r, message("U2", "10.1", "<@UBOT> hi", True))
   // A reply in a thread the bot isn't in is ignored.
   process.send(r, message("U1", "10.2", "hello", False))
-  // A bare mention has no prompt.
+  // A bare mention has no prompt, and asides and commands start nothing.
   process.send(r, message("U1", "10.3", "<@UBOT>", True))
+  process.send(r, message("U1", "10.31", "<@UBOT> ## just us", True))
+  process.send(r, message("U1", "10.32", "<@UBOT> !stop", True))
   let assert Error(Nil) = process.receive(launches, 100)
 
   process.send(r, message("U1", "10.4", "<@UBOT> do it", True))
@@ -156,16 +160,4 @@ pub fn registry_routing_test() {
   let assert Ok(Launched(_)) = process.receive(launches, 1000)
   let assert Error(Nil) = process.receive(launches, 100)
   Nil
-}
-
-pub fn stop_button_reaches_the_registry_test() {
-  let registry = process.new_subject()
-  let router = socket.router(registry, "UBOT")
-  let frame =
-    "{\"envelope_id\":\"e1\",\"type\":\"interactive\",\"accepts_response_payload\":false,\"payload\":{\"type\":\"block_actions\",\"user\":{\"id\":\"U1\",\"username\":\"k\",\"team_id\":\"T1\"},\"api_app_id\":\"A1\",\"token\":\"t\",\"container\":{\"type\":\"message\",\"message_ts\":\"11.1\",\"channel_id\":\"C1\",\"is_ephemeral\":false,\"thread_ts\":\"10.1\"},\"trigger_id\":\"x\",\"team\":{\"id\":\"T1\",\"domain\":\"d\"},\"channel\":{\"id\":\"C1\",\"name\":\"c\"},\"actions\":[{\"action_id\":\"crushling_stop\",\"block_id\":\"b\",\"text\":{\"type\":\"plain_text\",\"text\":\"Stop\"},\"value\":\"run-1\",\"style\":\"danger\",\"type\":\"button\",\"action_ts\":\"12.0\"}]}}"
-  let assert app.Send(frame: ack, after:) = app.handle_socket(router, frame)
-  let assert True = string.contains(ack, "e1")
-  after()
-  let assert Ok(registry.StopPressed("C1", "10.1", "U1")) =
-    process.receive(registry, 1000)
 }

@@ -75,8 +75,12 @@ fn start_server(
 @external(erlang, "crushling_local_ffi", "stop")
 fn stop_server(socket: String) -> Nil
 
-@external(erlang, "crushling_local_ffi", "wait_for_socket")
-fn wait_for_socket(path: String, timeout_ms: Int) -> Result(Nil, String)
+@external(erlang, "crushling_local_ffi", "wait_until_serving")
+fn wait_until_serving(
+  path: String,
+  os_pid: Int,
+  timeout_ms: Int,
+) -> Result(Nil, String)
 
 @external(erlang, "crushling_ffi", "mkdir_p")
 fn mkdir_p(path: String) -> Result(Nil, String)
@@ -102,9 +106,9 @@ pub fn local(
       use _ <- result.try(mkdir_p(base <> "/home/data"))
       use _ <- result.try(write_private(config(key), provider.config(backend)))
       use _ <- result.try(watch(creds, config(key)))
-      // A server left over from an earlier bridge would keep the socket.
+      // A server left over from an earlier bridge would keep the socket;
+      // this waits for it to exit.
       stop_server(socket(key))
-      process.sleep(200)
       let env = [
         "CRUSH_GLOBAL_CONFIG=" <> base <> "/home/config",
         "CRUSH_GLOBAL_DATA=" <> base <> "/home/data",
@@ -112,13 +116,13 @@ pub fn local(
         "CRUSH_SERVER_DETACH_GRACE=120",
         ..provider.env(backend)
       ]
-      use _ <- result.try(start_server(
+      use os_pid <- result.try(start_server(
         socket(key),
         work,
         base <> "/server.log",
         env,
       ))
-      use _ <- result.try(wait_for_socket(socket(key), 15_000))
+      use _ <- result.try(wait_until_serving(socket(key), os_pid, 15_000))
       Ok(Launched(socket: socket(key), root: work))
     },
     stop: fn(key) {

@@ -201,6 +201,21 @@ pub fn plan_folds_many_steps_test() {
   let assert [render.Task("earlier", _, _, _, "11 earlier steps"), ..] = tasks
 }
 
+pub fn status_test() {
+  let tool = fn(name, summary) {
+    run.Tool("c", name, "{}", summary, run.Running, "")
+  }
+  let assert "is running `go test ./...`…" =
+    render.status(tool("bash", "go test ./..."), "/w")
+  let assert "is editing a.go…" =
+    render.status(tool("edit", "/w/src/a.go"), "/w")
+  let assert "is reading example.com…" =
+    render.status(tool("fetch", "https://example.com/x/y"), "/w")
+  let long = render.status(tool("bash", string.repeat("x", 200)), "/w")
+  let assert 50 = string.length(long)
+  let assert True = string.ends_with(long, "…`…")
+}
+
 pub fn titles_test() {
   let assert "Reading a file" = render.title("view")
   let assert "Asking the language server" = render.title("lsp_definition")

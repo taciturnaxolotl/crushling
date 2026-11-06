@@ -5,6 +5,7 @@
 //// agent put to sleep; its workspace and session stay, so the next message
 //// picks the conversation up again.
 
+import crushling/crush/client
 import crushling/launcher.{type Launcher}
 import crushling/sandbox
 import crushling/slack
@@ -29,6 +30,7 @@ pub type Config {
     allowed: Set(String),
     idle_ms: Int,
     flush_ms: Int,
+    mode: client.PermissionMode,
   )
 }
 
@@ -48,11 +50,11 @@ pub type Incoming {
 
 pub type Message {
   Received(Incoming)
-  /// Someone pressed a run's Stop button.
-  StopPressed(channel: String, thread_ts: String, user: String)
   Started(
     key: String,
     generation: Int,
+    /// The first prompt as it should be sent, with any thread context.
+    first: String,
     result: Result(Subject(thread.Message), String),
   )
   RunFinished(key: String)
@@ -121,10 +123,8 @@ pub fn key(channel: String, thread_ts: String) -> String {
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
     Received(incoming) -> actor.continue(received(state, incoming))
-    StopPressed(channel, thread_ts, user) ->
-      actor.continue(stop_pressed(state, channel, thread_ts, user))
-    Started(key, generation, result) ->
-      actor.continue(started(state, key, generation, result))
+    Started(key, generation, first, result) ->
+      actor.continue(started(state, key, generation, first, result))
     RunFinished(key) -> actor.continue(run_finished(state, key))
     IdleCheck(key, generation) ->
       actor.continue(idle_check(state, key, generation))
@@ -152,15 +152,41 @@ fn received(state: State, incoming: Incoming) -> State {
       remember(state, id)
     }
     False, True, _, _ if prompt == "" -> remember(state, id)
-    False, True, Ok(entry), _ ->
-      case slack.is_stop(prompt), entry {
-        True, Live(thread:, ..) -> {
+    False, True, _, _ ->
+      case slack.command(prompt), known {
+        slack.SideComment, _ -> remember(state, id)
+        slack.HelpCommand, _ -> {
+          let client = config.client
+          process.spawn_unlinked(fn() {
+            slack.whisper(
+              client,
+              incoming.channel,
+              incoming.thread_ts,
+              incoming.user,
+              slack.help,
+            )
+          })
+          remember(state, id)
+        }
+        slack.StopCommand, Ok(Live(thread:, in_flight:, ..)) if in_flight > 0 -> {
           process.send(thread, thread.Cancel)
           react(config, incoming, "octagonal_sign")
           remember(state, id)
         }
-        True, Starting(..) -> remember(state, id)
-        False, _ -> {
+        slack.StopCommand, _ -> {
+          let client = config.client
+          process.spawn_unlinked(fn() {
+            slack.whisper(
+              client,
+              incoming.channel,
+              incoming.thread_ts,
+              incoming.user,
+              "_nothing is running in this thread._",
+            )
+          })
+          remember(state, id)
+        }
+        slack.NotACommand, Ok(entry) -> {
           // Seen; it runs after the current turn, as gorkie marks it.
           let busy = case entry {
             Live(in_flight:, ..) -> in_flight > 0
@@ -172,38 +198,12 @@ fn received(state: State, incoming: Incoming) -> State {
           })
           remember(deliver(state, key, entry, prompt), id)
         }
+        slack.NotACommand, Error(Nil) -> {
+          react(config, incoming, "eyes")
+          remember(launch(state, key, incoming, prompt), id)
+        }
       }
-    False, True, Error(Nil), True -> {
-      react(config, incoming, "eyes")
-      remember(launch(state, key, incoming, prompt), id)
-    }
   }
-}
-
-fn stop_pressed(
-  state: State,
-  channel: String,
-  thread_ts: String,
-  user: String,
-) -> State {
-  let config = state.config
-  let whisper = fn(text) {
-    let client = config.client
-    process.spawn_unlinked(fn() {
-      slack.whisper(client, channel, thread_ts, user, text)
-    })
-    Nil
-  }
-  case
-    set.contains(config.allowed, user),
-    dict.get(state.threads, key(channel, thread_ts))
-  {
-    False, _ -> whisper("_only the people this agent works for can stop it._")
-    True, Ok(Live(thread:, in_flight:, ..)) if in_flight > 0 ->
-      process.send(thread, thread.Cancel)
-    True, _ -> whisper("_nothing is running in this thread._")
-  }
-  state
 }
 
 fn remember(state: State, id: String) -> State {
@@ -242,6 +242,24 @@ fn launch(
   let channel = incoming.channel
   let thread_ts = incoming.thread_ts
   process.spawn_unlinked(fn() {
+    // Mentioned partway into a thread: what came before is context.
+    let first = case incoming.ts == thread_ts {
+      True -> prompt
+      False ->
+        case
+          slack.thread_context(
+            config.client,
+            channel,
+            thread_ts,
+            incoming.ts,
+            config.bot_user,
+            10,
+          )
+        {
+          "" -> prompt
+          context -> context <> "\n\nThe request:\n" <> prompt
+        }
+    }
     let result = {
       use launched <- result.try(config.launcher.launch(key))
       let sink =
@@ -254,10 +272,11 @@ fn launch(
         title: "slack " <> channel <> " " <> thread_ts,
         sink:,
         flush_ms: config.flush_ms,
+        mode: config.mode,
       ))
       |> result.map_error(fn(error) { "thread: " <> string.inspect(error) })
     }
-    process.send(self, Started(key, generation, result))
+    process.send(self, Started(key, generation, first, result))
   })
   let entry = Starting(channel:, thread_ts:, generation:, pending: [prompt])
   State(..state, generation:, threads: dict.insert(state.threads, key, entry))
@@ -267,6 +286,7 @@ fn started(
   state: State,
   key: String,
   generation: Int,
+  first: String,
   result: Result(Subject(thread.Message), String),
 ) -> State {
   case dict.get(state.threads, key), result {
@@ -290,6 +310,10 @@ fn started(
         Ok(thread) -> {
           let assert Ok(pid) = process.subject_owner(thread)
           let monitor = process.monitor(pid)
+          let pending = case pending {
+            [_, ..rest] -> [first, ..rest]
+            [] -> []
+          }
           list.each(pending, fn(prompt) {
             process.send(thread, thread.Prompt(prompt))
           })

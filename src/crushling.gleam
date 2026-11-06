@@ -14,12 +14,14 @@
 //// | `CRUSH_HYPER_API_KEY` | the key, for `hyper-key` |
 //// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | models |
 //// | `CRUSHLING_CLAUDE_VERSION` | Claude Code version to present; default the installed `claude`, else crush's floor |
+//// | `CRUSHLING_MODE` | `sysadmin` (default: no permission prompts and no blocked commands) or `yolo` |
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
 //// | `CRUSHLING_ROOT` | where thread workspaces live; default `~/.local/state/crushling/threads` |
 //// | `CRUSHLING_IDLE_MINUTES` | idle time before a thread's agent is stopped; default 15 |
 //// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc-uds`, `sbx-egress` |
 
 import crushling/credentials
+import crushling/crush/client
 import crushling/launcher
 import crushling/provider
 import crushling/registry
@@ -79,6 +81,11 @@ fn start() -> Result(Nil, String) {
   use app_token <- result.try(required("SLACK_APP_TOKEN"))
   use allowed <- result.try(allowed_users())
   use backend <- result.try(backend())
+  use mode <- result.try(case setting("CRUSHLING_MODE", "sysadmin") {
+    "sysadmin" -> Ok(client.Sysadmin)
+    "yolo" -> Ok(client.Yolo)
+    other -> Error("CRUSHLING_MODE is " <> other <> "; use sysadmin or yolo")
+  })
   use idle_minutes <- result.try(
     int.parse(setting("CRUSHLING_IDLE_MINUTES", "15"))
     |> result.replace_error("CRUSHLING_IDLE_MINUTES is not a number"),
@@ -114,6 +121,7 @@ fn start() -> Result(Nil, String) {
       allowed:,
       idle_ms: idle_minutes * 60_000,
       flush_ms: 1000,
+      mode:,
     ))
     |> result.map_error(fn(error) { "registry: " <> string.inspect(error) }),
   )
