@@ -1,29 +1,36 @@
-//// End to end against a real `crush server` and a real model. Skipped unless
-//// `CRUSHLING_REAL=1`:
+//// End to end against a real `crush server` and a real model, wired as in
+//// production. Skipped unless `CRUSHLING_REAL=1`:
 ////
-////     CRUSHLING_REAL=1 gleam test
+////     CRUSHLING_REAL=1 gleam test                               # hyper key
+////     CRUSHLING_REAL=1 CRUSHLING_TEST_BACKEND=claude gleam test # Claude
+////     CRUSHLING_REAL=1 CRUSHLING_TEST_BACKEND=hyper-login gleam test
 ////
-//// The server gets an isolated global config holding only one provider. Its
-//// settings are copied from `~/.local/share/crush/crush.json` but its key
-//// comes from `CRUSHLING_TEST_API_KEY` or `CRUSH_<PROVIDER>_API_KEY`, in the
-//// environment or `.env`: copying an OAuth login would let the
-//// test server rotate, and so revoke, the real refresh token. By default that is hyper,
-//// with deepseek as the large model and prism-flash as the small one;
-//// override with `CRUSHLING_TEST_PROVIDER`, `CRUSHLING_TEST_LARGE` and
-//// `CRUSHLING_TEST_SMALL`. Set `HYPER_URL` to point hyper elsewhere, such
-//// as `https://hyper.charmcli.dev`, with a key from that deployment.
+//// The hyper key comes from `CRUSH_HYPER_API_KEY` (environment or `.env`).
+//// The logins are crush.json files only crushling uses, at
+//// `CRUSHLING_CLAUDE_LOGIN` / `CRUSHLING_HYPER_LOGIN` (default
+//// `~/.local/state/crushling/<claude|hyper>/crush.json`). Seed one with
 ////
-//// Assertions are about structure (order, diffs, history), never wording,
-//// beyond asking the model to echo a marker word.
+////     CRUSH_GLOBAL_DATA=~/.local/state/crushling/claude crush login claude
+////
+//// With a login, the server only ever holds a managed token (no refresh
+//// token) that `credentials` keeps fresh, as a container does. Never point a
+//// test at the login your own crush uses: refresh tokens are single use.
+////
+//// Models can be overridden with `CRUSHLING_TEST_LARGE` and
+//// `CRUSHLING_TEST_SMALL`. Assertions are about structure (order, diffs,
+//// history), never wording, beyond asking the model to echo a marker word.
 
+import crushling/credentials
 import crushling/crush/client
 import crushling/gun
+import crushling/provider
 import crushling/run
 import crushling/thread
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/string
 
 @external(erlang, "real_server_ffi", "enabled")
@@ -33,15 +40,30 @@ fn enabled() -> Bool
 fn env(name: String, default: String) -> String
 
 @external(erlang, "real_server_ffi", "start")
-fn start_server(socket: String, log: String, home: String) -> Int
-
-@external(erlang, "real_server_ffi", "isolated_config")
-fn isolated_config(
+fn start_server(
+  socket: String,
+  log: String,
   home: String,
-  provider: String,
-  large: String,
-  small: String,
-) -> Nil
+  env: List(String),
+) -> Int
+
+@external(erlang, "real_server_ffi", "api_key")
+fn api_key(name: String) -> Result(String, Nil)
+
+@external(erlang, "real_server_ffi", "claude_version")
+fn claude_version() -> String
+
+@external(erlang, "real_server_ffi", "expand_home")
+fn expand_home(path: String) -> String
+
+@external(erlang, "crushling_ffi", "file_exists")
+fn file_exists(path: String) -> Bool
+
+@external(erlang, "crushling_ffi", "mkdir_p")
+fn mkdir_p(path: String) -> Result(Nil, String)
+
+@external(erlang, "crushling_ffi", "write_private")
+fn write_private(path: String, content: String) -> Result(Nil, String)
 
 @external(erlang, "real_server_ffi", "kill")
 fn kill(os_pid: Int) -> Nil
@@ -76,11 +98,91 @@ type Call {
 pub fn real_server_test_() -> Dynamic {
   case enabled() {
     False -> to_dynamic([])
-    True ->
+    True -> {
+      let backend = backend()
+      let wiring = Wiring(backend, start_credentials(backend))
       to_dynamic([
-        with_timeout(600, queued_prompts_and_bash_diff),
-        with_timeout(600, survives_server_restart),
+        with_timeout(600, fn() { queued_prompts_and_bash_diff(wiring) }),
+        with_timeout(600, fn() { survives_server_restart(wiring) }),
       ])
+    }
+  }
+}
+
+fn backend() -> provider.Backend {
+  let large = fn(default) { env("CRUSHLING_TEST_LARGE", default) }
+  let small = fn(default) { env("CRUSHLING_TEST_SMALL", default) }
+  case env("CRUSHLING_TEST_BACKEND", "hyper") {
+    "claude" ->
+      provider.Claude(
+        login: login_path("CRUSHLING_CLAUDE_LOGIN", "claude"),
+        version: claude_version(),
+        large: large("claude-haiku-4-5-20251001"),
+        small: small("claude-haiku-4-5-20251001"),
+      )
+    "hyper-login" ->
+      provider.Hyper(
+        login: login_path("CRUSHLING_HYPER_LOGIN", "hyper"),
+        large: large("deepseek-v4.1-flash"),
+        small: small("prism-flash"),
+      )
+    _ -> {
+      let assert Ok(key) = api_key("CRUSH_HYPER_API_KEY")
+        as "set CRUSH_HYPER_API_KEY in the environment or .env"
+      provider.HyperKey(
+        key:,
+        large: large("deepseek-v4.1-flash"),
+        small: small("prism-flash"),
+      )
+    }
+  }
+}
+
+fn login_path(variable: String, name: String) -> String {
+  let path =
+    expand_home(env(
+      variable,
+      "~/.local/state/crushling/" <> name <> "/crush.json",
+    ))
+  case file_exists(path) {
+    True -> path
+    False ->
+      panic as {
+        "no crushling "
+        <> name
+        <> " login at "
+        <> path
+        <> "; seed one with CRUSH_GLOBAL_DATA=<its dir> crush login "
+        <> name
+      }
+  }
+}
+
+type Wiring {
+  Wiring(
+    backend: provider.Backend,
+    credentials: option.Option(process.Subject(credentials.Message)),
+  )
+}
+
+/// One credentials actor for every test, as for every thread in production.
+/// Started unlinked, because EUnit runs the generator in a process that
+/// exits before the tests do.
+fn start_credentials(
+  backend: provider.Backend,
+) -> option.Option(process.Subject(credentials.Message)) {
+  case provider.login(backend) {
+    None -> None
+    Some(login) -> {
+      let started = process.new_subject()
+      process.spawn_unlinked(fn() {
+        let assert Ok(creds) = credentials.start(login)
+        process.send(started, creds)
+        process.sleep_forever()
+      })
+      let assert Ok(creds) = process.receive(started, 10_000)
+      Some(creds)
+    }
   }
 }
 
@@ -91,11 +193,12 @@ type Env {
     socket: String,
     log: String,
     home: String,
+    server_env: List(String),
     server: Int,
   )
 }
 
-fn setup(name: String) -> Env {
+fn setup(name: String, wiring: Wiring) -> Env {
   let dir =
     "/tmp/crushling-real-"
     <> name
@@ -109,23 +212,30 @@ fn setup(name: String) -> Env {
       "git init -q && printf 'first line\\n' > notes.txt && git add . && git -c user.email=t@t -c user.name=t commit -qm init",
     )
   let home = dir <> "/home"
-  isolated_config(
-    home,
-    env("CRUSHLING_TEST_PROVIDER", "hyper"),
-    env("CRUSHLING_TEST_LARGE", "deepseek-v4.1-flash"),
-    env("CRUSHLING_TEST_SMALL", "prism-flash"),
-  )
+  let Wiring(backend:, credentials: creds) = wiring
+  let assert Ok(Nil) = mkdir_p(home <> "/config")
+  let assert Ok(Nil) = mkdir_p(home <> "/data")
+  let config = home <> "/data/crush.json"
+  let assert Ok(Nil) = write_private(config, provider.config(backend))
+  case creds {
+    Some(creds) -> {
+      let assert Ok(Nil) = credentials.watch(creds, config)
+      Nil
+    }
+    None -> Nil
+  }
+  let server_env = provider.env(backend)
   let socket = dir <> "/crush.sock"
   let log = dir <> "/server.log"
-  let server = start_server(socket, log, home)
+  let server = start_server(socket, log, home, server_env)
   wait_for_socket(socket, 15_000)
-  Env(dir:, work:, socket:, log:, home:, server:)
+  Env(dir:, work:, socket:, log:, home:, server_env:, server:)
 }
 
 /// Set up a server and workspace, run the body, and always tear down, so a
 /// failed assertion never leaves a server running.
-fn with_env(name: String, body: fn(Env) -> Nil) -> Nil {
-  let env = setup(name)
+fn with_env(name: String, wiring: Wiring, body: fn(Env) -> Nil) -> Nil {
+  let env = setup(name, wiring)
   guarded(fn() { body(env) }, fn() { teardown(env) })
 }
 
@@ -188,8 +298,8 @@ fn says(finished: thread.Finished, word: String) -> Bool {
   string.contains(string.uppercase(finished.text), word)
 }
 
-fn queued_prompts_and_bash_diff() -> Nil {
-  use env <- with_env("queue")
+fn queued_prompts_and_bash_diff(wiring: Wiring) -> Nil {
+  use env <- with_env("queue", wiring)
   let #(t, calls) = start_thread(env)
   process.send(
     t,
@@ -244,8 +354,8 @@ fn shell_parts_in_history(env: Env) -> Int {
   count
 }
 
-fn survives_server_restart() -> Nil {
-  use env <- with_env("restart")
+fn survives_server_restart(wiring: Wiring) -> Nil {
+  use env <- with_env("restart", wiring)
   let #(t, calls) = start_thread(env)
   process.send(
     t,
@@ -256,7 +366,7 @@ fn survives_server_restart() -> Nil {
   await_progress(calls, "sleep")
 
   kill(env.server)
-  let server = start_server(env.socket, env.log, env.home)
+  let server = start_server(env.socket, env.log, env.home, env.server_env)
   let env = Env(..env, server:)
   wait_for_socket(env.socket, 15_000)
 

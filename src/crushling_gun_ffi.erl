@@ -1,7 +1,7 @@
 -module(crushling_gun_ffi).
 
--export([connect_unix/2, request/6, stream/3, cancel/2, close/1,
-         decode_message/1]).
+-export([connect_unix/2, connect_tcp/4, request/6, stream/3,
+         cancel/2, close/1, decode_message/1]).
 
 connect_unix(Path, TimeoutMs) ->
     Opts = #{
@@ -17,6 +17,33 @@ connect_unix(Path, TimeoutMs) ->
                 {error, Reason} ->
                     gun:close(Pid),
                     {error, reason(Reason)}
+            end;
+        {error, Reason} ->
+            {error, reason(Reason)}
+    end.
+
+%% A plain or TLS connection over TCP. TLS verifies the peer against the
+%% system trust store and checks the hostname.
+connect_tcp(Host, Port, Tls, TimeoutMs) ->
+    HostStr = unicode:characters_to_list(Host),
+    Base = #{protocols => [http], retry => 0,
+             http_opts => #{content_handlers => [gun_data_h]}},
+    Opts = case Tls of
+        true ->
+            Base#{transport => tls,
+                  tls_opts => [{verify, verify_peer},
+                               {cacerts, public_key:cacerts_get()},
+                               {server_name_indication, HostStr},
+                               {customize_hostname_check,
+                                [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}]};
+        false ->
+            Base
+    end,
+    case gun:open(HostStr, Port, Opts) of
+        {ok, Pid} ->
+            case gun:await_up(Pid, TimeoutMs) of
+                {ok, _} -> {ok, Pid};
+                {error, Reason} -> gun:close(Pid), {error, reason(Reason)}
             end;
         {error, Reason} ->
             {error, reason(Reason)}
