@@ -179,17 +179,66 @@ pub fn create_session(workspace_id: String, title: String) -> Call(String) {
 /// Always pass a fresh `run_id`: a prompt sent while the session is busy is
 /// then queued as its own turn with its own `run_complete`, instead of being
 /// folded into the turn already running.
+/// A file sent with a prompt, which crush hands the model directly: an
+/// image is seen, not just named.
+pub type Attachment {
+  Attachment(
+    /// Where the file is in the workspace, as the agent sees it.
+    path: String,
+    name: String,
+    mime_type: String,
+    content: BitArray,
+  )
+}
+
 pub fn send_prompt(
   workspace_id workspace_id: String,
   session_id session_id: String,
   run_id run_id: String,
   prompt prompt: String,
 ) -> Call(Nil) {
+  send_prompt_with(
+    workspace_id:,
+    session_id:,
+    run_id:,
+    prompt:,
+    attachments: [],
+  )
+}
+
+pub fn send_prompt_with(
+  workspace_id workspace_id: String,
+  session_id session_id: String,
+  run_id run_id: String,
+  prompt prompt: String,
+  attachments attachments: List(Attachment),
+) -> Call(Nil) {
+  let files = case attachments {
+    [] -> []
+    attachments -> [
+      #(
+        "attachments",
+        json.array(attachments, fn(file) {
+          json.object([
+            #("file_path", json.string(file.path)),
+            #("file_name", json.string(file.name)),
+            #("mime_type", json.string(file.mime_type)),
+            // Go's encoding/json reads []byte as base64.
+            #(
+              "content",
+              json.string(bit_array.base64_encode(file.content, True)),
+            ),
+          ])
+        }),
+      ),
+    ]
+  }
   let body =
     json.object([
       #("session_id", json.string(session_id)),
       #("run_id", json.string(run_id)),
       #("prompt", json.string(prompt)),
+      ..files
     ])
   Call(Post, workspace(workspace_id) <> "/agent", Some(body), 202, ignore_body)
 }
