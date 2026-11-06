@@ -36,9 +36,6 @@ pub type Sink {
     update_plan: fn(String, render.Plan) -> Result(Nil, String),
     /// Post a markdown message.
     post: fn(String) -> Result(String, String),
-    /// Post the controls for a run (a Stop button), returning their id.
-    post_controls: fn(String) -> Result(String, String),
-    delete: fn(String) -> Nil,
     /// Attach a file to the thread: name, then contents.
     upload: fn(String, String) -> Result(Nil, String),
     /// Called once per run after its reply is posted.
@@ -66,6 +63,9 @@ pub type Config {
     sink: Sink,
     /// How often an in-progress message is re-rendered, in milliseconds.
     flush_ms: Int,
+    /// Yolo skips permission prompts; sysadmin also lifts crush's block
+    /// list of dangerous commands.
+    mode: client.PermissionMode,
   )
 }
 
@@ -75,6 +75,8 @@ pub type Message {
   Stop
   Setup
   Flush
+  /// Periodic check that the active run is still making progress.
+  Watchdog
   Reconnect
   Gun(gun.Message)
 }
@@ -85,10 +87,13 @@ type Active {
     /// The plan card, once posted, and what it last showed.
     plan_ts: Option(String),
     shown: Option(render.Plan),
-    /// The Stop button message.
-    controls_ts: Option(String),
     /// The workspace snapshot taken just before the prompt was sent.
     base: Option(String),
+    /// The status last shown, so it is only set when it changes.
+    status: String,
+    last_event_ms: Int,
+    /// Whether the stall note has been posted for this run.
+    stalled: Bool,
   )
 }
 
@@ -123,6 +128,14 @@ type State {
 }
 
 const max_retries = 8
+
+/// With no event from the agent for this long, say so in the thread.
+const stall_ms = 600_000
+
+const watchdog_ms = 60_000
+
+@external(erlang, "crushling_ffi", "monotonic_ms")
+fn now_ms() -> Int
 
 const ready_poll_ms = 200
 
@@ -184,6 +197,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(State(..state, waiting: []))
     }
     Flush -> actor.continue(flush(State(..state, flushing: False)))
+    Watchdog -> actor.continue(watchdog(state))
     Gun(message) -> actor.continue(on_gun(state, message))
     Stop -> {
       shutdown(state)
@@ -262,7 +276,7 @@ fn establish(state: State) -> Result(#(Conns, Ready), String) {
   use workspace_id <- result.try(
     client.perform(
       requests,
-      client.create_workspace(config.root, state.client_id, client.Yolo, []),
+      client.create_workspace(config.root, state.client_id, config.mode, []),
     )
     |> result.map_error(fail),
   )
@@ -359,9 +373,19 @@ fn send_prompt(
   {
     Ok(Nil) -> {
       state.config.sink.status("is thinking")
+      process.send_after(state.self, watchdog_ms, Watchdog)
       let run = run.new(ready.session_id, run_id)
+      let now = now_ms()
       let active =
-        Active(run:, plan_ts: None, shown: None, controls_ts: None, base:)
+        Active(
+          run:,
+          plan_ts: None,
+          shown: None,
+          base:,
+          status: "is thinking",
+          last_event_ms: now,
+          stalled: False,
+        )
       State(..state, active: Some(active))
     }
     Error(client.Transport(_)) -> {
@@ -459,8 +483,8 @@ fn on_event(state: State, event: event.Event) -> State {
     None -> state
     Some(active) -> {
       let run = run.apply(active.run, state.known, event)
-      let state =
-        finish_if_done(State(..state, active: Some(Active(..active, run:))))
+      let active = Active(..active, run:, last_event_ms: now_ms())
+      let state = finish_if_done(State(..state, active: Some(active)))
       case state.active, state.flushing {
         None, _ | _, True -> state
         Some(_), False -> {
@@ -481,10 +505,61 @@ fn flush(state: State) -> State {
   }
 }
 
-/// Post or update the plan card. The first time it appears, the Stop button
-/// goes up with it. Posting a message clears the thread's status, so it is
-/// set again while the run carries on.
+fn watchdog(state: State) -> State {
+  case state.active {
+    None -> state
+    Some(active) -> {
+      process.send_after(state.self, watchdog_ms, Watchdog)
+      case !active.stalled && now_ms() - active.last_event_ms > stall_ms {
+        False -> state
+        True -> {
+          let _ =
+            state.config.sink.post(
+              "_no word from the agent in 10 minutes; it may be stuck. Reply `!stop` to stop it._",
+            )
+          state.config.sink.status("")
+          State(
+            ..state,
+            active: Some(Active(..active, stalled: True, status: "")),
+          )
+        }
+      }
+    }
+  }
+}
+
+/// The thread status for what the run is doing now: the newest tool still
+/// running, else thinking.
+fn current_status(active: Active, root: String) -> String {
+  case
+    list.find(list.reverse(active.run.tools), fn(tool) {
+      tool.status == run.Running
+    })
+  {
+    Ok(tool) -> render.status(tool, root)
+    Error(Nil) -> "is thinking"
+  }
+}
+
+fn show_status(config: Config, active: Active) -> Active {
+  let status = current_status(active, config.root)
+  case status == active.status {
+    True -> active
+    False -> {
+      config.sink.status(status)
+      Active(..active, status:)
+    }
+  }
+}
+
+/// Post or update the plan card, and keep the thread's status on what the
+/// run is doing. Posting a message clears the status, so it is set again
+/// after.
 fn show_progress(config: Config, active: Active) -> Active {
+  show_status(config, show_plan(config, active))
+}
+
+fn show_plan(config: Config, active: Active) -> Active {
   let sink = config.sink
   case render.plan(active.run, config.root) {
     None -> active
@@ -501,22 +576,9 @@ fn show_progress(config: Config, active: Active) -> Active {
           }
         None ->
           case sink.post_plan(plan) {
-            Ok(ts) -> {
-              let controls_ts = case sink.post_controls(active.run.run_id) {
-                Ok(ts) -> Some(ts)
-                Error(reason) -> {
-                  warn("crushling: controls failed: " <> reason)
-                  None
-                }
-              }
-              sink.status("is working")
-              Active(
-                ..active,
-                plan_ts: Some(ts),
-                shown: Some(plan),
-                controls_ts:,
-              )
-            }
+            Ok(ts) ->
+              // Posting cleared the status; show_status sets it again.
+              Active(..active, plan_ts: Some(ts), shown: Some(plan), status: "")
             Error(reason) -> {
               warn("crushling: plan post failed: " <> reason)
               active
@@ -592,7 +654,7 @@ fn finish(state: State, active: Active) -> Nil {
   let sink = config.sink
   let #(changes, patch) = changes(state, active)
 
-  // The plan card settles into its final state, and the Stop button goes.
+  // The plan card settles into its final state.
   case active.plan_ts, render.plan(active.run, config.root) {
     Some(ts), Some(plan) ->
       case sink.update_plan(ts, plan) {
@@ -600,10 +662,6 @@ fn finish(state: State, active: Active) -> Nil {
         Error(reason) -> warn("crushling: plan update failed: " <> reason)
       }
     _, _ -> Nil
-  }
-  case active.controls_ts {
-    Some(ts) -> sink.delete(ts)
-    None -> Nil
   }
 
   let answer = render.answer(active.run)

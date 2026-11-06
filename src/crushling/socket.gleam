@@ -2,7 +2,6 @@
 //// connection drops, with every event turned into a `registry.Incoming`.
 
 import crushling/registry
-import crushling/slack
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/option.{None, Some}
@@ -12,34 +11,17 @@ import slackline/api/apps
 import slackline/app
 import slackline/event
 import slackline/httpc
-import slackline/interaction
 import stratus
 
 @external(erlang, "crushling_ffi", "log_warning")
 fn warn(text: String) -> Nil
 
-/// The router: Slack events in as `registry.Received`, Stop buttons as
-/// `registry.StopPressed`.
+/// The router: Slack events in, `registry.Received` out.
 pub fn router(
   registry: Subject(registry.Message),
   bot_user: String,
 ) -> app.App {
   app.unverified()
-  |> app.action(slack.stop_action, fn(_action, payload) {
-    case payload.container {
-      Some(interaction.MessageContainer(
-        channel_id: Some(channel),
-        thread_ts: Some(thread_ts),
-        ..,
-      )) ->
-        process.send(
-          registry,
-          registry.StopPressed(channel, thread_ts, payload.user.id),
-        )
-      _ -> Nil
-    }
-    app.ack()
-  })
   |> app.on_event(fn(event, _delivery) {
     case incoming(event, bot_user) {
       Ok(message) -> process.send(registry, registry.Received(message))

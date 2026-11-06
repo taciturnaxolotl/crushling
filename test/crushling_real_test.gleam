@@ -266,8 +266,6 @@ fn sink(calls: Subject(Call)) -> thread.Sink {
       Ok(Nil)
     },
     post: progress,
-    post_controls: fn(_) { Ok("controls") },
-    delete: fn(_) { Nil },
     upload: fn(_, _) { Ok(Nil) },
     finished: fn(finished) { process.send(calls, Done(finished)) },
   )
@@ -282,6 +280,7 @@ fn start_thread(env: Env) -> #(Subject(thread.Message), Subject(Call)) {
       title: "crushling real test",
       sink: sink(calls),
       flush_ms: 250,
+      mode: client.Sysadmin,
     ))
   #(t, calls)
 }
@@ -445,6 +444,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       allowed: set.from_list(["U1"]),
       idle_ms: 500,
       flush_ms: 250,
+      mode: client.Sysadmin,
     ))
   process.send(
     r,

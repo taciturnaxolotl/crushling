@@ -5,8 +5,10 @@
 import crushling/render
 import crushling/thread
 import gleam/bit_array
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/result
 import gleam/string
 import slackline
@@ -16,11 +18,11 @@ import slackline/api/chat
 import slackline/api/chat/post_ephemeral
 import slackline/api/chat/post_message
 import slackline/api/chat/update
+import slackline/api/conversations
+import slackline/api/conversations/replies
 import slackline/api/files/complete_upload_external
 import slackline/api/reactions
 import slackline/block
-import slackline/element
-import slackline/element/button
 import slackline/httpc
 
 /// Notifications and old clients show `text`; keep it short.
@@ -38,9 +40,6 @@ fn send(run: fn() -> Result(a, slackline.Error)) -> Result(a, String) {
   httpc.retrying(attempts: 3, run:)
   |> result.map_error(slackline.describe_error)
 }
-
-/// The action id of a run's Stop button. Its value is the run id.
-pub const stop_action = "crushling_stop"
 
 const loading_messages = [
   "is reading the thread", "is looking around", "is thinking it over",
@@ -142,23 +141,6 @@ pub fn sink(
       }
     },
     post: fn(markdown) { post(markdown, markdown_blocks(markdown)) },
-    post_controls: fn(run_id) {
-      post("Working on it", [
-        block.actions(
-          [
-            element.button("Stop", stop_action, [
-              button.value(run_id),
-              button.style(block.Danger),
-            ]),
-          ],
-          [],
-        ),
-      ])
-    },
-    delete: fn(ts) {
-      let _ = chat.delete(channel:, ts:) |> httpc.send(client)
-      Nil
-    },
     upload: fn(name, content) {
       let file =
         slackline.FileUpload(
@@ -178,8 +160,7 @@ pub fn sink(
   )
 }
 
-/// Reply to one user only, such as when they press Stop with nothing
-/// running.
+/// Reply to one user only, such as for `!help`.
 pub fn whisper(
   client: slackline.Client,
   channel: String,
@@ -261,10 +242,65 @@ fn is_link(inside: String) -> Bool {
   || string.starts_with(inside, "mailto:")
 }
 
-/// A thread reply that asks to stop the current run.
-pub fn is_stop(prompt: String) -> Bool {
-  case string.lowercase(prompt) {
-    "stop" | "cancel" | "stop!" -> True
-    _ -> False
+pub type Command {
+  StopCommand
+  HelpCommand
+  /// A `##` aside meant for the people in the thread, not the agent.
+  SideComment
+  NotACommand
+}
+
+pub fn command(prompt: String) -> Command {
+  case string.lowercase(string.trim(prompt)) {
+    "!stop" | "stop" | "cancel" | "stop!" -> StopCommand
+    "!help" -> HelpCommand
+    "##" <> _ -> SideComment
+    _ -> NotACommand
+  }
+}
+
+pub const help =
+  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
+
+/// The messages before `before_ts` in a thread, as context for an agent
+/// first mentioned partway in. At most `limit` of the latest, from people.
+pub fn thread_context(
+  client: slackline.Client,
+  channel: String,
+  thread_ts: String,
+  before_ts: String,
+  bot_user: String,
+  limit: Int,
+) -> String {
+  let lines =
+    conversations.replies(channel:, ts: thread_ts)
+    |> replies.limit(100)
+    |> httpc.send(client)
+    |> result.map(fn(response) { option.unwrap(response.messages, []) })
+    |> result.unwrap([])
+    |> list.filter_map(fn(message) {
+      case message.user, message.text, message.ts, message.bot_id {
+        Some(user), Some(text), Some(ts), None
+          if ts != before_ts && user != bot_user
+        ->
+          case string.compare(ts, before_ts), command(text) {
+            order.Lt, NotACommand ->
+              Ok("[<@" <> user <> ">] " <> prompt_text(text, bot_user))
+            _, _ -> Error(Nil)
+          }
+        _, _, _, _ -> Error(Nil)
+      }
+    })
+  let count = list.length(lines)
+  case lines {
+    [] -> ""
+    lines ->
+      "Earlier in this Slack thread"
+      <> case count > limit {
+        True -> " (the last " <> int.to_string(limit) <> " messages)"
+        False -> ""
+      }
+      <> ":\n"
+      <> string.join(list.drop(lines, int.max(count - limit, 0)), "\n")
   }
 }
