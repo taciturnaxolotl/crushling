@@ -20,13 +20,17 @@
 //// | `CRUSHLING_IDLE_MINUTES` | idle time before a thread's agent is stopped; default 15 |
 //// | `CRUSHLING_SHUTDOWN_GRACE_SECONDS` | on SIGTERM, how long running turns get to finish before they are cancelled; default 60 |
 //// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc-uds`, `sbx-egress` |
+//// | `CRUSHLING_MCP_PORT`, `CRUSHLING_MCP_BIND` | where the agents' Slack tools are served; default `7469` on `127.0.0.1` |
+//// | `CRUSHLING_MCP_URL` | how an agent reaches them; default `http://127.0.0.1:<port>` for `local`, none for `docker` (set it to an address the sandbox network may reach, or `off`) |
 
 import crushling/credentials
 import crushling/crush/client
 import crushling/launcher
+import crushling/mcp
 import crushling/provider
 import crushling/registry
 import crushling/sandbox
+import crushling/slack_tools
 import crushling/socket
 import gleam/erlang/process
 import gleam/int
@@ -112,7 +116,23 @@ fn start() -> Result(Nil, String) {
 
   let root =
     expand_home(setting("CRUSHLING_ROOT", "~/.local/state/crushling/threads"))
-  use launcher <- result.try(launcher_for(root, backend, creds))
+  use secret <- result.try(mcp_secret(root))
+  use port <- result.try(
+    int.parse(setting("CRUSHLING_MCP_PORT", "7469"))
+    |> result.replace_error("CRUSHLING_MCP_PORT is not a number"),
+  )
+  let local = setting("CRUSHLING_LAUNCHER", "docker") == "local"
+  let mcp_url = case getenv("CRUSHLING_MCP_URL"), local {
+    Ok("off"), _ -> ""
+    Ok(url), _ -> url
+    Error(Nil), True -> "http://127.0.0.1:" <> int.to_string(port)
+    Error(Nil), False -> ""
+  }
+  let bridge = case mcp_url {
+    "" -> launcher.no_bridge()
+    url -> launcher.Bridge(url:, env: fn(key) { mcp.env(secret, key) })
+  }
+  use launcher <- result.try(launcher_for(root, backend, creds, bridge))
 
   use registry <- result.try(
     registry.start(registry.Config(
@@ -139,6 +159,38 @@ fn start() -> Result(Nil, String) {
     <> int.to_string(set.size(allowed))
     <> " allowed users",
   )
+  use _ <- result.try(case mcp_url {
+    "" -> {
+      io.println(
+        "crushling: Slack tools off; set CRUSHLING_MCP_URL so agents can reach them",
+      )
+      Ok(Nil)
+    }
+    url -> {
+      let context =
+        slack_tools.Context(
+          client:,
+          bot_user: me.user_id,
+          launcher:,
+          lookup: fn(key) {
+            process.call(registry, 5000, registry.Lookup(key, _))
+          },
+        )
+      use _ <- result.map(
+        mcp.start(
+          setting("CRUSHLING_MCP_BIND", "127.0.0.1"),
+          port,
+          secret,
+          slack_tools.tools(),
+          fn(key, name, arguments) {
+            slack_tools.call(context, key, name, arguments)
+          },
+        ),
+      )
+      io.println("crushling: Slack tools at " <> url)
+    }
+  })
+
   let grace_s =
     int.parse(setting("CRUSHLING_SHUTDOWN_GRACE_SECONDS", "60"))
     |> result.unwrap(60)
@@ -232,17 +284,45 @@ fn backend() -> Result(provider.Backend, String) {
   }
 }
 
+@external(erlang, "crushling_ffi", "read_file")
+fn read_file(path: String) -> Result(String, Nil)
+
+@external(erlang, "crushling_ffi", "mkdir_p")
+fn mkdir_p(path: String) -> Result(Nil, String)
+
+@external(erlang, "crushling_ffi", "write_private")
+fn write_private(path: String, content: String) -> Result(Nil, String)
+
+@external(erlang, "crushling_ffi", "uuid_v4")
+fn uuid_v4() -> String
+
+/// The secret every thread's tool token is derived from, kept beside the
+/// threads so tokens survive a restart.
+fn mcp_secret(root: String) -> Result(String, String) {
+  let path = root <> "/mcp-secret"
+  case read_file(path) {
+    Ok(secret) if secret != "" -> Ok(string.trim(secret))
+    _ -> {
+      let secret = uuid_v4() <> uuid_v4()
+      use _ <- result.try(mkdir_p(root))
+      use _ <- result.map(write_private(path, secret))
+      secret
+    }
+  }
+}
+
 fn launcher_for(
   root: String,
   backend: provider.Backend,
   creds: option.Option(process.Subject(credentials.Message)),
+  bridge: launcher.Bridge,
 ) -> Result(launcher.Launcher, String) {
   case setting("CRUSHLING_LAUNCHER", "docker") {
     "local" -> {
       io.println(
         "crushling: local launcher, agents run unsandboxed with your access",
       )
-      Ok(launcher.local(root, backend, creds))
+      Ok(launcher.local(root, backend, creds, bridge))
     }
     "docker" -> {
       use uid <- result.try(id("-u"))
@@ -260,9 +340,9 @@ fn launcher_for(
           gid:,
           root:,
           env: provider.env(backend),
-          crush_config: provider.config(backend),
+          crush_config: provider.config_with(backend, bridge.url),
         )
-      Ok(launcher.docker(policy, creds))
+      Ok(launcher.docker(policy, creds, bridge))
     }
     other -> Error("CRUSHLING_LAUNCHER is " <> other <> "; use docker or local")
   }

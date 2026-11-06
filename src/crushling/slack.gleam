@@ -6,6 +6,7 @@ import crushling/gun
 import crushling/render
 import crushling/thread
 import gleam/bit_array
+import gleam/erlang/process
 import gleam/float
 import gleam/http
 import gleam/int
@@ -16,6 +17,10 @@ import gleam/string
 import gleam/uri
 import slackline
 import slackline/api/agents
+import slackline/api/agents/conversations_archive
+import slackline/api/agents/conversations_create
+import slackline/api/agents/conversations_set_properties
+import slackline/api/agents/conversations_set_view
 import slackline/api/agents/sessions_rename
 import slackline/api/agents/sessions_set_status
 import slackline/api/chat
@@ -81,15 +86,81 @@ fn plan_blocks(plan: render.Plan) -> List(block.Block) {
   [block.plan(plan.title, tasks, [])]
 }
 
-/// Everything a thread actor needs to reply in one Slack thread.
-/// `finished` is called after each run's reply is posted.
+/// Where a sink posts.
+pub type Place {
+  /// A thread, with its own agent session.
+  InThread(thread_ts: String)
+  /// A code channel: top-level posts, and the channel is the session.
+  InCodeChannel
+  /// A thread inside a code channel, which can't have a session of its
+  /// own; for subagents working there.
+  InCodeThread(thread_ts: String)
+}
+
+/// What the registry hears about a thread: a run finished, or the work
+/// moved to a code channel (its id and the repository directory).
+pub type Hooks {
+  Hooks(finished: fn(thread.Finished) -> Nil, moved: fn(String, String) -> Nil)
+}
+
+pub fn no_hooks() -> Hooks {
+  Hooks(finished: fn(_) { Nil }, moved: fn(_, _) { Nil })
+}
+
+/// Everything a thread actor needs to reply in one place in Slack.
 pub fn sink(
   client: slackline.Client,
   channel: String,
-  thread_ts: String,
-  finished: fn(thread.Finished) -> Nil,
+  place: Place,
+  hooks: Hooks,
 ) -> thread.Sink {
+  let thread_ts = case place {
+    InThread(ts) | InCodeThread(ts) -> Some(ts)
+    InCodeChannel -> None
+  }
+  let has_session = case place {
+    InCodeThread(_) -> False
+    _ -> True
+  }
+  let in_code_channel = case place {
+    InThread(_) -> False
+    _ -> True
+  }
+  let post = fn(text, blocks) {
+    use <- send
+    let call =
+      chat.post_message(channel:, text: fallback(text))
+      |> post_message.blocks(blocks)
+      |> post_message.unfurl_links(False)
+      |> post_message.unfurl_media(False)
+    case thread_ts {
+      Some(ts) -> post_message.thread_ts(call, ts)
+      None -> call
+    }
+    |> httpc.send(client)
+    |> result.map(fn(posted) { posted.ts })
+  }
+  let update = fn(ts, text, blocks) {
+    use <- send
+    chat.update(channel:, ts:)
+    |> update.text(fallback(text))
+    |> update.blocks(blocks)
+    |> httpc.send(client)
+    |> result.replace(Nil)
+  }
+  let set_status = fn(status) {
+    case has_session {
+      True -> session_status(client, channel, thread_ts, status)
+      False -> Nil
+    }
+  }
   let branch = fn(intro, title) {
+    // In a code channel a subagent gets a thread there; elsewhere a new
+    // top-level message with its own session.
+    let child = case in_code_channel {
+      True -> InCodeThread
+      False -> InThread
+    }
     use root <- result.try(
       send(fn() {
         chat.post_message(channel:, text: fallback(intro))
@@ -104,44 +175,35 @@ pub fn sink(
       |> httpc.send(client)
       |> result.map(fn(found) { found.permalink })
       |> result.unwrap("")
-    let branch = sink(client, channel, root, fn(_) { Nil })
+    let branch = sink(client, channel, child(root), no_hooks())
     branch.title(title)
     Ok(#(branch, link))
   }
-  let post = fn(text, blocks) {
-    use <- send
-    chat.post_message(channel:, text: fallback(text))
-    |> post_message.thread_ts(thread_ts)
-    |> post_message.blocks(blocks)
-    |> post_message.unfurl_links(False)
-    |> post_message.unfurl_media(False)
-    |> httpc.send(client)
-    |> result.map(fn(posted) { posted.ts })
-  }
-  let update = fn(ts, text, blocks) {
-    use <- send
-    chat.update(channel:, ts:)
-    |> update.text(fallback(text))
-    |> update.blocks(blocks)
-    |> httpc.send(client)
-    |> result.replace(Nil)
-  }
   thread.Sink(
+    // Slack shows "Working…" with its Stop control until the session is
+    // set back to active; posting doesn't clear it.
     working: fn(working) {
-      case working {
-        // Slack shows "Working…" with its Stop control until the session
-        // is set back to active; posting no longer clears it.
-        True -> session_status(client, channel, thread_ts, agents.Processing)
-        False -> session_status(client, channel, thread_ts, agents.Active)
-      }
+      set_status(case working {
+        True -> agents.Processing
+        False -> agents.Active
+      })
     },
     title: fn(title) {
-      let _ =
-        agents.sessions_rename(title:)
-        |> sessions_rename.channel_id(channel)
-        |> sessions_rename.thread_ts(thread_ts)
-        |> httpc.send(client)
-      Nil
+      case has_session {
+        False -> Nil
+        True -> {
+          let call =
+            agents.sessions_rename(title:)
+            |> sessions_rename.channel_id(channel)
+          let _ =
+            case thread_ts {
+              Some(ts) -> sessions_rename.thread_ts(call, ts)
+              None -> call
+            }
+            |> httpc.send(client)
+          Nil
+        }
+      }
     },
     post_plan: fn(plan) {
       case post(plan.title, plan_blocks(plan)) {
@@ -164,48 +226,186 @@ pub fn sink(
     },
     post: fn(markdown) { post(markdown, markdown_blocks(markdown)) },
     upload: fn(name, content) {
-      let file =
-        slackline.FileUpload(
-          filename: name,
-          content_type: "text/x-diff",
-          contents: bit_array.from_string(content),
-        )
-      use <- send
-      httpc.upload_files(client, [file], share: fn(call) {
-        call
-        |> complete_upload_external.channel_id(channel)
-        |> complete_upload_external.thread_ts(thread_ts)
-      })
-      |> result.replace(Nil)
+      case in_code_channel {
+        // The Code tab shows the changes there.
+        True -> Ok(Nil)
+        False -> {
+          let file =
+            slackline.FileUpload(
+              filename: name,
+              content_type: "text/x-diff",
+              contents: bit_array.from_string(content),
+            )
+          use <- send
+          httpc.upload_files(client, [file], share: fn(call) {
+            let call = complete_upload_external.channel_id(call, channel)
+            case thread_ts {
+              Some(ts) -> complete_upload_external.thread_ts(call, ts)
+              None -> call
+            }
+          })
+          |> result.replace(Nil)
+        }
+      }
     },
-    finished:,
+    finished: hooks.finished,
     branch:,
+    conversation: #(channel, option.unwrap(thread_ts, "")),
+    open_code_channel: fn(name, repo) {
+      case place {
+        InThread(root) -> {
+          use opened <- result.try(
+            agents.conversations_create()
+            |> conversations_create.name(name)
+            |> conversations_create.origin_channel_id(channel)
+            |> conversations_create.origin_message_ts(root)
+            // A session that was archived and picked up again gets a new
+            // channel, so the id can't be the thread alone.
+            |> conversations_create.session_id(
+              channel <> "-" <> root <> "-" <> uuid_v4(),
+            )
+            |> httpc.send(client)
+            |> result.map_error(slackline.describe_error),
+          )
+          let code = opened.channel_id
+          hooks.moved(code, repo)
+          let channel_sink = sink(client, code, InCodeChannel, hooks)
+          channel_sink.title(name)
+          Ok(#(channel_sink, code))
+        }
+        _ -> Error("already in a code channel")
+      }
+    },
+    context: fn(items) {
+      case place {
+        InCodeChannel -> {
+          let items =
+            list.take(items, 5)
+            |> list.map(fn(item) {
+              agents.ContextBarItem(
+                key: item.key,
+                label: item.label,
+                icon: Some(item.icon),
+                url: case item.url {
+                  "" -> None
+                  url -> Some(url)
+                },
+                item_type: None,
+              )
+            })
+          let _ =
+            agents.conversations_set_properties(channel_id: channel)
+            |> conversations_set_properties.code_channel(
+              agents.CodeChannelProperties(
+                context_bar_items: Some(items),
+                summary_message: None,
+              ),
+            )
+            |> httpc.send(client)
+          Nil
+        }
+        _ -> Nil
+      }
+    },
+    code: fn(diff, base, head) {
+      case place {
+        InCodeChannel -> {
+          let call =
+            agents.conversations_set_view(channel_id: channel)
+            |> conversations_set_view.type_("diff")
+            |> conversations_set_view.content(diff)
+          let call = case base {
+            "" -> call
+            base -> conversations_set_view.base_branch(call, base)
+          }
+          let call = case head {
+            "" | "HEAD" -> call
+            head -> conversations_set_view.head_branch(call, head)
+          }
+          let attempt = fn() {
+            httpc.send(call, client)
+            |> result.map_error(slackline.describe_error)
+          }
+          // A brand-new channel can refuse its first view for a moment.
+          let sent = case attempt() {
+            Error(reason) ->
+              case string.contains(reason, "view_creation_failed") {
+                True -> {
+                  process.sleep(2000)
+                  attempt()
+                }
+                False -> Error(reason)
+              }
+            ok -> ok
+          }
+          case sent {
+            Ok(_) -> Nil
+            Error(reason) ->
+              logger_warn("crushling: Code tab update failed: " <> reason)
+          }
+        }
+        _ -> Nil
+      }
+    },
   )
 }
 
-/// Set the thread's agent session status. Best effort: it is decoration,
-/// and Slack times a working session out after an hour regardless.
+@external(erlang, "crushling_ffi", "log_warning")
+fn logger_warn(text: String) -> Nil
+
+@external(erlang, "crushling_ffi", "uuid_v4")
+fn uuid_v4() -> String
+
+/// Archive a code channel once its work is done, keeping `summary_ts` (a
+/// message in it, or "") as its summary.
+pub fn archive_code_channel(
+  client: slackline.Client,
+  channel: String,
+  summary_ts: String,
+) -> Result(Nil, String) {
+  let call = agents.conversations_archive(channel_id: channel)
+  case summary_ts {
+    "" -> call
+    ts -> conversations_archive.summary_message_ts(call, ts)
+  }
+  |> httpc.send(client)
+  |> result.replace(Nil)
+  |> result.map_error(slackline.describe_error)
+}
+
+/// Set an agent session's status: a thread's, or a whole code channel's
+/// when there is no thread. Best effort: it is decoration, and Slack times
+/// a working session out after an hour regardless.
 fn session_status(
   client: slackline.Client,
   channel: String,
-  thread_ts: String,
+  thread_ts: Option(String),
   status: agents.AgentStatus,
 ) -> Nil {
-  let _ =
+  let call =
     agents.sessions_set_status(status:)
     |> sessions_set_status.channel_id(channel)
-    |> sessions_set_status.thread_ts(thread_ts)
+  let _ =
+    case thread_ts {
+      Some(ts) -> sessions_set_status.thread_ts(call, ts)
+      None -> call
+    }
     |> httpc.send(client)
   Nil
 }
 
-/// Mark the thread's agent session as ready for the next prompt.
+/// Mark the agent session as ready for the next prompt. `thread_ts` is ""
+/// for a code channel.
 pub fn session_done(
   client: slackline.Client,
   channel: String,
   thread_ts: String,
 ) -> Nil {
-  session_status(client, channel, thread_ts, agents.Active)
+  let thread = case thread_ts {
+    "" -> None
+    ts -> Some(ts)
+  }
+  session_status(client, channel, thread, agents.Active)
 }
 
 /// Reply to one user only, such as for `!help`.
@@ -231,7 +431,12 @@ pub fn say(
 ) -> Nil {
   let _ =
     chat.post_message(channel:, text: fallback(markdown))
-    |> post_message.thread_ts(thread_ts)
+    |> fn(call) {
+      case thread_ts {
+        "" -> call
+        ts -> post_message.thread_ts(call, ts)
+      }
+    }
     |> post_message.blocks([block.markdown(markdown, [])])
     |> httpc.send(client)
   Nil

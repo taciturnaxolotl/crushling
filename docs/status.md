@@ -31,11 +31,40 @@ Configuration is from the environment or `.env`; see the table at the top of
 
 The Slack app needs Socket Mode, the `app_mention` and `message.channels`,
 `message.groups`, `message.im` events, and the scopes `app_mentions:read`,
-`chat:write`, `files:read`, `files:write`, `channels:history`,
-`groups:history`, `im:history`.
+`chat:write`, `code_channels:manage`, `files:read`, `files:write`,
+`channels:history`, `channels:read`, `groups:history`, `groups:read`,
+`im:history`, `users:read`, and the `code_channels` feature;
+`docs/slack-manifest.yaml` has it all.
 
 Mention the bot to start a thread; reply in the thread to continue it; reply
 `stop` to cancel the current run. A direct message starts a thread too.
+
+When the agent clones a repository (`git clone` or `gh repo clone` through
+`bash`), the work moves to a code channel opened from the thread: replies go
+there, every message in it is a prompt, the context bar shows the repo,
+branch and changed files, and the Code tab holds the diff against the
+default branch. When the thread goes idle the channel is archived with the
+last reply as its summary; a later message in the thread opens a new one.
+
+A subagent's thread shows what it says between tool calls as it goes, not
+only its final answer.
+
+### Slack tools
+
+Each agent gets a `slack` MCP server from the bridge (`crushling/mcp`,
+`crushling/slack_tools`): `read_conversation`, `read_channel`,
+`list_channels`, `user_info`, `post_message`, `share_file`, and
+`open_code_channel`, which lets the agent move its work to a code channel
+itself, with a task name for the title. Reading reaches any channel the bot
+is in; posting and sharing only reach the conversation the agent is in.
+
+The tools are served over HTTP on `CRUSHLING_MCP_BIND`:`CRUSHLING_MCP_PORT`
+(default `127.0.0.1:7469`), one endpoint per thread, with a bearer token
+derived from a secret in `$CRUSHLING_ROOT/mcp-secret`. The `local` launcher
+uses them by default. A `docker` sandbox can't reach the host through the
+egress filter, so they are off until `CRUSHLING_MCP_URL` names an address it
+can, such as the `sbx-egress` gateway with the bridge bound there and the
+port let through (see `docs/kloe-sandbox.md`).
 
 ## Providers
 

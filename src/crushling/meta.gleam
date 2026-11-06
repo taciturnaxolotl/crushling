@@ -15,6 +15,25 @@ pub type Meta {
     /// The ts of the last message sent to the agent; later messages are
     /// new to it. "" when it has read nothing.
     cursor: String,
+    /// The code channel the work moved to once the agent cloned a repo,
+    /// and the repo's directory in the workspace. "" until then.
+    code_channel: String,
+    repo: String,
+    /// Set on a code channel's own entry: the thread whose workspace it
+    /// shares, so the channel's messages reach that thread's agent.
+    origin_channel: String,
+    origin_ts: String,
+  )
+}
+
+pub fn new(follow: Bool) -> Meta {
+  Meta(
+    follow:,
+    cursor: "",
+    code_channel: "",
+    repo: "",
+    origin_channel: "",
+    origin_ts: "",
   )
 }
 
@@ -29,7 +48,22 @@ pub fn read(path: String) -> Result(Meta, Nil) {
   json.parse(text, {
     use follow <- decode.optional_field("follow", False, decode.bool)
     use cursor <- decode.optional_field("cursor", "", decode.string)
-    decode.success(Meta(follow:, cursor:))
+    use code_channel <- decode.optional_field("code_channel", "", decode.string)
+    use repo <- decode.optional_field("repo", "", decode.string)
+    use origin_channel <- decode.optional_field(
+      "origin_channel",
+      "",
+      decode.string,
+    )
+    use origin_ts <- decode.optional_field("origin_ts", "", decode.string)
+    decode.success(Meta(
+      follow:,
+      cursor:,
+      code_channel:,
+      repo:,
+      origin_channel:,
+      origin_ts:,
+    ))
   })
   |> result.replace_error(Nil)
 }
@@ -38,6 +72,10 @@ pub fn write(path: String, meta: Meta) -> Result(Nil, String) {
   json.object([
     #("follow", json.bool(meta.follow)),
     #("cursor", json.string(meta.cursor)),
+    #("code_channel", json.string(meta.code_channel)),
+    #("repo", json.string(meta.repo)),
+    #("origin_channel", json.string(meta.origin_channel)),
+    #("origin_ts", json.string(meta.origin_ts)),
   ])
   |> json.to_string
   |> bit_array.from_string

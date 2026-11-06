@@ -86,3 +86,110 @@ pub fn parse_numstat(output: String) -> List(Change) {
 pub fn is_binary(change: Change) -> Bool {
   result.is_error(change.added)
 }
+
+/// Prints the repositories in the workspace, one directory per line,
+/// relative to it: what an agent cloned.
+pub fn list_repos() -> String {
+  "for d in $(find . -mindepth 2 -maxdepth 4 -name .git -not -path './.crush/*' -not -path './.home/*' -not -path './.slack/*' 2>/dev/null); do dirname \"$d\"; done"
+}
+
+fn quote(text: String) -> String {
+  "'" <> string.replace(text, "'", "'\\''") <> "'"
+}
+
+/// Prints "yes" when `dir` is the top of a git repository.
+pub fn is_repo(dir: String) -> String {
+  "cd "
+  <> quote(dir)
+  <> " 2>/dev/null && [ \"$(git rev-parse --show-toplevel 2>/dev/null)\" = \"$(pwd -P)\" ] && echo yes"
+}
+
+/// Prints, one per line: the origin URL, the current branch, and the
+/// default branch, for the repository in `dir`.
+pub fn repo_info(dir: String) -> String {
+  "cd "
+  <> quote(dir)
+  <> " && git remote get-url origin 2>/dev/null; git rev-parse --abbrev-ref HEAD 2>/dev/null; git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||'"
+}
+
+pub type RepoInfo {
+  RepoInfo(url: String, branch: String, base: String)
+}
+
+pub fn parse_repo_info(output: String) -> RepoInfo {
+  let lines = string.split(output, "\n") |> list.map(string.trim)
+  let at = fn(i) { list.drop(lines, i) |> list.first |> result.unwrap("") }
+  RepoInfo(url: at(0), branch: at(1), base: at(2))
+}
+
+/// The repository's changes against its default branch: commits made on
+/// top of it and the working tree, untracked files included. A scratch
+/// index keeps the repository's own index untouched.
+fn against_base(dir: String, diff_args: String) -> String {
+  "cd "
+  <> quote(dir)
+  <> " && idx=$(mktemp) && cp .git/index \"$idx\" 2>/dev/null; GIT_INDEX_FILE=\"$idx\" git add -N -A >/dev/null 2>&1; base=$(git merge-base HEAD \"$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo HEAD)\" 2>/dev/null || echo HEAD); GIT_INDEX_FILE=\"$idx\" git diff --no-color --no-ext-diff "
+  <> diff_args
+  <> " \"$base\"; rm -f \"$idx\""
+}
+
+pub fn repo_diff(dir: String) -> String {
+  against_base(dir, "")
+}
+
+pub fn repo_numstat(dir: String) -> String {
+  against_base(dir, "--numstat")
+}
+
+/// "owner/repo" from a clone URL, for titles and the context bar.
+pub fn repo_name(url: String) -> String {
+  let path = case string.split_once(url, "://") {
+    Ok(#(_, rest)) ->
+      case string.split_once(rest, "/") {
+        Ok(#(_, path)) -> path
+        Error(Nil) -> rest
+      }
+    // git@github.com:owner/repo.git
+    Error(Nil) ->
+      case string.split_once(url, ":") {
+        Ok(#(_, path)) -> path
+        // A local path: its last part.
+        Error(Nil) ->
+          string.split(url, "/")
+          |> list.filter(fn(part) { part != "" })
+          |> list.last
+          |> result.unwrap(url)
+      }
+  }
+  let path = case string.ends_with(path, ".git") {
+    True -> string.drop_end(path, 4)
+    False -> path
+  }
+  string.trim(path) |> string.replace("//", "/")
+}
+
+/// A browsable URL for a clone URL, when it is a GitHub-style host.
+pub fn web_url(url: String) -> String {
+  case string.starts_with(url, "https://") {
+    True ->
+      case string.ends_with(url, ".git") {
+        True -> string.drop_end(url, 4)
+        False -> url
+      }
+    False ->
+      case string.split_once(url, "@") {
+        Ok(#(_, rest)) ->
+          case string.split_once(rest, ":") {
+            Ok(#(host, path)) -> web_url("https://" <> host <> "/" <> path)
+            Error(Nil) -> ""
+          }
+        Error(Nil) -> ""
+      }
+  }
+}
+
+/// Whether a shell command clones a repository.
+pub fn is_clone(command: String) -> Bool {
+  string.contains(command, "git clone ")
+  || string.contains(command, "gh repo clone ")
+}

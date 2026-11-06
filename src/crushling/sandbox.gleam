@@ -110,8 +110,16 @@ pub fn fingerprint(policy: Policy) -> String {
 @external(erlang, "crushling_ffi", "sha256_hex")
 fn sha256_hex(data: String) -> String
 
-pub fn run_args(policy: Policy, key: String) -> List(String) {
-  let env = list.flat_map(policy.env, fn(pair) { ["--env", pair] })
+/// `key_env` is the thread's own environment, such as its token for
+/// crushling's Slack tools: derived from the key, so it needn't be part of
+/// the fingerprint.
+pub fn run_args(
+  policy: Policy,
+  key: String,
+  key_env: List(String),
+) -> List(String) {
+  let env =
+    list.flat_map(list.append(policy.env, key_env), fn(pair) { ["--env", pair] })
   list.flatten([
     ["run", "--detach", "--name", container_name(key)],
     ["--label", label <> "=1"],
@@ -223,6 +231,7 @@ pub fn observe(policy: Policy, key: String) -> Result(Observed, Error) {
 pub fn ensure(
   policy: Policy,
   key: String,
+  key_env: List(String),
   before_start: fn() -> Result(Nil, String),
 ) -> Result(String, Error) {
   use _ <- result.try(prepare(policy, key))
@@ -234,9 +243,9 @@ pub fn ensure(
     Start -> docker(policy, ["start", name])
     Recreate -> {
       use _ <- result.try(docker(policy, ["rm", "--force", name]))
-      docker(policy, run_args(policy, key))
+      docker(policy, run_args(policy, key, key_env))
     }
-    Create -> docker(policy, run_args(policy, key))
+    Create -> docker(policy, run_args(policy, key, key_env))
   })
   Ok(host_socket(policy, key))
 }

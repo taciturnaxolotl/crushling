@@ -73,6 +73,11 @@ pub type Message {
   /// A prompt is ready to send: `ts` is the message it came from.
   Prepared(key: String, ts: String, prompt: String)
   RunFinished(key: String)
+  /// The thread posted a reply; its last message is `ts`.
+  Replied(key: String, ts: String)
+  /// The thread's work moved to code channel `channel`, for the repository
+  /// in workspace directory `repo`.
+  Moved(key: String, channel: String, repo: String)
   /// Stop taking messages, let running turns finish for up to `grace_ms`,
   /// cancel what is left, stop every agent, then reply.
   Shutdown(grace_ms: Int, reply: Subject(Nil))
@@ -82,6 +87,9 @@ pub type Message {
   ShutdownFinal
   IdleCheck(key: String, generation: Int)
   ThreadDown(process.Down)
+  /// The thread actor for `key`, if its agent is up: for the agent's own
+  /// Slack tools.
+  Lookup(key: String, reply: Subject(Option(Subject(thread.Message))))
 }
 
 type Agent {
@@ -104,6 +112,9 @@ type Entry {
     /// Whether one is being prepared now; they are prepared one at a time
     /// so each catches up from where the last left off.
     preparing: Bool,
+    /// The last reply posted, to keep as a code channel's summary when it
+    /// is archived.
+    summary_ts: String,
   )
 }
 
@@ -112,6 +123,9 @@ type State {
     config: Config,
     self: Subject(Message),
     threads: Dict(String, Entry),
+    /// Code channels, each to the thread (channel and ts) whose work it
+    /// holds.
+    code_channels: Dict(String, #(String, String)),
     /// Recently handled message ids, so a redelivery is not run twice.
     seen: List(String),
     generation: Int,
@@ -147,6 +161,7 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       config:,
       self:,
       threads: dict.new(),
+      code_channels: dict.new(),
       seen: [],
       generation: 0,
       stopping: None,
@@ -185,6 +200,9 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(prepared(state, key, ts, prompt))
     StopRequested(channel, thread_ts, user) ->
       actor.continue(stop_requested(state, channel, thread_ts, user))
+    Replied(key, ts) -> actor.continue(replied(state, key, ts))
+    Moved(key, channel, repo) ->
+      actor.continue(moved(state, key, channel, repo))
     RunFinished(key) -> {
       let state = run_finished(state, key)
       case state.stopping, busy(state) {
@@ -218,12 +236,24 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     IdleCheck(key, generation) ->
       actor.continue(idle_check(state, key, generation))
     ThreadDown(down) -> actor.continue(thread_down(state, down))
+    Lookup(key, reply) -> {
+      process.send(reply, case dict.get(state.threads, key) {
+        Ok(Entry(agent: Live(thread:, ..), ..)) -> Some(thread)
+        _ -> None
+      })
+      actor.continue(state)
+    }
   }
 }
 
 /// The thread's entry: in memory, or rebuilt from its `meta` on disk for a
 /// thread the bot was in before a restart or an idle stop.
-fn entry_for(state: State, key: String, incoming: Incoming) -> Option(Entry) {
+fn entry_for(
+  state: State,
+  key: String,
+  channel: String,
+  thread_ts: String,
+) -> Option(Entry) {
   case dict.get(state.threads, key) {
     Ok(entry) -> Some(entry)
     Error(Nil) -> {
@@ -232,40 +262,75 @@ fn entry_for(state: State, key: String, incoming: Incoming) -> Option(Entry) {
         False -> None
         True ->
           Some(new_entry(
-            incoming,
+            channel,
+            thread_ts,
             meta.read(launcher.meta_path(key))
               // A workspace without meta predates follow mode, when every
               // reply was a prompt.
-              |> result.unwrap(Meta(follow: True, cursor: "")),
+              |> result.unwrap(meta.new(True)),
           ))
       }
     }
   }
 }
 
-fn new_entry(incoming: Incoming, meta: Meta) -> Entry {
+fn new_entry(channel: String, thread_ts: String, meta: Meta) -> Entry {
   Entry(
-    channel: incoming.channel,
-    thread_ts: incoming.thread_ts,
+    channel:,
+    thread_ts:,
     generation: 0,
     agent: Starting,
     meta:,
     in_flight: 0,
     backlog: [],
     preparing: False,
+    summary_ts: "",
   )
+}
+
+/// Where a code channel's own `meta` lives: it names the thread the channel
+/// belongs to, so its messages still find that thread after a restart.
+fn code_channel_key(channel: String) -> String {
+  key(channel, "code")
+}
+
+/// The thread a code channel holds the work of, if `channel` is one.
+fn code_channel_origin(
+  state: State,
+  channel: String,
+) -> #(State, Option(#(String, String))) {
+  case dict.get(state.code_channels, channel) {
+    Ok(origin) -> #(state, Some(origin))
+    Error(Nil) -> {
+      let path = state.config.launcher.meta_path(code_channel_key(channel))
+      case meta.read(path) {
+        Ok(Meta(origin_channel:, origin_ts:, ..)) if origin_channel != "" -> {
+          let origin = #(origin_channel, origin_ts)
+          let code_channels = dict.insert(state.code_channels, channel, origin)
+          #(State(..state, code_channels:), Some(origin))
+        }
+        _ -> #(state, None)
+      }
+    }
+  }
 }
 
 fn received(state: State, incoming: Incoming) -> State {
   let config = state.config
   let id = incoming.channel <> ":" <> incoming.ts
-  let key = key(incoming.channel, incoming.thread_ts)
+  // A message in a code channel belongs to the thread that moved there.
+  let #(state, origin) = code_channel_origin(state, incoming.channel)
+  let #(channel, thread_ts) =
+    option.unwrap(origin, #(incoming.channel, incoming.thread_ts))
+  let key = key(channel, thread_ts)
   let prompt = slack.prompt_text(incoming.text, config.bot_user)
-  let known = entry_for(state, key, incoming)
-  // Whether this message is for the agent at all.
-  let addressed = case known {
-    Some(entry) -> incoming.mention || entry.meta.follow
-    None -> incoming.mention
+  let known = entry_for(state, key, channel, thread_ts)
+  // Whether this message is for the agent at all. In a code channel people
+  // are talking to the agent, mentioned or not.
+  let addressed = case known, origin {
+    Some(_), Some(_) -> True
+    Some(entry), None -> incoming.mention || entry.meta.follow
+    None, _ -> incoming.mention
   }
   case
     list.contains(state.seen, id),
@@ -314,9 +379,14 @@ fn received(state: State, incoming: Incoming) -> State {
           let follow =
             incoming.ts == incoming.thread_ts || is_dm(incoming.channel)
           let entry =
-            Entry(..new_entry(incoming, Meta(follow:, cursor: "")), backlog: [
-              incoming,
-            ])
+            Entry(
+              ..new_entry(
+                incoming.channel,
+                incoming.thread_ts,
+                meta.new(follow),
+              ),
+              backlog: [incoming],
+            )
           remember(launch(state, key, entry), id)
         }
       }
@@ -348,19 +418,32 @@ fn launch(state: State, key: String, entry: Entry) -> State {
   let self = state.self
   let channel = entry.channel
   let thread_ts = entry.thread_ts
-  let _ = meta.write(config.launcher.meta_path(key), entry.meta)
+  let meta = entry.meta
+  let _ = meta.write(config.launcher.meta_path(key), meta)
   process.spawn_unlinked(fn() {
     let result = {
       use launched <- result.try(config.launcher.launch(key))
-      let sink =
-        slack.sink(config.client, channel, thread_ts, fn(finished) {
-          // Turns crush starts itself, to read a subagent's report, were
-          // never counted in.
-          case finished.solicited {
-            True -> process.send(self, RunFinished(key))
-            False -> process.send(self, IdleCheck(key, -1))
-          }
-        })
+      let hooks =
+        slack.Hooks(
+          finished: fn(finished) {
+            case finished.reply_ts {
+              "" -> Nil
+              ts -> process.send(self, Replied(key, ts))
+            }
+            // Turns crush starts itself, to read a subagent's report, were
+            // never counted in.
+            case finished.solicited {
+              True -> process.send(self, RunFinished(key))
+              False -> process.send(self, IdleCheck(key, -1))
+            }
+          },
+          moved: fn(code, repo) { process.send(self, Moved(key, code, repo)) },
+        )
+      let sink = case meta.code_channel {
+        "" ->
+          slack.sink(config.client, channel, slack.InThread(thread_ts), hooks)
+        code -> slack.sink(config.client, code, slack.InCodeChannel, hooks)
+      }
       thread.start(thread.Config(
         socket: launched.socket,
         root: launched.root,
@@ -368,6 +451,8 @@ fn launch(state: State, key: String, entry: Entry) -> State {
         sink:,
         flush_ms: config.flush_ms,
         mode: config.mode,
+        repo: meta.repo,
+        in_code_channel: meta.code_channel != "",
       ))
       |> result.map_error(fn(error) { "thread: " <> string.inspect(error) })
     }
@@ -429,10 +514,13 @@ fn pump(state: State, key: String) -> State {
       let config = state.config
       let self = state.self
       let cursor = entry.meta.cursor
+      // A code channel is followed message by message, so there is nothing
+      // to catch up on there.
+      let catch_up = next.channel == entry.channel
       process.spawn_unlinked(fn() {
         process.send(
           self,
-          Prepared(key, next.ts, prepare(config, key, next, cursor)),
+          Prepared(key, next.ts, prepare(config, key, next, cursor, catch_up)),
         )
       })
       let entry = Entry(..entry, backlog: rest, preparing: True)
@@ -449,9 +537,11 @@ fn prepare(
   key: String,
   incoming: Incoming,
   cursor: String,
+  catch_up: Bool,
 ) -> String {
   let request = slack.prompt_text(incoming.text, config.bot_user)
-  let context = case incoming.ts == incoming.thread_ts && cursor == "" {
+  let first = incoming.ts == incoming.thread_ts && cursor == ""
+  let context = case first || !catch_up {
     // The thread's first message: nothing came before.
     True -> ""
     False ->
@@ -504,10 +594,16 @@ fn stop_requested(
 ) -> State {
   let config = state.config
   let incoming = Incoming(channel, thread_ts, thread_ts, user, "", False, [])
-  case
-    set.contains(config.allowed, user),
-    dict.get(state.threads, key(channel, thread_ts))
-  {
+  // A code channel's session has no thread.
+  let #(state, origin) = case thread_ts {
+    "" -> code_channel_origin(state, channel)
+    _ -> #(state, None)
+  }
+  let key = case origin {
+    Some(#(origin_channel, origin_ts)) -> key(origin_channel, origin_ts)
+    None -> key(channel, thread_ts)
+  }
+  case set.contains(config.allowed, user), dict.get(state.threads, key) {
     True, Ok(Entry(agent: Live(thread:, ..), in_flight:, ..)) if in_flight > 0 ->
       process.send(thread, thread.Cancel)
     False, _ ->
@@ -641,11 +737,76 @@ fn idle_check(state: State, key: String, generation: Int) -> State {
               process.send(thread, thread.Stop)
               let stop = state.config.launcher.stop
               process.spawn_unlinked(fn() { stop(key) })
-              State(..state, threads: dict.delete(state.threads, key))
+              archive(state, key, entry)
+              |> fn(state) {
+                State(..state, threads: dict.delete(state.threads, key))
+              }
             }
           }
       }
     _ -> state
+  }
+}
+
+fn replied(state: State, key: String, ts: String) -> State {
+  case dict.get(state.threads, key) {
+    Ok(entry) -> {
+      let entry = Entry(..entry, summary_ts: ts)
+      State(..state, threads: dict.insert(state.threads, key, entry))
+    }
+    Error(Nil) -> state
+  }
+}
+
+fn moved(state: State, key: String, channel: String, repo: String) -> State {
+  case dict.get(state.threads, key) {
+    Ok(entry) -> {
+      let launcher = state.config.launcher
+      let meta = Meta(..entry.meta, code_channel: channel, repo:)
+      let _ = meta.write(launcher.meta_path(key), meta)
+      let _ =
+        meta.write(
+          launcher.meta_path(code_channel_key(channel)),
+          Meta(
+            ..meta.new(True),
+            origin_channel: entry.channel,
+            origin_ts: entry.thread_ts,
+          ),
+        )
+      let entry = Entry(..entry, meta:, summary_ts: "")
+      State(
+        ..state,
+        threads: dict.insert(state.threads, key, entry),
+        code_channels: dict.insert(state.code_channels, channel, #(
+          entry.channel,
+          entry.thread_ts,
+        )),
+      )
+    }
+    Error(Nil) -> state
+  }
+}
+
+/// Archive the thread's code channel, if it has one: its work is done for
+/// now. A later message in the thread picks it up in a new channel.
+fn archive(state: State, key: String, entry: Entry) -> State {
+  case entry.meta.code_channel {
+    "" -> state
+    code -> {
+      info("crushling: archiving code channel " <> code)
+      let client = state.config.client
+      let summary_ts = entry.summary_ts
+      process.spawn_unlinked(fn() {
+        case slack.archive_code_channel(client, code, summary_ts) {
+          Ok(Nil) -> Nil
+          Error(reason) ->
+            warn("crushling: archiving " <> code <> " failed: " <> reason)
+        }
+      })
+      let meta = Meta(..entry.meta, code_channel: "")
+      let _ = meta.write(state.config.launcher.meta_path(key), meta)
+      State(..state, code_channels: dict.delete(state.code_channels, code))
+    }
   }
 }
 
