@@ -2,7 +2,7 @@
 
 -export([line_at/2, uuid_v4/0, monotonic_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
          file_exists/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
-         claude_version/0]).
+         claude_version/0, read_file/1, write_bytes/2]).
 
 line_at(Lines, Index) ->
     element(Index + 1, Lines).
@@ -125,4 +125,22 @@ claude_version() ->
                 {match, [V]} -> V;
                 nomatch -> <<"2.1.282">>
             end
+    end.
+
+read_file(Path) ->
+    case file:read_file(Path) of
+        {ok, Bin} -> {ok, Bin};
+        {error, _} -> {error, nil}
+    end.
+
+%% Write bytes, creating the parent directory.
+write_bytes(Path, Bytes) ->
+    case filelib:ensure_dir(Path) of
+        ok ->
+            case file:write_file(Path, Bytes) of
+                ok -> {ok, nil};
+                {error, R} -> {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
+            end;
+        {error, R} ->
+            {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
     end.

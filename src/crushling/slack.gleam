@@ -2,15 +2,18 @@
 //// session (Slack's "Working…" and Stop), a plan card and markdown replies, and the helpers that turn a Slack
 //// message back into a prompt.
 
+import crushling/gun
 import crushling/render
 import crushling/thread
 import gleam/bit_array
+import gleam/float
+import gleam/http
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/order
 import gleam/result
 import gleam/string
+import gleam/uri
 import slackline
 import slackline/api/agents
 import slackline/api/agents/sessions_rename
@@ -23,6 +26,7 @@ import slackline/api/conversations
 import slackline/api/conversations/replies
 import slackline/api/files/complete_upload_external
 import slackline/block
+import slackline/file
 import slackline/httpc
 
 /// Notifications and old clients show `text`; keep it short.
@@ -85,6 +89,25 @@ pub fn sink(
   thread_ts: String,
   finished: fn(thread.Finished) -> Nil,
 ) -> thread.Sink {
+  let branch = fn(intro, title) {
+    use root <- result.try(
+      send(fn() {
+        chat.post_message(channel:, text: fallback(intro))
+        |> post_message.blocks(markdown_blocks(intro))
+        |> post_message.unfurl_links(False)
+        |> httpc.send(client)
+        |> result.map(fn(posted) { posted.ts })
+      }),
+    )
+    let link =
+      chat.get_permalink(channel:, message_ts: root)
+      |> httpc.send(client)
+      |> result.map(fn(found) { found.permalink })
+      |> result.unwrap("")
+    let branch = sink(client, channel, root, fn(_) { Nil })
+    branch.title(title)
+    Ok(#(branch, link))
+  }
   let post = fn(text, blocks) {
     use <- send
     chat.post_message(channel:, text: fallback(text))
@@ -156,6 +179,7 @@ pub fn sink(
       |> result.replace(Nil)
     },
     finished:,
+    branch:,
   )
 }
 
@@ -276,40 +300,208 @@ pub fn command(prompt: String) -> Command {
 pub const help =
   "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
-/// The messages before `before_ts` in a thread, as context for an agent
-/// first mentioned partway in. At most `limit` of the latest, from people.
-pub fn thread_context(
+/// A file attached to a Slack message.
+pub type Attachment {
+  Attachment(name: String, mimetype: String, size: Int, url: String)
+}
+
+pub fn attachments(files: Option(List(file.File))) -> List(Attachment) {
+  option.unwrap(files, [])
+  |> list.filter_map(fn(file) {
+    case file.url_private, file.name {
+      Some(url), Some(name) ->
+        Ok(Attachment(
+          name:,
+          mimetype: option.unwrap(file.mimetype, "application/octet-stream"),
+          size: option.unwrap(file.size, 0),
+          url:,
+        ))
+      _, _ -> Error(Nil)
+    }
+  })
+}
+
+/// Files bigger than this are named in the prompt but not fetched.
+const max_attachment_bytes = 25_000_000
+
+@external(erlang, "crushling_ffi", "write_bytes")
+fn write_bytes(path: String, bytes: BitArray) -> Result(Nil, String)
+
+/// Fetch a Slack file with the bot token, following one redirect.
+fn download(token: String, url: String, hops: Int) -> Result(BitArray, String) {
+  use parsed <- result.try(uri.parse(url) |> result.replace_error("bad url"))
+  use host <- result.try(option.to_result(parsed.host, "bad url"))
+  let path = case parsed.query {
+    Some(query) -> parsed.path <> "?" <> query
+    None -> parsed.path
+  }
+  use conn <- result.try(gun.connect_tcp(host, 443, True, 10_000))
+  let response =
+    gun.request(
+      conn,
+      http.Get,
+      path,
+      [#("host", host), #("authorization", "Bearer " <> token)],
+      <<>>,
+      120_000,
+    )
+  gun.close(conn)
+  use response <- result.try(response)
+  case response.status {
+    200 -> Ok(response.body)
+    301 | 302 | 303 | 307 | 308 if hops > 0 ->
+      case list.key_find(response.headers, "location") {
+        Ok(location) -> download(token, location, hops - 1)
+        Error(Nil) -> Error("redirect without a location")
+      }
+    status -> Error("status " <> int.to_string(status))
+  }
+}
+
+/// Keep only characters that are safe in a file name.
+fn safe_name(name: String) -> String {
+  let cleaned =
+    string.to_graphemes(name)
+    |> list.map(fn(g) {
+      case
+        string.contains(
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-",
+          g,
+        )
+      {
+        True -> g
+        False -> "_"
+      }
+    })
+    |> string.concat
+  case cleaned {
+    "" | "." | ".." -> "file"
+    cleaned -> cleaned
+  }
+}
+
+fn human_size(bytes: Int) -> String {
+  case bytes {
+    b if b < 1024 -> int.to_string(b) <> " B"
+    b if b < 1_048_576 -> int.to_string(b / 1024) <> " KB"
+    b -> int.to_string(b / 1_048_576) <> " MB"
+  }
+}
+
+/// Save a message's attachments into the workspace and describe them for
+/// the prompt. `dirs` is the host directory and the same directory as the
+/// agent sees it, relative to its workspace.
+pub fn save_attachments(
+  token: String,
+  files: List(Attachment),
+  ts: String,
+  dirs: #(String, String),
+) -> String {
+  let #(host_dir, agent_dir) = dirs
+  let lines =
+    list.map(files, fn(file) {
+      let name = safe_name(file.name)
+      let relative = agent_dir <> "/" <> safe_name(ts) <> "/" <> name
+      let about = " (" <> file.mimetype <> ", " <> human_size(file.size) <> ")"
+      case file.size > max_attachment_bytes {
+        True -> "- " <> file.name <> about <> ": too large to fetch"
+        False ->
+          case download(token, file.url, 2) {
+            Error(reason) ->
+              "- "
+              <> file.name
+              <> about
+              <> ": couldn't fetch ("
+              <> reason
+              <> ")"
+            Ok(bytes) ->
+              case
+                write_bytes(
+                  host_dir <> "/" <> safe_name(ts) <> "/" <> name,
+                  bytes,
+                )
+              {
+                Ok(Nil) -> "- `" <> relative <> "`" <> about
+                Error(reason) ->
+                  "- "
+                  <> file.name
+                  <> about
+                  <> ": couldn't save ("
+                  <> reason
+                  <> ")"
+              }
+          }
+      }
+    })
+  case lines {
+    [] -> ""
+    lines ->
+      "Attached to this message, saved in the workspace:\n"
+      <> string.join(lines, "\n")
+  }
+}
+
+fn ts_value(ts: String) -> Float {
+  case float.parse(ts) {
+    Ok(value) -> value
+    Error(Nil) ->
+      int.parse(ts) |> result.map(int.to_float) |> result.unwrap(0.0)
+  }
+}
+
+/// What happened in a thread between `after_ts` (exclusive; "" for the
+/// start) and `before_ts` (exclusive), from people, as context for the next
+/// prompt. The last `limit` messages are kept; `##` asides are left out.
+pub fn catch_up(
   client: slackline.Client,
   channel: String,
   thread_ts: String,
+  after_ts: String,
   before_ts: String,
   bot_user: String,
   limit: Int,
 ) -> String {
+  let after = case after_ts {
+    "" -> -1.0
+    ts -> ts_value(ts)
+  }
+  let before = ts_value(before_ts)
   let lines =
     conversations.replies(channel:, ts: thread_ts)
-    |> replies.limit(100)
+    |> replies.limit(200)
     |> httpc.send(client)
     |> result.map(fn(response) { option.unwrap(response.messages, []) })
     |> result.unwrap([])
     |> list.filter_map(fn(message) {
       case message.user, message.text, message.ts, message.bot_id {
-        Some(user), Some(text), Some(ts), None
-          if ts != before_ts && user != bot_user
-        ->
-          case string.compare(ts, before_ts), command(text) {
-            order.Lt, NotACommand ->
-              Ok("[<@" <> user <> ">] " <> prompt_text(text, bot_user))
+        Some(user), Some(text), Some(ts), None if user != bot_user -> {
+          let at = ts_value(ts)
+          case at >. after && at <. before, command(text) {
+            True, NotACommand -> {
+              let files = case attachments(message.files) {
+                [] -> ""
+                files ->
+                  " [attached: "
+                  <> string.join(list.map(files, fn(f) { f.name }), ", ")
+                  <> "]"
+              }
+              Ok("[<@" <> user <> ">] " <> prompt_text(text, bot_user) <> files)
+            }
             _, _ -> Error(Nil)
           }
+        }
         _, _, _, _ -> Error(Nil)
       }
     })
   let count = list.length(lines)
+  let heading = case after_ts {
+    "" -> "Earlier in this Slack thread"
+    _ -> "New in this Slack thread since your last turn"
+  }
   case lines {
     [] -> ""
     lines ->
-      "Earlier in this Slack thread"
+      heading
       <> case count > limit {
         True -> " (the last " <> int.to_string(limit) <> " messages)"
         False -> ""

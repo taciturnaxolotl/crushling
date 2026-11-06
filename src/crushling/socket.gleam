@@ -2,6 +2,7 @@
 //// connection drops, with every event turned into a `registry.Incoming`.
 
 import crushling/registry
+import crushling/slack
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/option.{None, Some}
@@ -55,6 +56,7 @@ pub fn incoming(
       thread_ts:,
       bot_id: None,
       subtype: None,
+      files:,
       ..,
     ) ->
       Ok(registry.Incoming(
@@ -64,6 +66,7 @@ pub fn incoming(
         user:,
         text:,
         mention: True,
+        files: slack.attachments(files),
       ))
     event.MessageEvent(event.PlainMessage(
       channel:,
@@ -73,6 +76,7 @@ pub fn incoming(
       thread_ts:,
       channel_type:,
       bot_id: None,
+      files:,
       ..,
     )) ->
       case mentions_bot(text), thread_ts, channel_type {
@@ -87,6 +91,7 @@ pub fn incoming(
             user:,
             text:,
             mention: True,
+            files: slack.attachments(files),
           ))
         False, Some(root), _ ->
           Ok(registry.Incoming(
@@ -96,6 +101,7 @@ pub fn incoming(
             user:,
             text:,
             mention: False,
+            files: slack.attachments(files),
           ))
         False, None, _ -> Error(Nil)
       }

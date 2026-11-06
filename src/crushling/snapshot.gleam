@@ -22,13 +22,15 @@ fn git(args: String) -> String {
 /// Prints the tree id of the workspace as it is now.
 pub fn take() -> String {
   let index = "GIT_INDEX_FILE=" <> dir <> "/snapshot-index "
-  "[ -d "
+  "{ [ -d "
   <> dir
-  <> " ] || { git init -q --bare "
+  <> " ] || git init -q --bare "
   <> dir
-  <> " && printf '/.crush/\\n/.home/\\n' > "
+  <> "; } && mkdir -p "
   <> dir
-  <> "/info/exclude; } && rm -f "
+  <> "/info && printf '/.crush/\\n/.home/\\n/.slack/\\n' > "
+  <> dir
+  <> "/info/exclude && rm -f "
   <> dir
   <> "/snapshot-index && "
   <> index

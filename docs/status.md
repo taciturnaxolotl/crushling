@@ -31,7 +31,7 @@ Configuration is from the environment or `.env`; see the table at the top of
 
 The Slack app needs Socket Mode, the `app_mention` and `message.channels`,
 `message.groups`, `message.im` events, and the scopes `app_mentions:read`,
-`chat:write`, `files:write`, `channels:history`,
+`chat:write`, `files:read`, `files:write`, `channels:history`,
 `groups:history`, `im:history`.
 
 Mention the bot to start a thread; reply in the thread to continue it; reply

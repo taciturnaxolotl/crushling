@@ -57,6 +57,13 @@ pub fn config(backend: Backend) -> String {
   json.object([
     #("providers", json.object([#(provider, json.object(entry))])),
     #("models", json.object([#("large", pick(large)), #("small", pick(small))])),
+    // The agent runs interactively so it can dispatch subagents that
+    // report back later, but nobody is at a terminal to answer its
+    // multiple-choice questions.
+    #(
+      "options",
+      json.object([#("disabled_tools", json.array(["question"], json.string))]),
+    ),
   ])
   |> json.to_string
 }

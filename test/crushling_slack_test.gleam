@@ -1,5 +1,6 @@
 import crushling/crush/client
 import crushling/launcher
+import crushling/meta
 import crushling/registry
 import crushling/slack
 import crushling/socket
@@ -50,6 +51,7 @@ pub fn mention_starts_a_thread_test() {
     "U1",
     "<@UBOT> hi",
     True,
+    [],
   )) = socket.incoming(mention, "UBOT")
 
   let in_thread =
@@ -65,7 +67,7 @@ pub fn thread_replies_route_test() {
     decode_event(
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"more\",\"ts\":\"12.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
     )
-  let assert Ok(registry.Incoming("C1", "10.1", "12.1", "U1", "more", False)) =
+  let assert Ok(registry.Incoming("C1", "10.1", "12.1", "U1", "more", False, [])) =
     socket.incoming(reply, "UBOT")
 
   // The app_mention for the same message is the one that counts.
@@ -93,7 +95,7 @@ pub fn direct_messages_start_threads_test() {
     decode_event(
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"hi\",\"ts\":\"20.1\",\"channel\":\"D1\",\"channel_type\":\"im\"}",
     )
-  let assert Ok(registry.Incoming("D1", "20.1", "20.1", "U1", "hi", True)) =
+  let assert Ok(registry.Incoming("D1", "20.1", "20.1", "U1", "hi", True, [])) =
     socket.incoming(dm, "UBOT")
 }
 
@@ -115,12 +117,19 @@ fn start_registry(launches: process.Subject(Launch)) {
         Error("no agents in this test")
       },
       stop: fn(key) { process.send(launches, Stopped(key)) },
-      exists: fn(key) { key == registry.key("C9", "1.0") },
+      exists: fn(key) {
+        key == registry.key("C9", "1.0") || key == registry.key("C7", "1.0")
+      },
+      meta_path: fn(key) { "/tmp/crushling-registry-test/" <> key <> ".json" },
+      attachments: fn(key) {
+        #("/tmp/crushling-registry-test/" <> key, ".slack")
+      },
     )
   let assert Ok(r) =
     registry.start(registry.Config(
       launcher: fake,
       client:,
+      token: "xoxb-test",
       bot_user: "UBOT",
       allowed: set.from_list(["U1"]),
       idle_ms: 50,
@@ -131,7 +140,9 @@ fn start_registry(launches: process.Subject(Launch)) {
 }
 
 fn message(user: String, ts: String, text: String, mention: Bool) {
-  registry.Received(registry.Incoming("C1", "10.1", ts, user, text, mention))
+  registry.Received(
+    registry.Incoming("C1", "10.1", ts, user, text, mention, []),
+  )
 }
 
 pub fn registry_routing_test() {
@@ -170,14 +181,18 @@ pub fn replies_resume_threads_from_before_a_restart_test() {
   // C9's thread has a workspace on disk, but this registry never saw it.
   process.send(
     r,
-    registry.Received(registry.Incoming("C9", "1.0", "5.0", "U1", "more", False)),
+    registry.Received(
+      registry.Incoming("C9", "1.0", "5.0", "U1", "more", False, []),
+    ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
   let assert True = key == registry.key("C9", "1.0")
   // A reply in a thread with no workspace is still ignored.
   process.send(
     r,
-    registry.Received(registry.Incoming("C8", "1.0", "5.0", "U1", "more", False)),
+    registry.Received(
+      registry.Incoming("C8", "1.0", "5.0", "U1", "more", False, []),
+    ),
   )
   let assert Error(Nil) = process.receive(launches, 100)
   Nil
@@ -200,4 +215,52 @@ pub fn native_stop_reaches_the_registry_test() {
   after()
   let assert Ok(registry.StopRequested("C1", "10.1", "U1")) =
     process.receive(registry, 1000)
+}
+
+@external(erlang, "crushling_ffi", "mkdir_p")
+fn mkdir_p(path: String) -> Result(Nil, String)
+
+pub fn follow_mode_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  // C7's thread is on disk, joined partway through: not following.
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/" <> registry.key("C7", "1.0") <> ".json",
+      meta.Meta(follow: False, cursor: "3.0"),
+    )
+  let r = start_registry(launches)
+  let reply = fn(ts, text, mention) {
+    registry.Received(
+      registry.Incoming("C7", "1.0", ts, "U1", text, mention, []),
+    )
+  }
+  // A plain reply is chatter for the next turn, not a prompt.
+  process.send(r, reply("4.0", "just talking", False))
+  let assert Error(Nil) = process.receive(launches, 100)
+  // A mention is.
+  process.send(r, reply("5.0", "<@UBOT> now you", True))
+  let assert Ok(Launched(_)) = process.receive(launches, 1000)
+
+  // A thread started from its first message follows every reply.
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("C6", "2.0", "2.0", "U1", "<@UBOT> go", True, []),
+    ),
+  )
+  let assert Ok(Launched(key)) = process.receive(launches, 1000)
+  let assert Ok(meta.Meta(follow: True, ..)) =
+    meta.read("/tmp/crushling-registry-test/" <> key <> ".json")
+  // Mentioned partway into a thread: answers mentions only.
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("C5", "2.0", "2.5", "U1", "<@UBOT> hi", True, []),
+    ),
+  )
+  let assert Ok(Launched(key)) = process.receive(launches, 1000)
+  let assert Ok(meta.Meta(follow: False, ..)) =
+    meta.read("/tmp/crushling-registry-test/" <> key <> ".json")
+  Nil
 }

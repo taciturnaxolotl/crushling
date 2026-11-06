@@ -193,28 +193,135 @@ pub fn note(run: Run, answered: Bool) -> Option(String) {
   case run.outcome {
     Some(run.Cancelled) -> Some("_stopped._")
     Some(run.Errored(reason)) -> {
-      let reason = clip_reason(reason)
-      Some(case answered, did_work {
-        True, _ ->
-          "_the run failed partway ("
-          <> reason
-          <> "), so the reply above may be partial. Send a follow-up to carry on._"
-        False, True ->
-          "_the run failed ("
-          <> reason
-          <> "). The steps above show what got done; send a follow-up to carry on._"
-        False, False -> "_the run failed: " <> reason <> "_"
-      })
+      let #(cause, advice) = explain(reason)
+      let where = case answered, did_work {
+        True, _ -> " The reply above may be partial."
+        False, True -> " The steps above show what got done."
+        False, False -> ""
+      }
+      Some(
+        "_"
+        <> cause
+        <> "."
+        <> where
+        <> " "
+        <> advice
+        <> "_\n> `"
+        <> clip_reason(reason)
+        <> "`",
+      )
     }
     Some(run.Completed(_)) if !answered && !did_work -> Some("_no reply._")
     _ -> None
   }
 }
 
+/// What went wrong in words, and what to do about it, from an error as
+/// crush reports it. Crush passes provider errors through, so this goes by
+/// what the text contains.
+pub fn explain(reason: String) -> #(String, String) {
+  let text = string.lowercase(reason)
+  let has = fn(needles) { list.any(needles, string.contains(text, _)) }
+  case Nil {
+    _ if text == "lost the connection mid-run" -> #(
+      "Lost touch with the agent partway through",
+      "Send a follow-up to carry on.",
+    )
+    _ ->
+      case
+        has([
+          "prompt is too long",
+          "context length",
+          "context_length",
+          "too many tokens",
+          "maximum context",
+        ]),
+        has([
+          "credit",
+          "billing",
+          "insufficient_quota",
+          "payment required",
+          "402",
+        ]),
+        has(["rate limit", "rate_limit", "429", "too many requests"]),
+        has([
+          "unauthorized",
+          "authentication",
+          "invalid token",
+          "invalid api key",
+          "401",
+          "token is expired",
+          "re-authenticate",
+        ]),
+        has(["claude_code_version_too_old"]),
+        has([
+          "overloaded",
+          "529",
+          "503",
+          "502",
+          "500 internal",
+          "internal server error",
+          "bad gateway",
+          "service unavailable",
+        ]),
+        has([
+          "timeout",
+          "timed out",
+          "deadline exceeded",
+          "connection reset",
+          "eof",
+        ]),
+        has(["max_tokens", "invalid_request", "bad request", "400"])
+      {
+        True, _, _, _, _, _, _, _ -> #(
+          "The conversation got too long for the model",
+          "Start a new thread to carry on.",
+        )
+        _, True, _, _, _, _, _, _ -> #(
+          "The model provider is out of credits",
+          "Top up the account, then send a follow-up to carry on.",
+        )
+        _, _, True, _, _, _, _, _ -> #(
+          "The model provider is rate limiting us",
+          "Wait a minute, then send a follow-up to carry on.",
+        )
+        _, _, _, True, _, _, _, _ -> #(
+          "The model provider rejected crushling's login",
+          "Someone needs to sign crushling in again.",
+        )
+        _, _, _, _, True, _, _, _ -> #(
+          "Anthropic now wants a newer Claude Code version",
+          "Raise CRUSHLING_CLAUDE_VERSION and restart crushling.",
+        )
+        _, _, _, _, _, True, _, _ -> #(
+          "The model provider is having trouble",
+          "Try again in a bit.",
+        )
+        _, _, _, _, _, _, True, _ -> #(
+          "The connection to the model provider dropped",
+          "Send a follow-up to carry on.",
+        )
+        _, _, _, _, _, _, _, True -> #(
+          "The model provider refused the request",
+          "This is likely a configuration problem; check the model settings.",
+        )
+        _, _, _, _, _, _, _, _ -> #(
+          "Something went wrong",
+          "Send a follow-up to try again.",
+        )
+      }
+  }
+}
+
+/// The raw error, on one line and short, for a code span.
 fn clip_reason(reason: String) -> String {
-  let reason = string.trim(reason) |> string.replace("_", "\\_")
-  case string.length(reason) > 300 {
-    True -> string.slice(reason, 0, 299) <> "…"
+  let reason =
+    reason
+    |> string.replace("\n", " ")
+    |> string.replace("`", "'")
+    |> string.trim
+  case string.length(reason) > 200 {
+    True -> string.slice(reason, 0, 199) <> "…"
     False -> reason
   }
 }

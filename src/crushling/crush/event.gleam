@@ -30,6 +30,11 @@ pub type ToolResult {
   )
 }
 
+/// A finished subagent's report, delivered into its parent's session.
+pub type SubReport {
+  SubReport(label: String, output: String, failed: Bool)
+}
+
 pub type Message {
   Message(
     id: String,
@@ -38,6 +43,7 @@ pub type Message {
     text: String,
     tool_calls: List(ToolCall),
     tool_results: List(ToolResult),
+    reports: List(SubReport),
   )
 }
 
@@ -58,6 +64,8 @@ pub type FileVersion {
 
 pub type Event {
   MessageEvent(op: String, message: Message)
+  /// A session was created or changed; subagents run in child sessions.
+  SessionEvent(id: String, parent_session_id: String, title: String)
   RunCompleteEvent(RunComplete)
   AgentError(session_id: String, run_id: String, error: String)
   FileEvent(FileVersion)
@@ -76,6 +84,13 @@ pub fn decoder() -> Decoder(Event) {
     "run_complete" ->
       body(run_complete_decoder()) |> decode.map(RunCompleteEvent)
     "file" -> body(file_decoder()) |> decode.map(FileEvent)
+    "session" ->
+      body({
+        use id <- str("id")
+        use parent_session_id <- str("parent_session_id")
+        use title <- str("title")
+        decode.success(SessionEvent(id:, parent_session_id:, title:))
+      })
     "agent_event" -> body(agent_event_decoder(kind))
     _ -> decode.success(Other(kind))
   }
@@ -120,6 +135,13 @@ fn message_decoder() -> Decoder(Message) {
         _ -> Error(Nil)
       }
     })
+  let reports =
+    list.filter_map(parts, fn(part) {
+      case part {
+        ReportPart(report) -> Ok(report)
+        _ -> Error(Nil)
+      }
+    })
   decode.success(Message(
     id:,
     session_id:,
@@ -127,6 +149,7 @@ fn message_decoder() -> Decoder(Message) {
     text:,
     tool_calls:,
     tool_results:,
+    reports:,
   ))
 }
 
@@ -143,6 +166,7 @@ type Part {
   TextPart(String)
   CallPart(ToolCall)
   ResultPart(ToolResult)
+  ReportPart(SubReport)
   OtherPart
 }
 
@@ -183,6 +207,13 @@ fn part_decoder() -> Decoder(Part) {
         decode.success(
           ResultPart(ToolResult(tool_call_id:, name:, content:, is_error:)),
         )
+      })
+    "sub_agent_report" ->
+      data({
+        use label <- str("label")
+        use output <- str("output")
+        use failed <- decode.optional_field("failed", False, decode.bool)
+        decode.success(ReportPart(SubReport(label:, output:, failed:)))
       })
     _ -> decode.success(OtherPart)
   }

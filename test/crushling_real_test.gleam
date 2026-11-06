@@ -112,6 +112,7 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { survives_server_restart(wiring) }),
         with_timeout(600, fn() { registry_launches_and_idles(wiring) }),
         with_timeout(600, fn() { shutdown_cancels_and_stops(wiring) }),
+        with_timeout(600, fn() { subagents_get_their_own_threads(wiring) }),
       ])
     }
   }
@@ -270,6 +271,7 @@ fn sink(calls: Subject(Call)) -> thread.Sink {
     post: progress,
     upload: fn(_, _) { Ok(Nil) },
     finished: fn(finished) { process.send(calls, Done(finished)) },
+    branch: fn(_, _) { Error("no branches in this test") },
   )
 }
 
@@ -429,6 +431,8 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
         process.send(launches, Stopped(key))
       },
       exists: local.exists,
+      meta_path: local.meta_path,
+      attachments: local.attachments,
     )
   use <-
     guarded(_, fn() {
@@ -444,6 +448,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
     registry.start(registry.Config(
       launcher: watched,
       client:,
+      token: "xoxb-test",
       bot_user: "UBOT",
       allowed: set.from_list(["U1"]),
       idle_ms: 500,
@@ -452,14 +457,17 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
     ))
   process.send(
     r,
-    registry.Received(registry.Incoming(
-      "C1",
-      "10.1",
-      "10.1",
-      "U1",
-      "<@UBOT> Reply with exactly the word DELTA and nothing else. Use no tools.",
-      True,
-    )),
+    registry.Received(
+      registry.Incoming(
+        "C1",
+        "10.1",
+        "10.1",
+        "U1",
+        "<@UBOT> Reply with exactly the word DELTA and nothing else. Use no tools.",
+        True,
+        [],
+      ),
+    ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 60_000)
   let assert True = key == registry.key("C1", "10.1")
@@ -490,6 +498,8 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
         process.send(launches, Stopped(key))
       },
       exists: local.exists,
+      meta_path: local.meta_path,
+      attachments: local.attachments,
     )
   use <-
     guarded(_, fn() {
@@ -505,6 +515,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
     registry.start(registry.Config(
       launcher: watched,
       client:,
+      token: "xoxb-test",
       bot_user: "UBOT",
       allowed: set.from_list(["U1"]),
       idle_ms: 600_000,
@@ -513,14 +524,17 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
     ))
   process.send(
     r,
-    registry.Received(registry.Incoming(
-      "C1",
-      "20.1",
-      "20.1",
-      "U1",
-      "<@UBOT> Use the bash tool to run: sleep 120\nThen reply DONE.",
-      True,
-    )),
+    registry.Received(
+      registry.Incoming(
+        "C1",
+        "20.1",
+        "20.1",
+        "U1",
+        "<@UBOT> Use the bash tool to run: sleep 120\nThen reply DONE.",
+        True,
+        [],
+      ),
+    ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 60_000)
   // Give the turn time to start its command.
@@ -536,4 +550,115 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       "pgrep -f 'crush server --host unix://" <> root <> "'",
     ))
   Nil
+}
+
+type SubCall {
+  Branched(intro: String, title: String)
+  InBranch(text: String)
+  InMain(text: String)
+  MainFinished(solicited: Bool)
+}
+
+fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> thread.Sink {
+  let post = fn(text) {
+    process.send(calls, case in_branch {
+      True -> InBranch(text)
+      False -> InMain(text)
+    })
+    Ok("ts" <> int.to_string(unique()))
+  }
+  thread.Sink(
+    working: fn(_) { Nil },
+    title: fn(_) { Nil },
+    post_plan: fn(plan) { post(render.plan_markdown(plan)) },
+    update_plan: fn(_, _) { Ok(Nil) },
+    post:,
+    upload: fn(_, _) { Ok(Nil) },
+    finished: fn(finished) {
+      process.send(calls, MainFinished(finished.solicited))
+    },
+    branch: fn(intro, title) {
+      process.send(calls, Branched(intro, title))
+      Ok(#(recording_sink(calls, True), "https://slack.example/thread"))
+    },
+  )
+}
+
+/// A dispatched subagent opens its own thread, works there, and its report
+/// comes back to the main thread; crush's own turn to read the report is
+/// adopted and reported as unsolicited.
+fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
+  use env <- with_env("subagent", wiring)
+  let calls = process.new_subject()
+  let assert Ok(t) =
+    thread.start(thread.Config(
+      socket: env.socket,
+      root: env.work,
+      title: "crushling subagent test",
+      sink: recording_sink(calls, False),
+      flush_ms: 250,
+      mode: client.Sysadmin,
+    ))
+  process.send(
+    t,
+    thread.Prompt(
+      "Start one subagent (agent_dispatch if you have it, otherwise agent) with the label \"count-files\" and the prompt \"Use the ls tool on the current directory, then reply with how many entries it has.\". Then reply with the word OK.",
+    ),
+  )
+  let seen = collect_sub_calls(calls, 0, [])
+  // The subagent got a thread of its own, worked there, and reported back.
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        Branched(..) -> True
+        _ -> False
+      }
+    })
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        InBranch(text) ->
+          string.contains(text, "▸") || string.contains(text, "✓")
+        _ -> False
+      }
+    })
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        InMain(text) -> string.contains(text, "* finished _")
+        _ -> False
+      }
+    })
+  let assert True = list.contains(seen, MainFinished(True))
+  // Crush's own turn to read the report was adopted, not lost.
+  let assert True = list.contains(seen, MainFinished(False))
+  process.send(t, thread.Stop)
+}
+
+/// Collect until the prompt's run has finished and the subagent reported
+/// back, plus the turn crush starts to read the report, if any.
+fn collect_sub_calls(
+  calls: Subject(SubCall),
+  finished: Int,
+  acc: List(SubCall),
+) -> List(SubCall) {
+  let reported =
+    list.any(acc, fn(call) {
+      case call {
+        InMain(text) -> string.contains(text, "* finished _")
+        _ -> False
+      }
+    })
+  let report_turn = list.contains(acc, MainFinished(False))
+  case finished >= 2 && reported && report_turn {
+    True -> list.reverse(acc)
+    False ->
+      case process.receive(calls, 240_000) {
+        Ok(MainFinished(_) as call) ->
+          collect_sub_calls(calls, finished + 1, [call, ..acc])
+        Ok(call) -> collect_sub_calls(calls, finished, [call, ..acc])
+        Error(Nil) ->
+          panic as { "stuck; saw " <> string.inspect(list.reverse(acc)) }
+      }
+  }
 }

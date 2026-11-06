@@ -36,7 +36,9 @@ start(Socket, Log, Home, Extra) ->
                              {"ANTHROPIC_API_KEY", false},
                              {"CRUSH_SERVER_IDLE_TIMEOUT", "600"},
                              {"CRUSH_GLOBAL_CONFIG", unicode:characters_to_list([Home, "/config"])},
-                             {"CRUSH_GLOBAL_DATA", unicode:characters_to_list([Home, "/data"])}
+                             {"CRUSH_GLOBAL_DATA", unicode:characters_to_list([Home, "/data"])},
+                             {"HONCHO_CONFIG_DIR", unicode:characters_to_list([Home, "/honcho"])},
+                             {"HONCHO_API_KEY", false}
                              | [list_to_tuple(string:split(unicode:characters_to_list(E), "="))
                                 || E <- Extra]]},
                       exit_status, hide]),

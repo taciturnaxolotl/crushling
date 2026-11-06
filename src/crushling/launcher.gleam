@@ -30,8 +30,17 @@ pub type Launcher {
     stop: fn(String) -> Nil,
     /// Whether the thread has a workspace, so it was started before.
     exists: fn(String) -> Bool,
+    /// Where the bridge keeps the thread's `meta`, outside the workspace.
+    meta_path: fn(String) -> String,
+    /// Where Slack attachments are saved: the host directory, and the same
+    /// directory relative to the agent's workspace.
+    attachments: fn(String) -> #(String, String),
   )
 }
+
+/// Attachments live in the workspace, so the agent can open them, under a
+/// directory the change snapshots leave out.
+pub const attachments_dir = ".slack"
 
 type Credentials =
   Option(Subject(credentials.Message))
@@ -64,6 +73,13 @@ pub fn docker(policy: sandbox.Policy, creds: Credentials) -> Launcher {
       Nil
     },
     exists: fn(key) { file_exists(sandbox.host_workspace(policy, key)) },
+    meta_path: fn(key) { policy.root <> "/" <> key <> "/crushling.json" },
+    attachments: fn(key) {
+      #(
+        sandbox.host_workspace(policy, key) <> "/" <> attachments_dir,
+        attachments_dir,
+      )
+    },
   )
 }
 
@@ -110,6 +126,7 @@ pub fn local(
       use _ <- result.try(mkdir_p(work))
       use _ <- result.try(mkdir_p(base <> "/home/config"))
       use _ <- result.try(mkdir_p(base <> "/home/data"))
+      use _ <- result.try(mkdir_p(base <> "/home/honcho"))
       use _ <- result.try(write_private(config(key), provider.config(backend)))
       use _ <- result.try(watch(creds, config(key)))
       // A server left over from an earlier bridge would keep the socket;
@@ -118,6 +135,9 @@ pub fn local(
       let env = [
         "CRUSH_GLOBAL_CONFIG=" <> base <> "/home/config",
         "CRUSH_GLOBAL_DATA=" <> base <> "/home/data",
+        // The same goes for the Honcho memory sign-in in ~/.honcho, which
+        // would otherwise record every Slack conversation as yours.
+        "HONCHO_CONFIG_DIR=" <> base <> "/home/honcho",
         "CRUSH_SERVER_IDLE_TIMEOUT=31536000",
         "CRUSH_SERVER_DETACH_GRACE=120",
         ..provider.env(backend)
@@ -136,5 +156,9 @@ pub fn local(
       stop_server(socket(key))
     },
     exists: fn(key) { file_exists(dir(key) <> "/work") },
+    meta_path: fn(key) { dir(key) <> "/crushling.json" },
+    attachments: fn(key) {
+      #(dir(key) <> "/work/" <> attachments_dir, attachments_dir)
+    },
   )
 }
