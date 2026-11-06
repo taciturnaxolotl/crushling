@@ -263,9 +263,7 @@ fn read(
         list.drop(all, int.max(list.length(all) - limit, 0))
       })
   }
-  use messages <- result.try(
-    messages |> result.map_error(slackline.describe_error),
-  )
+  use messages <- result.try(messages |> result.map_error(slack.describe))
   case list.filter_map(messages, fn(m) { line(context, m) }) {
     [] -> Ok("(no messages)")
     lines -> Ok(string.join(lines, "\n"))
@@ -304,7 +302,7 @@ fn list_channels(context: Context) -> Result(String, String) {
     |> conversations_list.exclude_archived(True)
     |> conversations_list.limit(1000)
     |> httpc.send(context.client)
-    |> result.map_error(slackline.describe_error),
+    |> result.map_error(slack.describe),
   )
   let lines =
     option.unwrap(found.channels, [])
@@ -335,7 +333,7 @@ fn user_info(context: Context, user: String) -> Result(String, String) {
     users.info()
     |> users_info.user(id)
     |> httpc.send(context.client)
-    |> result.map_error(slackline.describe_error),
+    |> result.map_error(slack.describe),
   )
   case found.user {
     None -> Error("no such user")
@@ -441,5 +439,5 @@ fn share_file(
     }
   })
   |> result.map(fn(_) { "shared " <> relative })
-  |> result.map_error(slackline.describe_error)
+  |> result.map_error(slack.describe)
 }

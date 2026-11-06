@@ -1,6 +1,6 @@
 -module(crushling_ffi).
 
--export([line_at/2, uuid_v4/0, monotonic_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
+-export([line_at/2, uuid_v4/0, monotonic_ms/0, system_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
          file_exists/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
          claude_version/0, read_file/1, write_bytes/2]).
 
@@ -16,6 +16,9 @@ uuid_v4() ->
 
 monotonic_ms() ->
     erlang:monotonic_time(millisecond).
+
+system_ms() ->
+    erlang:system_time(millisecond).
 
 %% Logged at notice, the lowest level the default handler prints.
 log_info(Text) ->

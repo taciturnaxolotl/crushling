@@ -28,11 +28,13 @@ import slackline/api/chat/post_ephemeral
 import slackline/api/chat/post_message
 import slackline/api/chat/update
 import slackline/api/conversations
+import slackline/api/conversations/history
 import slackline/api/conversations/replies
 import slackline/api/files/complete_upload_external
 import slackline/block
 import slackline/file
 import slackline/httpc
+import slackline/value
 
 /// Notifications and old clients show `text`; keep it short.
 const fallback_length = 200
@@ -47,7 +49,7 @@ fn fallback(markdown: String) -> String {
 
 fn send(run: fn() -> Result(a, slackline.Error)) -> Result(a, String) {
   httpc.retrying(attempts: 3, run:)
-  |> result.map_error(slackline.describe_error)
+  |> result.map_error(describe)
 }
 
 fn markdown_blocks(markdown: String) -> List(block.Block) {
@@ -256,16 +258,16 @@ pub fn sink(
         InThread(root) -> {
           use opened <- result.try(
             agents.conversations_create()
-            |> conversations_create.name(name)
+            |> conversations_create.name(string.slice(name, 0, 80))
             |> conversations_create.origin_channel_id(channel)
             |> conversations_create.origin_message_ts(root)
             // A session that was archived and picked up again gets a new
-            // channel, so the id can't be the thread alone.
-            |> conversations_create.session_id(
-              channel <> "-" <> root <> "-" <> uuid_v4(),
-            )
+            // channel, so the id can't be the thread alone; kept short.
+            |> conversations_create.session_id(uuid_v4())
             |> httpc.send(client)
-            |> result.map_error(slackline.describe_error),
+            |> result.map_error(fn(error) {
+              describe(error) <> " creating a code channel named " <> name
+            }),
           )
           let code = opened.channel_id
           hooks.moved(code, repo)
@@ -324,7 +326,7 @@ pub fn sink(
           }
           let attempt = fn() {
             httpc.send(call, client)
-            |> result.map_error(slackline.describe_error)
+            |> result.map_error(describe)
           }
           // A brand-new channel can refuse its first view for a moment.
           let sent = case attempt() {
@@ -353,6 +355,31 @@ pub fn sink(
 @external(erlang, "crushling_ffi", "log_warning")
 fn logger_warn(text: String) -> Nil
 
+/// A Slack error for logs and the agent, with the detail Slack gives for
+/// vague codes like `invalid_arguments` in `response_metadata.messages`.
+pub fn describe(error: slackline.Error) -> String {
+  let base = slackline.describe_error(error)
+  case error {
+    slackline.ApiError(response:, ..) ->
+      case value.at(response, ["response_metadata", "messages"]) {
+        Ok(value.Array(messages)) ->
+          case
+            list.filter_map(messages, fn(message) {
+              case message {
+                value.String(text) -> Ok(text)
+                _ -> Error(Nil)
+              }
+            })
+          {
+            [] -> base
+            details -> base <> " (" <> string.join(details, "; ") <> ")"
+          }
+        _ -> base
+      }
+    _ -> base
+  }
+}
+
 @external(erlang, "crushling_ffi", "uuid_v4")
 fn uuid_v4() -> String
 
@@ -370,7 +397,7 @@ pub fn archive_code_channel(
   }
   |> httpc.send(client)
   |> result.replace(Nil)
-  |> result.map_error(slackline.describe_error)
+  |> result.map_error(describe)
 }
 
 /// Set an agent session's status: a thread's, or a whole code channel's
@@ -488,6 +515,9 @@ fn is_link(inside: String) -> Bool {
 pub type Command {
   StopCommand
   HelpCommand
+  /// Stop following: only mentions reach the agent until `!resume`.
+  PauseCommand
+  ResumeCommand
   /// A `##` aside meant for the people in the thread, not the agent.
   SideComment
   NotACommand
@@ -497,13 +527,15 @@ pub fn command(prompt: String) -> Command {
   case string.lowercase(string.trim(prompt)) {
     "!stop" | "stop" | "cancel" | "stop!" -> StopCommand
     "!help" -> HelpCommand
+    "!pause" -> PauseCommand
+    "!resume" | "!unpause" -> ResumeCommand
     "##" <> _ -> SideComment
     _ -> NotACommand
   }
 }
 
 pub const help =
-  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
+  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
 /// A file attached to a Slack message.
 pub type Attachment {
@@ -646,7 +678,8 @@ pub fn save_attachments(
   }
 }
 
-fn ts_value(ts: String) -> Float {
+/// A Slack ts as seconds.
+pub fn ts_value(ts: String) -> Float {
   case float.parse(ts) {
     Ok(value) -> value
     Error(Nil) ->
@@ -671,12 +704,30 @@ pub fn catch_up(
     ts -> ts_value(ts)
   }
   let before = ts_value(before_ts)
+  // A code channel is caught up on as a whole; its history is newest first.
+  let found = case thread_ts {
+    "" -> {
+      let call =
+        conversations.history(channel:)
+        |> history.limit(200)
+        |> history.latest(before_ts)
+      case after_ts {
+        "" -> call
+        ts -> history.oldest(call, ts)
+      }
+      |> httpc.send(client)
+      |> result.map(fn(response) {
+        option.unwrap(response.messages, []) |> list.reverse
+      })
+    }
+    ts ->
+      conversations.replies(channel:, ts:)
+      |> replies.limit(200)
+      |> httpc.send(client)
+      |> result.map(fn(response) { option.unwrap(response.messages, []) })
+  }
   let lines =
-    conversations.replies(channel:, ts: thread_ts)
-    |> replies.limit(200)
-    |> httpc.send(client)
-    |> result.map(fn(response) { option.unwrap(response.messages, []) })
-    |> result.unwrap([])
+    result.unwrap(found, [])
     |> list.filter_map(fn(message) {
       case message.user, message.text, message.ts, message.bot_id {
         Some(user), Some(text), Some(ts), None if user != bot_user -> {
@@ -699,9 +750,13 @@ pub fn catch_up(
       }
     })
   let count = list.length(lines)
+  let place = case thread_ts {
+    "" -> "Slack channel"
+    _ -> "Slack thread"
+  }
   let heading = case after_ts {
-    "" -> "Earlier in this Slack thread"
-    _ -> "New in this Slack thread since your last turn"
+    "" -> "Earlier in this " <> place
+    _ -> "New in this " <> place <> " since your last turn"
   }
   case lines {
     [] -> ""
