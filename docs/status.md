@@ -49,6 +49,13 @@ branch and changed files, and the Code tab holds the diff against the
 default branch. When the thread goes idle the channel is archived with the
 last reply as its summary; a later message in the thread opens a new one.
 
+A run is one message: what the agent says streams into it as it is written,
+its steps sit in a plan block in the same message, and the block settles to
+"Done · N steps" while the closing line names the files it changed. That is
+`chat.startStream` / `chat.appendStream` / `chat.stopStream` with plan-mode
+task chunks; where a workspace refuses the streaming API the plan card and
+separate reply messages are used instead, as before.
+
 A subagent's thread shows what it says between tool calls as it goes, not
 only its final answer.
 
@@ -103,7 +110,7 @@ single use, so the two would revoke each other.
 | `crushling/crush/event` | Decodes the SSE envelope into `MessageEvent`, `RunCompleteEvent`, `AgentError`, `FileEvent`, or `Other`. |
 | `crushling/run` | Pure state for one run: text by message id, tool calls and their status, file baselines and latest contents. |
 | `crushling/diff` | Myers line diff and unified hunks, so diffs never need `git` on the host. |
-| `crushling/render` | Markdown progress view and final reply, split under Slack's markdown-block limit with code fences kept balanced. |
+| `crushling/render` | The run as it streams and the final reply: plan title, task rows, live text, split under Slack's markdown-block limit with code fences kept balanced. |
 | `crushling/thread` | One actor per thread. Owns two connections, a workspace and a session; sends prompts with fresh run ids; throttles updates through a `Sink`; reconnects and settles runs stranded by a dropped stream. |
 | `crushling/snapshot` | Shell commands that snapshot the workspace into a private bare repo under `.crush/` and diff two snapshots. |
 | `crushling/provider` | Claude, Hyper login, or Hyper key: the container's crush.json, env, and login. |
@@ -111,7 +118,7 @@ single use, so the two would revoke each other.
 | `crushling` | Entry point: reads the settings, starts credentials, the registry and Socket Mode. |
 | `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; turns events into `Incoming`. |
 | `crushling/registry` | Thread key to actor; allowlist, dedupe, `stop`, lazy launch, idle shutdown. |
-| `crushling/slack` | The `Sink` over chat.postMessage/update with markdown blocks and file uploads; prompt text cleanup. |
+| `crushling/slack` | The `Sink` over chat.postMessage/update and chat.startStream/appendStream/stopStream, with markdown and plan blocks and file uploads; prompt text cleanup. |
 | `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). |
 | `crushling/sandbox` | `docker run` arguments, a policy fingerprint label, adopt/start/recreate, stop (warm) and remove (cold). |
 

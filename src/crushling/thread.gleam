@@ -38,6 +38,13 @@ pub type Sink {
     /// Post the plan card, returning its id (Slack's `ts`).
     post_plan: fn(render.Plan) -> Result(String, String),
     update_plan: fn(String, render.Plan) -> Result(Nil, String),
+    /// Start a streamed message showing `chunks`, and return its id
+    /// (Slack's `ts`).
+    start_stream: fn(List(render.Chunk)) -> Result(String, String),
+    /// Add to a streamed message.
+    append_stream: fn(String, List(render.Chunk)) -> Result(Nil, String),
+    /// Finish a streamed message with its last pieces.
+    stop_stream: fn(String, List(render.Chunk)) -> Result(Nil, String),
     /// Post a markdown message.
     post: fn(String) -> Result(String, String),
     /// Attach a file to the thread: name, then contents.
@@ -143,6 +150,8 @@ type Active {
     /// The plan card, once posted, and what it last showed.
     plan_ts: Option(String),
     shown: Option(render.Plan),
+    /// Where the run is being shown.
+    display: Display,
     /// The workspace snapshot taken just before the prompt was sent.
     base: Option(String),
     /// When the session was last marked working: Slack lets it lapse after
@@ -539,6 +548,7 @@ fn send_prompt(
           run:,
           plan_ts: None,
           shown: None,
+          display: Unshown,
           base:,
           working_since_ms: now,
           last_event_ms: now,
@@ -775,7 +785,7 @@ fn move_to(
                 }
                 _, _ -> Nil
               }
-              Active(..active, plan_ts: None, shown: None)
+              Active(..active, plan_ts: None, shown: None, display: PlanCard)
             })
           let state = State(..state, active:)
           update_code_view(state, info)
@@ -870,6 +880,7 @@ fn adopt_report_turn(state: State, event: event.Event) -> State {
           run: run.new(message.session_id, ""),
           plan_ts: None,
           shown: None,
+          display: Unshown,
           base: None,
           working_since_ms: now,
           last_event_ms: now,
@@ -1218,9 +1229,57 @@ fn watchdog(state: State) -> State {
   }
 }
 
-/// Post or update the plan card.
+/// Show the run moving: one streamed message with the agent's text as it
+/// arrives and its steps in a plan block, or the plan card where Slack
+/// won't stream.
+/// Where a run is being shown: nowhere yet, one streamed message, or the
+/// plan card where Slack won't stream.
+type Display {
+  Unshown
+  Streaming(ts: String, shown: render.Shown)
+  PlanCard
+}
+
 fn show_progress(config: Config, active: Active) -> Active {
-  show_plan(config, active)
+  case active.display {
+    PlanCard -> show_plan(config, active)
+    _ -> show_stream(config, active)
+  }
+}
+
+fn show_stream(config: Config, active: Active) -> Active {
+  let sink = config.sink
+  case active.display {
+    Streaming(ts, shown) -> {
+      let pending = render.pending(active.run, config.root, shown)
+      case pending.chunks {
+        [] -> active
+        chunks ->
+          case sink.append_stream(ts, chunks) {
+            Ok(Nil) -> Active(..active, display: Streaming(ts, pending.shown))
+            Error(reason) -> {
+              warn("crushling: stream update failed: " <> reason)
+              active
+            }
+          }
+      }
+    }
+    _ -> {
+      let pending =
+        render.pending(active.run, config.root, render.empty_shown())
+      case pending.chunks {
+        [] -> active
+        chunks ->
+          case sink.start_stream(chunks) {
+            Ok(ts) -> Active(..active, display: Streaming(ts, pending.shown))
+            Error(reason) -> {
+              warn("crushling: streaming not available: " <> reason)
+              show_plan(config, Active(..active, display: PlanCard))
+            }
+          }
+      }
+    }
+  }
 }
 
 fn show_plan(config: Config, active: Active) -> Active {
@@ -1344,46 +1403,28 @@ fn finish(state: State, active: Active) -> Nil {
     None -> Nil
   }
 
-  // The plan card settles into its final state.
-  case active.plan_ts, render.plan(active.run, config.root) {
-    Some(ts), Some(plan) ->
-      case sink.update_plan(ts, plan) {
-        Ok(Nil) -> Nil
-        Error(reason) -> warn("crushling: plan update failed: " <> reason)
-      }
-    _, _ -> Nil
-  }
-
   let answer = render.answer(active.run)
   let answered = answer != []
   let closing =
     [
-      render.changes(changes),
+      // A code channel's Code tab already lists what changed.
+      case config.in_code_channel {
+        True -> None
+        False -> render.changes(changes)
+      },
       case active.run.outcome, active.cancel_note {
         Some(run.Cancelled), Some(note) -> Some("_" <> note <> "_")
         _, _ -> render.note(active.run, answered)
       },
     ]
     |> option.values
-  // The file summary and any note ride on the last answer message when
-  // there is one, so a run ends in a single message.
-  let messages = case list.reverse(answer), closing {
-    [], [] -> []
-    [], closing -> [string.join(closing, "\n")]
-    [last, ..earlier], [] -> list.reverse([last, ..earlier])
-    [last, ..earlier], closing ->
-      list.reverse([last <> "\n\n" <> string.join(closing, "\n"), ..earlier])
+  // A run ends in one message: the streamed one settles with what the agent
+  // said, its steps and the line naming the files it changed. Without a
+  // stream, the plan card settles and the answer is posted after it.
+  let reply_ts = case active.display {
+    Streaming(ts, shown) -> settle_stream(config, active, ts, shown, closing)
+    _ -> settle_card(config, active, answer, closing)
   }
-  let reply_ts =
-    list.fold(messages, "", fn(last, text) {
-      case sink.post(text) {
-        Ok(ts) -> ts
-        Error(reason) -> {
-          warn("crushling: post failed: " <> reason)
-          last
-        }
-      }
-    })
   sink.working(False)
 
   case patch, string.byte_size(patch) > max_patch_bytes {
@@ -1402,11 +1443,89 @@ fn finish(state: State, active: Active) -> Nil {
     solicited: active.solicited,
     run_id: active.run.run_id,
     outcome: option.unwrap(active.run.outcome, run.Cancelled),
-    text: string.join(messages, "\n"),
+    text: string.join(answer, "\n\n"),
     reply_ts:,
     changes:,
     patch:,
   ))
+}
+
+/// Finish the streamed message: its last pieces, then whatever didn't fit.
+fn settle_stream(
+  config: Config,
+  active: Active,
+  ts: String,
+  shown: render.Shown,
+  closing: List(String),
+) -> String {
+  let sink = config.sink
+  let pending = render.pending(active.run, config.root, shown)
+  let tail = case string.join(closing, "\n\n") {
+    "" -> []
+    text -> [render.ChunkText("\n\n" <> text)]
+  }
+  case sink.stop_stream(ts, list.append(pending.chunks, tail)) {
+    Ok(Nil) -> {
+      let rest = render.remainder(render.reply(active.run), pending.shown.text)
+      last_ts(post_texts(sink, render.chunk(rest, render.message_limit)), ts)
+    }
+    // Nothing could settle the stream; say it again in the thread rather
+    // than leave it half written.
+    Error(reason) -> {
+      warn("crushling: finishing the stream failed: " <> reason)
+      settle_card(config, active, render.answer(active.run), closing)
+    }
+  }
+}
+
+/// Post the answer and settle the plan card.
+fn settle_card(
+  config: Config,
+  active: Active,
+  answer: List(String),
+  closing: List(String),
+) -> String {
+  let sink = config.sink
+  case active.plan_ts, render.plan(active.run, config.root) {
+    Some(ts), Some(plan) ->
+      case sink.update_plan(ts, plan) {
+        Ok(Nil) -> Nil
+        Error(reason) -> warn("crushling: plan update failed: " <> reason)
+      }
+    _, _ -> Nil
+  }
+  // The file summary and any note ride on the last answer message when
+  // there is one, so a run ends in a single message.
+  let messages = case list.reverse(answer), closing {
+    [], [] -> []
+    [], closing -> [string.join(closing, "\n")]
+    [last, ..earlier], [] -> list.reverse([last, ..earlier])
+    [last, ..earlier], closing ->
+      list.reverse([last <> "\n\n" <> string.join(closing, "\n"), ..earlier])
+  }
+  last_ts(post_texts(sink, messages), "")
+}
+
+/// The part of `reply` a stream hasn't shown yet.
+/// Post each piece, keeping the ids of the ones that went out.
+fn post_texts(sink: Sink, texts: List(String)) -> List(String) {
+  list.fold(texts, [], fn(posted, text) {
+    case text {
+      "" -> posted
+      text ->
+        case sink.post(text) {
+          Ok(ts) -> list.append(posted, [ts])
+          Error(reason) -> {
+            warn("crushling: post failed: " <> reason)
+            posted
+          }
+        }
+    }
+  })
+}
+
+fn last_ts(posted: List(String), fallback: String) -> String {
+  list.last(posted) |> result.unwrap(fallback)
 }
 
 fn close_conns(state: State) -> Nil {

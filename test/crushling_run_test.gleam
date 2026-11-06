@@ -197,6 +197,70 @@ pub fn plan_render_test() {
   )) = render.plan(failed, "/workspace")
 }
 
+pub fn streamed_text_test() {
+  // Crush sends the same message again as it grows; the view keeps one
+  // entry per message, in order, trimmed and without empties.
+  let r =
+    feed([
+      assistant("m1", "Look", []),
+      assistant("m1", "Looking at it.", []),
+      assistant("m2", "  ", []),
+      assistant("m3", "Fixed.", []),
+    ])
+  let assert [#("m1", "Looking at it."), #("m3", "Fixed.")] =
+    run.messages(r, True)
+  let assert "Working" = render.progress_title(r)
+  let assert "Looking at it.\n\nFixed." = render.reply(r)
+  let assert ["Looking at it.\n\nFixed."] = render.answer(r)
+}
+
+pub fn done_title_test() {
+  let r =
+    feed([
+      assistant("m1", "On it.", []),
+      event.MessageEvent(
+        "created",
+        event.Message(
+          "t1",
+          "s1",
+          event.Tool,
+          "",
+          [],
+          [event.ToolResult("c1", "bash", "out", False)],
+          [],
+        ),
+      ),
+    ])
+  let assert "Working" = render.progress_title(r)
+  let assert "Done · 0 steps" =
+    render.progress_title(run.apply(r, dict.new(), done("On it.", "", False)))
+  let assert "Stopped · 0 steps" =
+    render.progress_title(run.apply(r, dict.new(), done("", "", True)))
+}
+
+pub fn a_failure_worked_around_is_not_a_badge_test() {
+  let call = event.ToolCall("c1", "bash", "{\"command\":\"false\"}", True)
+  let r = feed([assistant("m1", "On it.", [call]), tool_result("c1", True)])
+  // While it runs, a failed command is shown as one.
+  let assert Some(render.Plan(_, [render.Task(status: render.Failed, ..)])) =
+    render.plan(r, "/w")
+  // The agent carried on and finished, so the card doesn't keep Slack's
+  // warning badge for the whole run.
+  let finished = run.apply(r, dict.new(), done("On it.", "", False))
+  let assert Some(render.Plan(
+    "Done · 1 step",
+    [render.Task(status: render.Complete, ..)],
+  )) = render.plan(finished, "/w")
+  // A run that ends badly still says so, and so does one the user stopped:
+  // the failure is the thing to look at.
+  let failed = run.apply(r, dict.new(), done("", "boom", False))
+  let assert Some(render.Plan(_, [render.Task(status: render.Failed, ..)])) =
+    render.plan(failed, "/w")
+  let stopped = run.apply(r, dict.new(), done("", "", True))
+  let assert Some(render.Plan(_, [render.Task(status: render.Failed, ..)])) =
+    render.plan(stopped, "/w")
+}
+
 pub fn plan_folds_many_steps_test() {
   let calls =
     int.range(from: 50, to: 0, with: [], run: fn(acc, i) {
