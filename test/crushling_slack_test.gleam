@@ -438,3 +438,25 @@ pub fn the_seeded_request_is_not_run_twice_test() {
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
   let assert True = key == registry.key("C9", "1.0")
 }
+
+pub fn shared_files_route_like_messages_test() {
+  // A reply with an image, in a thread.
+  let in_thread =
+    decode_event(
+      "{\"type\":\"message\",\"subtype\":\"file_share\",\"user\":\"U1\",\"text\":\"look\",\"ts\":\"15.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\",\"files\":[{\"id\":\"F1\",\"name\":\"image.png\",\"mimetype\":\"image/png\",\"size\":10,\"url_private\":\"https://files.slack.com/x\"}]}",
+    )
+  let assert Ok(registry.Incoming(
+    thread_ts: "10.1",
+    ts: "15.1",
+    mention: False,
+    files: [slack.Attachment(name: "image.png", ..)],
+    ..,
+  )) = socket.incoming(in_thread, "UBOT")
+  // At the top of a channel, as in a code channel.
+  let top =
+    decode_event(
+      "{\"type\":\"message\",\"subtype\":\"file_share\",\"user\":\"U1\",\"text\":\"\",\"ts\":\"16.1\",\"channel\":\"CCODE\",\"channel_type\":\"channel\",\"files\":[]}",
+    )
+  let assert Ok(registry.Incoming(thread_ts: "16.1", mention: False, ..)) =
+    socket.incoming(top, "UBOT")
+}

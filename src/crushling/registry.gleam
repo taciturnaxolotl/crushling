@@ -662,9 +662,9 @@ fn prepare(
   let request = slack.prompt_text(incoming.text, config.bot_user)
   let first =
     catch_up != "" && incoming.ts == incoming.thread_ts && cursor == ""
-  let context = case first {
+  let #(context, earlier) = case first {
     // The thread's first message: nothing came before.
-    True -> ""
+    True -> #("", [])
     False ->
       slack.catch_up(
         config.client,
@@ -676,18 +676,16 @@ fn prepare(
         catch_up_limit,
       )
   }
+  let dirs = config.launcher.attachments(key)
+  let earlier_files =
+    slack.save_earlier_attachments(config.token, earlier, dirs)
   let files =
-    slack.save_attachments(
-      config.token,
-      incoming.files,
-      incoming.ts,
-      config.launcher.attachments(key),
-    )
+    slack.save_attachments(config.token, incoming.files, incoming.ts, dirs)
   let from = case is_dm(incoming.channel) {
     True -> ""
     False -> "From <@" <> incoming.user <> ">:\n"
   }
-  [context, from <> request, files]
+  [context, earlier_files, from <> request, files]
   |> list.filter(fn(part) { string.trim(part) != "" })
   |> string.join("\n\n")
 }
