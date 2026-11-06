@@ -634,6 +634,45 @@ pub fn save_attachments(
   ts: String,
   dirs: #(String, String),
 ) -> String {
+  save_attachments_as(
+    token,
+    files,
+    ts,
+    dirs,
+    "Attached to this message, saved in the workspace:\n",
+  )
+}
+
+/// Save the files of messages the prompt only caught up on, so the agent
+/// can open those too.
+pub fn save_earlier_attachments(
+  token: String,
+  earlier: List(#(String, List(Attachment))),
+  dirs: #(String, String),
+) -> String {
+  list.map(earlier, fn(message) {
+    let #(ts, files) = message
+    save_attachments_as(
+      token,
+      files,
+      ts,
+      dirs,
+      "Attached to the earlier message at "
+        <> ts
+        <> ", saved in the workspace:\n",
+    )
+  })
+  |> list.filter(fn(text) { text != "" })
+  |> string.join("\n\n")
+}
+
+fn save_attachments_as(
+  token: String,
+  files: List(Attachment),
+  ts: String,
+  dirs: #(String, String),
+  heading: String,
+) -> String {
   let #(host_dir, agent_dir) = dirs
   let lines =
     list.map(files, fn(file) {
@@ -672,9 +711,7 @@ pub fn save_attachments(
     })
   case lines {
     [] -> ""
-    lines ->
-      "Attached to this message, saved in the workspace:\n"
-      <> string.join(lines, "\n")
+    lines -> heading <> string.join(lines, "\n")
   }
 }
 
@@ -698,7 +735,7 @@ pub fn catch_up(
   before_ts: String,
   bot_user: String,
   limit: Int,
-) -> String {
+) -> #(String, List(#(String, List(Attachment)))) {
   let after = case after_ts {
     "" -> -1.0
     ts -> ts_value(ts)
@@ -726,7 +763,7 @@ pub fn catch_up(
       |> httpc.send(client)
       |> result.map(fn(response) { option.unwrap(response.messages, []) })
   }
-  let lines =
+  let kept =
     result.unwrap(found, [])
     |> list.filter_map(fn(message) {
       case message.user, message.text, message.ts, message.bot_id {
@@ -741,7 +778,10 @@ pub fn catch_up(
                   <> string.join(list.map(files, fn(f) { f.name }), ", ")
                   <> "]"
               }
-              Ok("[<@" <> user <> ">] " <> prompt_text(text, bot_user) <> files)
+              Ok(#(
+                "[<@" <> user <> ">] " <> prompt_text(text, bot_user) <> files,
+                #(ts, attachments(message.files)),
+              ))
             }
             _, _ -> Error(Nil)
           }
@@ -749,7 +789,16 @@ pub fn catch_up(
         _, _, _, _ -> Error(Nil)
       }
     })
-  let count = list.length(lines)
+  let count = list.length(kept)
+  let kept = list.drop(kept, int.max(count - limit, 0))
+  let lines = list.map(kept, fn(pair) { pair.0 })
+  let files =
+    list.filter_map(kept, fn(pair) {
+      case pair.1 {
+        #(_, []) -> Error(Nil)
+        with_files -> Ok(with_files)
+      }
+    })
   let place = case thread_ts {
     "" -> "Slack channel"
     _ -> "Slack thread"
@@ -758,7 +807,7 @@ pub fn catch_up(
     "" -> "Earlier in this " <> place
     _ -> "New in this " <> place <> " since your last turn"
   }
-  case lines {
+  let text = case lines {
     [] -> ""
     lines ->
       heading
@@ -767,6 +816,7 @@ pub fn catch_up(
         False -> ""
       }
       <> ":\n"
-      <> string.join(list.drop(lines, int.max(count - limit, 0)), "\n")
+      <> string.join(lines, "\n")
   }
+  #(text, files)
 }

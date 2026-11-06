@@ -122,6 +122,34 @@ pub fn incoming(
             files: slack.attachments(files),
           ))
       }
+    // A message with files attached, when Slack gives it its own subtype.
+    event.MessageEvent(event.FileShareMessage(
+      channel: Some(channel),
+      user: Some(user),
+      text:,
+      ts:,
+      thread_ts:,
+      channel_type:,
+      bot_id: None,
+      files:,
+      ..,
+    )) -> {
+      let text = option.unwrap(text, "")
+      case mentions_bot(text), thread_ts, channel_type {
+        // A mention arrives as app_mention too.
+        True, _, _ -> Error(Nil)
+        _, _, _ ->
+          Ok(registry.Incoming(
+            channel:,
+            thread_ts: option.unwrap(thread_ts, ts),
+            ts:,
+            user:,
+            text:,
+            mention: channel_type == Some(event.Im) && thread_ts == None,
+            files: slack.attachments(files),
+          ))
+      }
+    }
     _ -> Error(Nil)
   }
 }
