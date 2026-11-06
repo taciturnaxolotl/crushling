@@ -1,0 +1,93 @@
+import crushling/sandbox
+import gleam/list
+import gleam/string
+
+fn policy() -> sandbox.Policy {
+  sandbox.Policy(
+    docker: "docker",
+    image: "crushling-sandbox:latest",
+    runtime: "runsc-uds",
+    network: "sbx-egress",
+    cpus: "2",
+    memory: "2g",
+    pids: 1024,
+    uid: 970,
+    gid: 970,
+    root: "/storage/crushling/workspaces",
+    env: ["ANTHROPIC_BASE_URL=http://proxy"],
+  )
+}
+
+pub fn key_sanitizes_test() {
+  let assert "C0123-1699999999.000100" =
+    sandbox.key("C0123", "1699999999.000100")
+  let assert "a_b_c-d_e" = sandbox.key("a/b c", "d;e")
+  let assert 64 = string.length(sandbox.key(string.repeat("x", 100), "1"))
+}
+
+pub fn paths_test() {
+  let assert "/storage/crushling/workspaces/k/sock/crush.sock" =
+    sandbox.host_socket(policy(), "k")
+}
+
+pub fn run_args_test() {
+  let args = sandbox.run_args(policy(), "k")
+  let pairs = list.window_by_2(args)
+  let has = fn(a, b) { list.contains(pairs, #(a, b)) }
+  let assert True = has("--name", "crushling-k")
+  let assert True = has("--runtime", "runsc-uds")
+  let assert True = has("--network", "sbx-egress")
+  let assert True = has("--user", "970:970")
+  let assert True = has("--cap-drop", "ALL")
+  let assert True = has("--env", "ANTHROPIC_BASE_URL=http://proxy")
+  let assert True =
+    has("--volume", "/storage/crushling/workspaces/k/work:/workspace")
+  let assert True =
+    has("--volume", "/storage/crushling/workspaces/k/sock:/run/crushling")
+  let assert Ok("unix:///run/crushling/crush.sock") = list.last(args)
+  let assert ["run", "--detach", ..] = args
+}
+
+pub fn fingerprint_tracks_policy_test() {
+  let base = sandbox.fingerprint(policy())
+  let assert 16 = string.length(base)
+  let assert True = base == sandbox.fingerprint(policy())
+  let assert False =
+    base == sandbox.fingerprint(sandbox.Policy(..policy(), memory: "4g"))
+}
+
+pub fn decide_test() {
+  let p = policy()
+  let current = sandbox.fingerprint(p)
+  let assert sandbox.Create = sandbox.decide(sandbox.Missing, p)
+  let assert sandbox.Adopt = sandbox.decide(sandbox.Present(True, current), p)
+  let assert sandbox.Start = sandbox.decide(sandbox.Present(False, current), p)
+  let assert sandbox.Recreate = sandbox.decide(sandbox.Present(True, "old"), p)
+  let assert sandbox.Recreate = sandbox.decide(sandbox.Present(False, ""), p)
+}
+
+pub fn parse_inspect_test() {
+  let assert sandbox.Present(True, "abc") = sandbox.parse_inspect("true abc\n")
+  let assert sandbox.Present(False, "") = sandbox.parse_inspect("false \n")
+  let assert sandbox.Present(False, "") = sandbox.parse_inspect("false")
+  let assert sandbox.Missing = sandbox.parse_inspect("")
+}
+
+pub fn docker_missing_is_unavailable_test() {
+  let p = sandbox.Policy(..policy(), docker: "definitely-not-docker-xyz")
+  let assert Error(sandbox.DockerUnavailable(_)) = sandbox.observe(p, "k")
+}
+
+pub fn prepare_creates_dirs_test() {
+  let p = sandbox.Policy(..policy(), root: "/tmp/crushling-sandbox-test")
+  let assert Ok(Nil) = sandbox.prepare(p, "k")
+  let assert True = sandbox.socket_ready(sandbox.host_workspace(p, "k"))
+  let assert True = sandbox.socket_ready(sandbox.host_socket_dir(p, "k"))
+}
+
+pub fn exec_runs_without_a_shell_test() {
+  // `echo` stands in for docker: it prints its arguments, which are not an
+  // inspect result, so the container reads as missing.
+  let p = sandbox.Policy(..policy(), docker: "echo")
+  let assert Ok(sandbox.Missing) = sandbox.observe(p, "k; rm -rf /")
+}
