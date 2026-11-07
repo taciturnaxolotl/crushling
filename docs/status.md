@@ -46,8 +46,9 @@ When the agent clones a repository (`git clone` or `gh repo clone` through
 `bash`), the work moves to a code channel opened from the thread: replies go
 there, every message in it is a prompt, the context bar shows the repo,
 branch and changed files, and the Code tab holds the diff against the
-default branch. When the thread goes idle the channel is archived with the
-last reply as its summary; a later message in the thread opens a new one.
+default branch. The channel stays open while the agent sleeps; `!done` archives
+it with the last reply as its summary, and a later message in the thread
+opens a new one.
 
 A run is one message: what the agent says streams into it as it is written,
 its steps sit in a plan block in the same message, and the block settles to
@@ -97,6 +98,14 @@ own Claude Code fingerprinting (`CRUSH_CLAUDE_VERSION` is set, so no
 
 What a container can leak is an access token (hours), never the refresh
 token. With a Hyper key, the key itself sits in the container.
+
+`CRUSHLING_EXTRA_BACKENDS` adds more providers to every agent's crush.json,
+so it can run subagents on their models while it runs on its own:
+`CRUSHLING_BACKEND=hyper-key CRUSHLING_EXTRA_BACKENDS=claude` gives a Hyper
+agent Claude subagents. Each extra login gets its own `credentials` process,
+and they share the container's file under a lock.
+
+    CRUSHLING_REAL=1 CRUSHLING_TEST_EXTRA=claude gleam test   # also checks this
 
 Never give crushling the login your own crush uses: refresh tokens are
 single use, so the two would revoke each other.

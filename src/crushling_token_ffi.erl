@@ -39,7 +39,14 @@ write_login(Path, Provider, Access, Refresh, ExpiresAt, ExpiresIn) ->
 write_managed(Path, Provider, Access, ExpiresAt, ExpiresIn) ->
     write(Path, Provider, Access, <<>>, ExpiresAt, ExpiresIn).
 
+%% Each login has its own process, and several may keep tokens in the same
+%% file, so a read-modify-write holds a per-file lock.
 write(Path, Provider, Access, Refresh, ExpiresAt, ExpiresIn) ->
+    global:trans({{crushling_token_file, Path}, self()},
+                 fun() -> write_unlocked(Path, Provider, Access, Refresh, ExpiresAt, ExpiresIn) end,
+                 [node()]).
+
+write_unlocked(Path, Provider, Access, Refresh, ExpiresAt, ExpiresIn) ->
     Doc = case file:read_file(Path) of
         {ok, Bin} -> try json:decode(Bin) catch _:_ -> #{} end;
         {error, _} -> #{}

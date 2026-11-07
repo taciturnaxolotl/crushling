@@ -13,6 +13,7 @@
 //// | `CRUSHLING_LOGIN` | the backend's login crush.json; default `~/.local/state/crushling/<claude\|hyper>/crush.json` |
 //// | `CRUSH_HYPER_API_KEY` | the key, for `hyper-key` |
 //// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | models |
+//// | `CRUSHLING_EXTRA_BACKENDS` | comma-separated extra backends (`claude`, `hyper`, `hyper-key`) whose models agents can pick for subagents; each login lives at its default path |
 //// | `CRUSHLING_CLAUDE_VERSION` | Claude Code version to present; default the installed `claude`, else crush's floor |
 //// | `CRUSHLING_MODE` | `sysadmin` (default: no permission prompts and no blocked commands) or `yolo` |
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
@@ -36,7 +37,6 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/option.{None, Some}
 import gleam/result
 import gleam/set
 import gleam/string
@@ -105,14 +105,14 @@ fn start() -> Result(Nil, String) {
     }),
   )
 
-  let creds = case provider.login(backend) {
-    Some(login) ->
+  use extras <- result.try(extra_backends())
+  use creds <- result.try(
+    provider.logins(backend, extras)
+    |> list.try_map(fn(login) {
       credentials.start(login)
-      |> result.map(Some)
       |> result.map_error(fn(error) { "credentials: " <> string.inspect(error) })
-    None -> Ok(None)
-  }
-  use creds <- result.try(creds)
+    }),
+  )
 
   let root =
     expand_home(setting("CRUSHLING_ROOT", "~/.local/state/crushling/threads"))
@@ -132,7 +132,7 @@ fn start() -> Result(Nil, String) {
     "" -> launcher.no_bridge()
     url -> launcher.Bridge(url:, env: fn(key) { mcp.env(secret, key) })
   }
-  use launcher <- result.try(launcher_for(root, backend, creds, bridge))
+  use launcher <- result.try(launcher_for(root, backend, extras, creds, bridge))
 
   use registry <- result.try(
     registry.start(registry.Config(
@@ -230,12 +230,13 @@ fn allowed_users() -> Result(set.Set(String), String) {
   }
 }
 
-fn login_path(name: String) -> Result(String, String) {
+fn login_path(name: String, main: Bool) -> Result(String, String) {
+  let default = "~/.local/state/crushling/" <> name <> "/crush.json"
   let path =
-    expand_home(setting(
-      "CRUSHLING_LOGIN",
-      "~/.local/state/crushling/" <> name <> "/crush.json",
-    ))
+    expand_home(case main {
+      True -> setting("CRUSHLING_LOGIN", default)
+      False -> default
+    })
   case sandbox.socket_ready(path) {
     True -> Ok(path)
     False ->
@@ -251,35 +252,58 @@ fn login_path(name: String) -> Result(String, String) {
 }
 
 fn backend() -> Result(provider.Backend, String) {
-  case setting("CRUSHLING_BACKEND", "claude") {
+  backend_named(setting("CRUSHLING_BACKEND", "claude"), True)
+}
+
+/// Providers the agents can also pick models from for subagents, from
+/// `CRUSHLING_EXTRA_BACKENDS`.
+fn extra_backends() -> Result(List(provider.Backend), String) {
+  setting("CRUSHLING_EXTRA_BACKENDS", "")
+  |> string.split(",")
+  |> list.map(string.trim)
+  |> list.filter(fn(name) { name != "" })
+  |> list.try_map(fn(name) { backend_named(name, False) })
+}
+
+/// `main` is whether this is the main backend, which `CRUSHLING_LOGIN` and
+/// the model settings apply to.
+fn backend_named(name: String, main: Bool) -> Result(provider.Backend, String) {
+  let login_path = fn(name) { login_path(name, main) }
+  let model = fn(key, default) {
+    case main {
+      True -> setting(key, default)
+      False -> default
+    }
+  }
+  case name {
     "claude" -> {
       use login <- result.try(login_path("claude"))
       Ok(provider.Claude(
         login:,
         version: setting("CRUSHLING_CLAUDE_VERSION", installed_claude_version()),
-        large: setting("CRUSHLING_LARGE", "claude-opus-4-8"),
-        small: setting("CRUSHLING_SMALL", "claude-haiku-4-5-20251001"),
+        large: model("CRUSHLING_LARGE", "claude-opus-4-8"),
+        small: model("CRUSHLING_SMALL", "claude-haiku-4-5-20251001"),
       ))
     }
     "hyper" -> {
       use login <- result.try(login_path("hyper"))
       Ok(provider.Hyper(
         login:,
-        large: setting("CRUSHLING_LARGE", "deepseek-v4.1-flash"),
-        small: setting("CRUSHLING_SMALL", "prism-flash"),
+        large: model("CRUSHLING_LARGE", "deepseek-v4.1-flash"),
+        small: model("CRUSHLING_SMALL", "prism-flash"),
       ))
     }
     "hyper-key" -> {
       use key <- result.try(required("CRUSH_HYPER_API_KEY"))
       Ok(provider.HyperKey(
         key:,
-        large: setting("CRUSHLING_LARGE", "deepseek-v4.1-flash"),
-        small: setting("CRUSHLING_SMALL", "prism-flash"),
+        large: model("CRUSHLING_LARGE", "deepseek-v4.1-flash"),
+        small: model("CRUSHLING_SMALL", "prism-flash"),
       ))
     }
     other ->
       Error(
-        "CRUSHLING_BACKEND is " <> other <> "; use claude, hyper, or hyper-key",
+        "backend " <> other <> " is unknown; use claude, hyper, or hyper-key",
       )
   }
 }
@@ -314,7 +338,8 @@ fn mcp_secret(root: String) -> Result(String, String) {
 fn launcher_for(
   root: String,
   backend: provider.Backend,
-  creds: option.Option(process.Subject(credentials.Message)),
+  extras: List(provider.Backend),
+  creds: launcher.Credentials,
   bridge: launcher.Bridge,
 ) -> Result(launcher.Launcher, String) {
   case setting("CRUSHLING_LAUNCHER", "docker") {
@@ -322,7 +347,7 @@ fn launcher_for(
       io.println(
         "crushling: local launcher, agents run unsandboxed with your access",
       )
-      Ok(launcher.local(root, backend, creds, bridge))
+      Ok(launcher.local(root, backend, extras, creds, bridge))
     }
     "docker" -> {
       use uid <- result.try(id("-u"))
@@ -339,8 +364,8 @@ fn launcher_for(
           uid:,
           gid:,
           root:,
-          env: provider.env(backend),
-          crush_config: provider.config_with(backend, bridge.url),
+          env: provider.env_for(backend, extras),
+          crush_config: provider.config_for(backend, extras, bridge.url),
         )
       Ok(launcher.docker(policy, creds, bridge))
     }

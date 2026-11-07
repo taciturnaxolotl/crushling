@@ -11,7 +11,6 @@ import crushling/provider
 import crushling/sandbox
 import gleam/erlang/process.{type Subject}
 import gleam/list
-import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
@@ -55,21 +54,16 @@ pub fn no_bridge() -> Bridge {
 /// directory the change snapshots leave out.
 pub const attachments_dir = ".slack"
 
-type Credentials =
-  Option(Subject(credentials.Message))
+/// One process per login the agents use.
+pub type Credentials =
+  List(Subject(credentials.Message))
 
 fn watch(creds: Credentials, path: String) -> Result(Nil, String) {
-  case creds {
-    Some(creds) -> credentials.watch(creds, path)
-    None -> Ok(Nil)
-  }
+  list.try_each(creds, fn(login) { credentials.watch(login, path) })
 }
 
 fn unwatch(creds: Credentials, path: String) -> Nil {
-  case creds {
-    Some(creds) -> credentials.unwatch(creds, path)
-    None -> Nil
-  }
+  list.each(creds, fn(login) { credentials.unwatch(login, path) })
 }
 
 /// `policy.crush_config` should come from `provider.config_with` and the
@@ -136,6 +130,7 @@ fn write_private(path: String, content: String) -> Result(Nil, String)
 pub fn local(
   root: String,
   backend: provider.Backend,
+  extras: List(provider.Backend),
   creds: Credentials,
   bridge: Bridge,
 ) -> Launcher {
@@ -152,7 +147,7 @@ pub fn local(
       use _ <- result.try(mkdir_p(base <> "/home/honcho"))
       use _ <- result.try(write_private(
         config(key),
-        provider.config_with(backend, bridge.url),
+        provider.config_for(backend, extras, bridge.url),
       ))
       use _ <- result.try(watch(creds, config(key)))
       // A server left over from an earlier bridge would keep the socket;
@@ -166,7 +161,7 @@ pub fn local(
         "HONCHO_CONFIG_DIR=" <> base <> "/home/honcho",
         "CRUSH_SERVER_IDLE_TIMEOUT=31536000",
         "CRUSH_SERVER_DETACH_GRACE=120",
-        ..list.append(provider.env(backend), bridge.env(key))
+        ..list.append(provider.env_for(backend, extras), bridge.env(key))
       ]
       use os_pid <- result.try(start_server(
         socket(key),

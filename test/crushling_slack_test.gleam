@@ -33,6 +33,7 @@ pub fn command_test() {
   let assert slack.HelpCommand = slack.command(" !help ")
   let assert slack.PauseCommand = slack.command("!pause")
   let assert slack.ResumeCommand = slack.command("!Resume")
+  let assert slack.DoneCommand = slack.command("!done")
   let assert slack.SideComment = slack.command("## not for the bot")
   let assert slack.NotACommand = slack.command("stop the server")
 }
@@ -459,4 +460,35 @@ pub fn shared_files_route_like_messages_test() {
     )
   let assert Ok(registry.Incoming(thread_ts: "16.1", mention: False, ..)) =
     socket.incoming(top, "UBOT")
+}
+
+pub fn done_archives_the_code_channel_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let thread_path =
+    "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json"
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/"
+        <> registry.key("CDONE", "code")
+        <> ".json",
+      meta.Meta(..meta.new(True), origin_channel: "C9", origin_ts: "1.0"),
+    )
+  let assert Ok(Nil) =
+    meta.write(
+      thread_path,
+      meta.Meta(..meta.new(True), code_channel: "CDONE", repo: "./demo"),
+    )
+  let r = start_registry(launches)
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("CDONE", "50.0", "50.0", "U1", "!done", False, []),
+    ),
+  )
+  process.sleep(100)
+  let assert Error(Nil) = process.receive(launches, 50)
+  let assert Ok(meta.Meta(code_channel: "", repo: "./demo", ..)) =
+    meta.read(thread_path)
+  Nil
 }

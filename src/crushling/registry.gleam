@@ -423,7 +423,12 @@ fn received(state: State, incoming: Incoming) -> State {
           )
           remember(state, id)
         }
-        slack.PauseCommand, None | slack.ResumeCommand, None -> {
+        slack.DoneCommand, Some(entry) ->
+          remember(done(state, key, entry, incoming, origin), id)
+        slack.PauseCommand, None
+        | slack.ResumeCommand, None
+        | slack.DoneCommand, None
+        -> {
           whisper(config, incoming, "_I'm not working in this thread._")
           remember(state, id)
         }
@@ -870,10 +875,9 @@ fn idle_check(state: State, key: String, generation: Int) -> State {
               process.send(thread, thread.Stop)
               let stop = state.config.launcher.stop
               process.spawn_unlinked(fn() { stop(key) })
-              archive(state, key, entry)
-              |> fn(state) {
-                State(..state, threads: dict.delete(state.threads, key))
-              }
+              // A code channel stays open: going quiet isn't the work being
+              // done. `!done` archives it.
+              State(..state, threads: dict.delete(state.threads, key))
             }
           }
       }
@@ -947,6 +951,53 @@ fn archive(state: State, key: String, entry: Entry) -> State {
       let meta = Meta(..entry.meta, code_channel: "")
       let _ = meta.write(state.config.launcher.meta_path(key), meta)
       State(..state, code_channels: dict.delete(state.code_channels, code))
+    }
+  }
+}
+
+/// `!done`: archive the code channel with the last reply as its summary,
+/// and let the agent go. A later message in the thread opens a new channel.
+fn done(
+  state: State,
+  key: String,
+  entry: Entry,
+  incoming: Incoming,
+  origin: Option(#(String, String)),
+) -> State {
+  case entry.meta.code_channel, entry.in_flight > 0 || entry.preparing {
+    "", _ -> {
+      whisper(state.config, incoming, "_there's no code channel to wrap up._")
+      state
+    }
+    _, True -> {
+      whisper(
+        state.config,
+        incoming,
+        "_still working; `!stop` first, or wait for this turn to finish._",
+      )
+      state
+    }
+    _, False -> {
+      announce(
+        state.config,
+        incoming,
+        origin,
+        "_wrapping up; this channel will be archived. Mention me in the original thread to pick the work up again._",
+      )
+      let state = archive(state, key, entry)
+      let entry = Entry(..entry, meta: Meta(..entry.meta, code_channel: ""))
+      case entry.agent {
+        // Its sink posts to the channel; it starts afresh with the next
+        // message, in a new one.
+        Live(thread:, monitor:) -> {
+          process.demonitor_process(monitor)
+          process.send(thread, thread.Stop)
+          let stop = state.config.launcher.stop
+          process.spawn_unlinked(fn() { stop(key) })
+          State(..state, threads: dict.delete(state.threads, key))
+        }
+        Starting -> state
+      }
     }
   }
 }

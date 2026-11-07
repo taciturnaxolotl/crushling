@@ -120,6 +120,12 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { cloning_moves_to_a_code_channel(wiring) }),
         with_timeout(600, fn() { agent_uses_slack_tools(wiring) }),
         with_timeout(600, fn() { prompts_carry_images(wiring) }),
+        ..case env("CRUSHLING_TEST_EXTRA", "") {
+          "claude" -> [
+            with_timeout(600, fn() { subagents_use_extra_providers(wiring) }),
+          ]
+          _ -> []
+        }
       ])
     }
   }
@@ -219,6 +225,16 @@ fn setup(name: String, wiring: Wiring) -> Env {
 }
 
 fn setup_with(name: String, wiring: Wiring, bridge: launcher.Bridge) -> Env {
+  setup_full(name, wiring, bridge, [], [])
+}
+
+fn setup_full(
+  name: String,
+  wiring: Wiring,
+  bridge: launcher.Bridge,
+  extras: List(provider.Backend),
+  extra_creds: List(process.Subject(credentials.Message)),
+) -> Env {
   let dir =
     "/tmp/crushling-real-"
     <> name
@@ -237,16 +253,21 @@ fn setup_with(name: String, wiring: Wiring, bridge: launcher.Bridge) -> Env {
   let assert Ok(Nil) = mkdir_p(home <> "/data")
   let config = home <> "/data/crush.json"
   let assert Ok(Nil) =
-    write_private(config, provider.config_with(backend, bridge.url))
-  case creds {
-    Some(creds) -> {
-      let assert Ok(Nil) = credentials.watch(creds, config)
-      Nil
+    write_private(config, provider.config_for(backend, extras, bridge.url))
+  list.each([creds, ..list.map(extra_creds, Some)], fn(creds) {
+    case creds {
+      Some(creds) -> {
+        let assert Ok(Nil) = credentials.watch(creds, config)
+        Nil
+      }
+      None -> Nil
     }
-    None -> Nil
-  }
+  })
   let server_env =
-    list.append(provider.env(backend), bridge.env(string.inspect(unique())))
+    list.append(
+      provider.env_for(backend, extras),
+      bridge.env(string.inspect(unique())),
+    )
   let socket = dir <> "/crush.sock"
   let log = dir <> "/server.log"
   let server = start_server(socket, log, home, server_env)
@@ -443,7 +464,8 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
     launcher.local(
       root,
       wiring.backend,
-      wiring.credentials,
+      [],
+      option.values([wiring.credentials]),
       launcher.no_bridge(),
     )
   let launches = process.new_subject()
@@ -517,7 +539,8 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
     launcher.local(
       root,
       wiring.backend,
-      wiring.credentials,
+      [],
+      option.values([wiring.credentials]),
       launcher.no_bridge(),
     )
   let launches = process.new_subject()
@@ -911,4 +934,70 @@ fn prompts_carry_images(wiring: Wiring) -> Nil {
   let finished = await_finished(calls)
   let assert True = says(finished, "SEEN")
   process.send(t, thread.Stop)
+}
+
+/// With Claude as an extra backend, the agent can run a subagent on a
+/// Claude model while it runs on its own provider.
+fn subagents_use_extra_providers(wiring: Wiring) -> Nil {
+  let claude =
+    provider.Claude(
+      login: login_path("CRUSHLING_CLAUDE_LOGIN", "claude"),
+      version: claude_version(),
+      large: "claude-haiku-4-5-20251001",
+      small: "claude-haiku-4-5-20251001",
+    )
+  let assert Some(claude_creds) = start_credentials(claude)
+  let env =
+    setup_full("extra", wiring, launcher.no_bridge(), [claude], [
+      claude_creds,
+    ])
+  use <- guarded(_, fn() { teardown(env) })
+  let calls = process.new_subject()
+  let assert Ok(t) =
+    thread.start(thread.Config(
+      socket: env.socket,
+      root: env.work,
+      title: "crushling extra provider test",
+      sink: recording_sink(calls, False),
+      flush_ms: 250,
+      mode: client.Sysadmin,
+      repo: "",
+      in_code_channel: False,
+    ))
+  process.send(
+    t,
+    thread.Prompt(
+      "Start one subagent with agent_dispatch, label \"hello\", provider \"anthropic\", model \"claude-haiku-4-5-20251001\", and the prompt \"Reply with the word HI.\". Then reply with the word OK.",
+    ),
+  )
+  await_report(calls, False, False)
+  process.send(t, thread.Stop)
+  let providers =
+    sh(
+      env.work,
+      "for db in $(find .. -name crush.db); do sqlite3 \"$db\" \"select distinct provider from messages where role='assistant' and provider != ''\"; done",
+    )
+  let assert True = string.contains(providers, "anthropic")
+  let assert True = string.contains(providers, "hyper")
+  Nil
+}
+
+/// Wait until the subagent has reported back and the prompt's run is done,
+/// in either order.
+fn await_report(calls: Subject(SubCall), reported: Bool, done: Bool) -> Nil {
+  case reported && done {
+    True -> Nil
+    False ->
+      case process.receive(calls, 240_000) {
+        Ok(InMain(text)) ->
+          await_report(
+            calls,
+            reported || string.contains(text, "* finished _"),
+            done,
+          )
+        Ok(MainFinished(True)) -> await_report(calls, reported, True)
+        Ok(_) -> await_report(calls, reported, done)
+        Error(Nil) -> panic as "the subagent never reported back"
+      }
+  }
 }
