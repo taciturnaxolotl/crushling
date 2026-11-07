@@ -207,3 +207,25 @@ pub fn container_configs_test() {
     )
   let assert [] = provider.env(key)
 }
+
+pub fn extra_backends_add_providers_test() {
+  let main = provider.HyperKey("k", "big", "small")
+  let claude = provider.Claude("/claude.json", "2.1.300", "x", "y")
+  let config = provider.config_for(main, [claude, claude], "")
+  // Both providers are there for subagents; the agent's own models stay
+  // on the main one.
+  let assert True =
+    string.contains(
+      config,
+      "\"providers\":{\"hyper\":{\"api_key\":\"k\"},\"anthropic\":{}}",
+    )
+  let assert True =
+    string.contains(
+      config,
+      "\"large\":{\"provider\":\"hyper\",\"model\":\"big\"}",
+    )
+  let assert ["CRUSH_CLAUDE_VERSION=2.1.300"] = provider.env_for(main, [claude])
+  let assert [_] = provider.logins(main, [claude])
+  // An extra that repeats the main provider adds nothing.
+  let assert [] = provider.logins(main, [provider.HyperKey("k2", "a", "b")])
+}

@@ -589,6 +589,8 @@ pub type Command {
   /// Stop following: only mentions reach the agent until `!resume`.
   PauseCommand
   ResumeCommand
+  /// Archive the code channel: the work is done.
+  DoneCommand
   /// A `##` aside meant for the people in the thread, not the agent.
   SideComment
   NotACommand
@@ -600,13 +602,14 @@ pub fn command(prompt: String) -> Command {
     "!help" -> HelpCommand
     "!pause" -> PauseCommand
     "!resume" | "!unpause" -> ResumeCommand
+    "!done" | "!archive" -> DoneCommand
     "##" <> _ -> SideComment
     _ -> NotACommand
   }
 }
 
 pub const help =
-  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
+  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
 /// A file attached to a Slack message.
 pub type Attachment {
