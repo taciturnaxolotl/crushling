@@ -27,6 +27,7 @@ import crushling/launcher
 import crushling/mcp
 import crushling/provider
 import crushling/registry
+import crushling/registry/incoming as msg
 import crushling/render
 import crushling/run
 import crushling/sink
@@ -497,6 +498,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       meta_path: local.meta_path,
       attachments: local.attachments,
       workspace: local.workspace,
+      run_in_sandbox: local.run_in_sandbox,
     )
   use <-
     guarded(_, fn() {
@@ -519,11 +521,12 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       idle_ms: 500,
       flush_ms: 250,
       mode: client.Sysadmin,
+      tailnet: None,
     ))
   process.send(
     r,
     registry.Received(
-      registry.Incoming(
+      msg.Incoming(
         "C1",
         "10.1",
         "10.1",
@@ -573,6 +576,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       meta_path: local.meta_path,
       attachments: local.attachments,
       workspace: local.workspace,
+      run_in_sandbox: local.run_in_sandbox,
     )
   use <-
     guarded(_, fn() {
@@ -595,11 +599,12 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       idle_ms: 600_000,
       flush_ms: 250,
       mode: client.Sysadmin,
+      tailnet: None,
     ))
   process.send(
     r,
     registry.Received(
-      registry.Incoming(
+      msg.Incoming(
         "C1",
         "20.1",
         "20.1",
@@ -916,7 +921,7 @@ fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
       "127.0.0.1",
       port,
       secret,
-      slack_tools.tools(),
+      slack_tools.tools(tailnet: False),
       fn(key, name, arguments) {
         process.send(calls, #(key, name, arguments))
         Ok("posted")

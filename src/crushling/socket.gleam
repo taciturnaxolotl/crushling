@@ -1,18 +1,23 @@
 //// Socket Mode: one WebSocket to Slack, reopened whenever Slack asks or the
-//// connection drops, with every event turned into a `registry.Incoming`.
+//// connection drops, with every event turned into a `msg.Incoming`.
 
 import crushling/registry
+import crushling/registry/incoming as msg
+import crushling/registry/tailnet
 import crushling/slack
 import crushling/sys
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
+import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
 import slackline
 import slackline/api/apps
 import slackline/app
 import slackline/event
 import slackline/httpc
+import slackline/interaction
 import stratus
 
 /// The router: Slack events in, `registry.Received` out.
@@ -41,6 +46,48 @@ pub fn router(
         }
     }
   })
+  |> tailnet_buttons(registry)
+}
+
+/// The buttons on a tailnet card. The registry decides what each press
+/// does; Slack only needs to hear that it arrived.
+fn tailnet_buttons(
+  app: app.App,
+  registry: Subject(registry.Message),
+) -> app.App {
+  use app, action_id <- list.fold(tailnet.action_ids(), app)
+  use action, payload <- app.action(app, action_id)
+  case pressed(action, payload) {
+    Ok(message) -> process.send(registry, message)
+    Error(Nil) -> Nil
+  }
+  app.ack()
+}
+
+/// A button press on a tailnet card, as a registry message.
+pub fn pressed(
+  action: interaction.BlockAction,
+  payload: interaction.BlockActionsPayload,
+) -> Result(registry.Message, Nil) {
+  use #(action_id, value) <- result.try(case action {
+    interaction.ButtonAction(action_id:, value: Some(value), ..) ->
+      Ok(#(action_id, value))
+    _ -> Error(Nil)
+  })
+  use #(choice, channel, thread_ts) <- result.try(tailnet.read_button(
+    action_id,
+    value,
+  ))
+  use card <- result.map(case payload.container {
+    Some(interaction.MessageContainer(message_ts:, channel_id:, thread_ts:, ..)) ->
+      tailnet.card(channel_id, message_ts, thread_ts)
+    _ -> Error(Nil)
+  })
+  let user = payload.user.id
+  registry.Tailnet(
+    registry.key(channel, thread_ts),
+    tailnet.Pressed(choice:, channel:, thread_ts:, user:, card:),
+  )
 }
 
 /// The messages worth routing: mentions, thread replies, direct messages,
@@ -49,7 +96,7 @@ pub fn router(
 pub fn incoming(
   event: event.Event,
   bot_user: String,
-) -> Result(registry.Incoming, Nil) {
+) -> Result(msg.Incoming, Nil) {
   let mentions_bot = fn(text) { string.contains(text, "<@" <> bot_user <> ">") }
   case event {
     event.AppMention(
@@ -63,7 +110,7 @@ pub fn incoming(
       files:,
       ..,
     ) ->
-      Ok(registry.Incoming(
+      Ok(msg.Incoming(
         channel:,
         thread_ts: option.unwrap(thread_ts, ts),
         ts:,
@@ -88,7 +135,7 @@ pub fn incoming(
         True, _, _ -> Error(Nil)
         // A direct message starts a thread, as a mention would.
         False, _, Some(event.Im) ->
-          Ok(registry.Incoming(
+          Ok(msg.Incoming(
             channel:,
             thread_ts: option.unwrap(thread_ts, ts),
             ts:,
@@ -98,7 +145,7 @@ pub fn incoming(
             files: slack.attachments(files),
           ))
         False, Some(root), _ ->
-          Ok(registry.Incoming(
+          Ok(msg.Incoming(
             channel:,
             thread_ts: root,
             ts:,
@@ -110,7 +157,7 @@ pub fn incoming(
         // Top-level chatter, which only reaches the agent in one of its
         // code channels.
         False, None, _ ->
-          Ok(registry.Incoming(
+          Ok(msg.Incoming(
             channel:,
             thread_ts: ts,
             ts:,
@@ -137,7 +184,7 @@ pub fn incoming(
         // A mention arrives as app_mention too.
         True, _, _ -> Error(Nil)
         _, _, _ ->
-          Ok(registry.Incoming(
+          Ok(msg.Incoming(
             channel:,
             thread_ts: option.unwrap(thread_ts, ts),
             ts:,

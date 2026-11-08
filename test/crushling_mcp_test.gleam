@@ -5,11 +5,12 @@ import crushling/slack_tools
 import gleam/dict
 import gleam/dynamic/decode
 import gleam/json
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 
 fn tools() {
-  slack_tools.tools()
+  slack_tools.tools(tailnet: False)
 }
 
 fn fake(key, name, arguments) {
@@ -123,4 +124,12 @@ pub fn settled_messages_test() {
   let r = run.apply(r, dict.new(), assistant("m2", "found it"))
   let assert [#("m1", "looking around")] = run.messages(r, False)
   let assert [_, #("m2", "found it")] = run.messages(r, True)
+}
+
+pub fn the_tailnet_tool_is_offered_only_when_set_up_test() {
+  let names = fn(tailnet) {
+    slack_tools.tools(tailnet:) |> list.map(fn(tool) { tool.name })
+  }
+  let assert False = list.contains(names(False), "request_tailnet")
+  let assert True = list.contains(names(True), "request_tailnet")
 }

@@ -22,6 +22,10 @@
 //// | `CRUSHLING_SHUTDOWN_GRACE_SECONDS` | on SIGTERM, how long running turns get to finish before they are cancelled; default 60 |
 //// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc-uds`, `sbx-egress` |
 //// | `CRUSHLING_MCP_PORT`, `CRUSHLING_MCP_BIND` | where the agents' Slack tools are served; default `7469` on `127.0.0.1` |
+//// | `CRUSHLING_TAILSCALE_CLIENT_ID`, `CRUSHLING_TAILSCALE_CLIENT_SECRET` | an OAuth client with the `auth_keys` scope that owns the tag; with it, people can put a thread's sandbox on the tailnet for a while |
+//// | `CRUSHLING_TAILSCALE_API_KEY` | an API access token, instead of the OAuth client |
+//// | `CRUSHLING_TAILSCALE_TAG` | the tag sandboxes join with; default `tag:crushling` |
+//// | `CRUSHLING_TAILSCALE_TAILNET` | the tailnet's name; default `-`, the credential's own |
 //// | `CRUSHLING_MCP_URL` | how an agent reaches them; default `http://127.0.0.1:<port>` for `local`, none for `docker` (set it to an address the sandbox network may reach, or `off`) |
 
 import crushling/credentials
@@ -30,14 +34,17 @@ import crushling/launcher
 import crushling/mcp
 import crushling/provider
 import crushling/registry
+import crushling/registry/tailnet
 import crushling/sandbox
 import crushling/slack_tools
 import crushling/socket
 import crushling/sys
+import crushling/tailscale
 import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/option
 import gleam/result
 import gleam/set
 import gleam/string
@@ -134,6 +141,7 @@ fn start() -> Result(Nil, String) {
     url -> launcher.Bridge(url:, env: fn(key) { mcp.env(secret, key) })
   }
   use launcher <- result.try(launcher_for(root, backend, extras, creds, bridge))
+  let tailnet = tailnet(launcher)
 
   use registry <- result.try(
     registry.start(registry.Config(
@@ -146,6 +154,7 @@ fn start() -> Result(Nil, String) {
       idle_ms: idle_minutes * 60_000,
       flush_ms: 1000,
       mode:,
+      tailnet:,
     ))
     |> result.map_error(fn(error) { "registry: " <> string.inspect(error) }),
   )
@@ -177,13 +186,18 @@ fn start() -> Result(Nil, String) {
           lookup: fn(key) {
             process.call(registry, 5000, registry.Lookup(key, _))
           },
+          ask_tailnet: fn(key, reason) {
+            process.call(registry, 5000, fn(reply) {
+              registry.Tailnet(key, tailnet.Asked(reason, reply))
+            })
+          },
         )
       use _ <- result.map(
         mcp.start(
           setting("CRUSHLING_MCP_BIND", "127.0.0.1"),
           port,
           secret,
-          slack_tools.tools(),
+          slack_tools.tools(tailnet: tailnet != option.None),
           fn(key, name, arguments) {
             slack_tools.call(context, key, name, arguments)
           },
@@ -378,5 +392,31 @@ fn id(flag: String) -> Result(Int, String) {
       int.parse(string.trim(output))
       |> result.replace_error("unexpected output from id " <> flag)
     _ -> Error("could not run id " <> flag)
+  }
+}
+
+/// Tailnet access, when a Tailscale credential is set and agents run in
+/// sandboxes.
+fn tailnet(launcher: launcher.Launcher) -> option.Option(tailnet.Setup) {
+  let credential = case
+    getenv("CRUSHLING_TAILSCALE_CLIENT_ID"),
+    getenv("CRUSHLING_TAILSCALE_CLIENT_SECRET"),
+    getenv("CRUSHLING_TAILSCALE_API_KEY")
+  {
+    Ok(id), Ok(secret), _ -> Ok(tailscale.OAuthClient(id:, secret:))
+    _, _, Ok(key) -> Ok(tailscale.ApiKey(key))
+    _, _, _ -> Error(Nil)
+  }
+  case credential, launcher.run_in_sandbox {
+    Ok(credential), option.Some(run) ->
+      option.Some(tailnet.Setup(
+        api: tailscale.Config(
+          credential:,
+          tag: setting("CRUSHLING_TAILSCALE_TAG", "tag:crushling"),
+          tailnet: setting("CRUSHLING_TAILSCALE_TAILNET", "-"),
+        ),
+        run:,
+      ))
+    _, _ -> option.None
   }
 }
