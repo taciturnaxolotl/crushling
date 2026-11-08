@@ -15,7 +15,14 @@
 import crushling/crush/client
 import crushling/launcher.{type Launcher}
 import crushling/meta.{type Link, type Meta, Link, Meta}
+import crushling/registry/entry.{
+  type Entry, Entry, Live, Starting, already_read, is_quiet, new as new_entry,
+  tailnet_view,
+}
+import crushling/registry/incoming.{type Incoming, Incoming, is_dm}
 import crushling/registry/links.{type Links}
+import crushling/registry/prompt
+import crushling/registry/tailnet
 import crushling/sandbox
 import crushling/slack
 import crushling/sys
@@ -47,22 +54,8 @@ pub type Config {
     idle_ms: Int,
     flush_ms: Int,
     mode: client.PermissionMode,
-  )
-}
-
-/// A Slack message, reduced to what routing needs.
-pub type Incoming {
-  Incoming(
-    channel: String,
-    /// The thread's root; the message's own ts when it starts a thread.
-    thread_ts: String,
-    ts: String,
-    user: String,
-    text: String,
-    /// Whether the bot was mentioned (or messaged directly), which may
-    /// start a thread and always reaches the agent.
-    mention: Bool,
-    files: List(slack.Attachment),
+    /// How to put sandboxes on the tailnet, if anyone may.
+    tailnet: Option(tailnet.Setup),
   )
 }
 
@@ -92,37 +85,11 @@ pub type Message {
   ShutdownFinal
   IdleCheck(key: String, generation: Int)
   ThreadDown(process.Down)
+  /// Something about tailnet access for the thread `key`.
+  Tailnet(key: String, event: tailnet.Event)
   /// The thread actor for `key`, if its agent is up: for the agent's own
   /// Slack tools.
   Lookup(key: String, reply: Subject(Option(Subject(thread.Message))))
-}
-
-type Agent {
-  /// The agent is launching.
-  Starting
-  Live(thread: Subject(thread.Message), monitor: process.Monitor)
-}
-
-type Entry {
-  Entry(
-    channel: String,
-    thread_ts: String,
-    generation: Int,
-    agent: Agent,
-    meta: Meta,
-    /// Prompts sent and not yet finished.
-    in_flight: Int,
-    /// Messages waiting to be prepared, oldest first.
-    backlog: List(Incoming),
-    /// Whether one is being prepared now; they are prepared one at a time
-    /// so each catches up from where the last left off.
-    preparing: Bool,
-    /// The last reply posted, to keep as a code channel's summary when it
-    /// is archived.
-    summary_ts: String,
-    /// True while the thread says it is busy.
-    working: Bool,
-  )
 }
 
 type State {
@@ -141,6 +108,7 @@ type State {
     generation: Int,
     /// Set once shutdown begins: who to tell when it is done.
     stopping: Option(Subject(Nil)),
+    tailnets: tailnet.Tailnets,
   )
 }
 
@@ -151,9 +119,6 @@ const restart_note =
   "crushling restarted, so this run was stopped. Send a follow-up to carry on."
 
 const seen_limit = 1000
-
-/// How many earlier thread messages a prompt carries at most.
-const catch_up_limit = 10
 
 /// How long a held-back message waits before it is tried again, and the most
 /// tries it gets.
@@ -176,6 +141,15 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       seen: [],
       generation: 0,
       stopping: None,
+      tailnets: tailnet.new(
+        config.tailnet,
+        config.client,
+        config.allowed,
+        fn(key, event, after_ms) {
+          process.send_after(self, after_ms, Tailnet(key, event))
+          Nil
+        },
+      ),
     )
     |> actor.initialised
     |> actor.selecting(selector)
@@ -189,10 +163,6 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
 
 pub fn key(channel: String, thread_ts: String) -> String {
   sandbox.key(channel, thread_ts)
-}
-
-fn is_dm(channel: String) -> Bool {
-  string.starts_with(channel, "D")
 }
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
@@ -249,6 +219,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     IdleCheck(key, generation) ->
       actor.continue(idle_check(state, key, generation))
     ThreadDown(down) -> actor.continue(thread_down(state, down))
+    Tailnet(key, event) -> actor.continue(on_tailnet(state, key, event))
     Lookup(key, reply) -> {
       process.send(reply, case dict.get(state.threads, key) {
         Ok(Entry(agent: Live(thread:, ..), ..)) -> Some(thread)
@@ -284,32 +255,6 @@ fn entry_for(
           ))
       }
     }
-  }
-}
-
-fn new_entry(channel: String, thread_ts: String, meta: Meta) -> Entry {
-  Entry(
-    channel:,
-    thread_ts:,
-    generation: 0,
-    agent: Starting,
-    meta:,
-    in_flight: 0,
-    backlog: [],
-    preparing: False,
-    summary_ts: "",
-    working: False,
-  )
-}
-
-/// Whether the agent has already read a message: it is no newer than the
-/// last prompt, so it was that prompt or part of its catch-up. Slack can
-/// deliver an event late, such as one sent while crushling was restarting.
-fn already_read(known: Option(Entry), ts: String) -> Bool {
-  case known {
-    Some(Entry(meta: Meta(cursor:, ..), ..)) if cursor != "" ->
-      slack.ts_value(ts) <=. slack.ts_value(cursor)
-    _ -> False
   }
 }
 
@@ -432,9 +377,34 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       whisper(config, route.incoming, "_nothing is running in this thread._")
       state
     }
+    slack.TailnetCommand(on: True), Some(entry) -> {
+      let #(tailnets, asked) =
+        tailnet.ask(
+          state.tailnets,
+          route.key,
+          tailnet_view(entry),
+          route.incoming.user,
+          "",
+        )
+      let state = State(..state, tailnets:)
+      case asked {
+        Ok(_) -> Nil
+        Error(reason) -> whisper(config, route.incoming, "_" <> reason <> "._")
+      }
+      state
+    }
+    slack.TailnetCommand(on: False), Some(entry) ->
+      tailnet.end(
+        state.tailnets,
+        route.key,
+        tailnet_view(entry),
+        "_<@" <> route.incoming.user <> "> took the sandbox off the tailnet._",
+      )
+      |> apply_tailnet(state, route.key, Some(entry), _)
     slack.PauseCommand, None
     | slack.ResumeCommand, None
     | slack.DoneCommand, None
+    | slack.TailnetCommand(..), None
     -> {
       whisper(config, route.incoming, "_I'm not working in this thread._")
       state
@@ -601,6 +571,10 @@ fn started(
           let entry = Entry(..entry, agent: Live(thread:, monitor:))
           State(..state, threads: dict.insert(state.threads, key, entry))
           |> pump(key)
+          |> fn(state) {
+            tailnet.check(state.tailnets, key, tailnet_view(entry), None)
+            |> apply_tailnet(state, key, Some(entry), _)
+          }
         }
       }
     _, Ok(thread) -> {
@@ -649,7 +623,14 @@ fn prepare_next(
         False -> ""
       }
       process.spawn_unlinked(fn() {
-        let prompt = prepare(config, key, next, cursor, catch_up)
+        let source =
+          prompt.Source(
+            config.client,
+            config.token,
+            config.bot_user,
+            config.launcher.attachments(key),
+          )
+        let prompt = prompt.build(source, next, cursor, catch_up)
         process.send(self, Prepared(key, next.ts, prompt))
       })
       let entry = Entry(..entry, backlog: rest, preparing: True)
@@ -662,46 +643,6 @@ fn prepare_next(
 /// The prompt for `incoming`: what was said since `cursor`, who is asking,
 /// the request, and any attached files. `catch_up` is the thread to catch
 /// up on, or "" for the whole of a code channel.
-fn prepare(
-  config: Config,
-  key: String,
-  incoming: Incoming,
-  cursor: String,
-  catch_up: String,
-) -> thread.Message {
-  let request = slack.prompt_text(incoming.text, config.bot_user)
-  let first =
-    catch_up != "" && incoming.ts == incoming.thread_ts && cursor == ""
-  let slack.CatchUp(text: context, earlier:) = case first {
-    // The thread's first message: nothing came before.
-    True -> slack.CatchUp("", [])
-    False ->
-      slack.catch_up(
-        config.client,
-        incoming.channel,
-        catch_up,
-        cursor,
-        incoming.ts,
-        config.bot_user,
-        catch_up_limit,
-      )
-  }
-  let dirs = config.launcher.attachments(key)
-  let #(earlier_files, earlier_seen) =
-    slack.save_earlier_attachments(config.token, earlier, dirs)
-  let #(files, seen) =
-    slack.save_attachments(config.token, incoming.files, incoming.ts, dirs)
-  let from = case is_dm(incoming.channel) {
-    True -> ""
-    False -> "From <@" <> incoming.user <> ">:\n"
-  }
-  let prompt =
-    [context, earlier_files, from <> request, files]
-    |> list.filter(fn(part) { string.trim(part) != "" })
-    |> string.join("\n\n")
-  thread.Prompt(prompt, list.append(earlier_seen, seen), incoming.user)
-}
-
 fn prepared(
   state: State,
   key: String,
@@ -789,7 +730,8 @@ fn finish_shutdown(state: State) -> actor.Next(State, Message) {
       })
       done
     })
-  // Agents stop in parallel; each waits for its own process to exit.
+  // Agents stop in parallel. A stopped sandbox's ephemeral node leaves
+  // the tailnet with it.
   list.each(stoppers, fn(done) {
     let _ = process.receive(done, 30_000)
     Nil
@@ -833,14 +775,6 @@ fn from_thread(state: State, key: String, notice: thread.Notice) -> State {
   }
 }
 
-/// True when the thread is idle and nothing is waiting for it.
-fn is_quiet(entry: Entry) -> Bool {
-  entry.in_flight == 0
-  && !entry.preparing
-  && entry.backlog == []
-  && !entry.working
-}
-
 /// Store the entry. If the thread is now quiet, start its idle timer. A later
 /// change to the generation cancels the timer.
 fn idle_soon(state: State, key: String, entry: Entry) -> State {
@@ -862,20 +796,14 @@ fn idle_soon(state: State, key: String, entry: Entry) -> State {
 
 fn idle_check(state: State, key: String, generation: Int) -> State {
   case dict.get(state.threads, key) {
-    Ok(Entry(agent: Live(thread:, monitor:), ..) as entry)
-      if entry.generation == generation
-    ->
+    Ok(Entry(agent: Live(..), ..) as entry) if entry.generation == generation ->
       case is_quiet(entry) {
         False -> state
         True -> {
           sys.info("crushling: " <> key <> " is idle; stopping its agent")
-          process.demonitor_process(monitor)
-          process.send(thread, thread.Stop)
-          let stop = state.config.launcher.stop
-          process.spawn_unlinked(fn() { stop(key) })
           // A code channel stays open: going quiet isn't the work being
           // done. `!done` archives it.
-          State(..state, threads: dict.delete(state.threads, key))
+          stop_agent(state, key)
         }
       }
     _ -> state
@@ -937,25 +865,21 @@ fn done(state: State, route: Route, entry: Entry) -> State {
             sys.warn("crushling: archiving " <> code <> " failed: " <> reason)
         }
       })
-      let state =
-        set_meta(
-          state,
-          key,
-          entry,
-          Meta(..entry.meta, venue: venue.Archived(repo)),
-        )
-      case entry.agent {
-        // Its sink posts to the old channel. The next message starts a new
-        // agent in a new channel.
-        Live(thread:, monitor:) -> {
-          process.demonitor_process(monitor)
-          process.send(thread, thread.Stop)
-          let stop = state.config.launcher.stop
-          process.spawn_unlinked(fn() { stop(key) })
-          State(..state, threads: dict.delete(state.threads, key))
-        }
-        Starting -> state
-      }
+      // Its sink posts to the old channel. The next message starts a new
+      // agent in a new channel.
+      tailnet.end(
+        state.tailnets,
+        key,
+        tailnet_view(entry),
+        "_The tailnet access ended with the channel._",
+      )
+      |> apply_tailnet(state, key, Some(entry), _)
+      |> set_meta(
+        key,
+        entry,
+        Meta(..entry.meta, venue: venue.Archived(repo), tailnet: None),
+      )
+      |> stop_agent(key)
     }
     venue.CodeChannel(..), False -> {
       whisper(
@@ -992,5 +916,55 @@ fn thread_down(state: State, down: process.Down) -> State {
       )
     })
   })
-  State(..state, threads: dict.drop(state.threads, dict.keys(gone)))
+  // Its container may still be running, and on the tailnet.
+  dict.fold(gone, state, fn(state, key, _) { stop_agent(state, key) })
+}
+
+/// Stop a running agent and its container, keeping its workspace.
+fn stop_agent(state: State, key: String) -> State {
+  case dict.get(state.threads, key) {
+    Ok(Entry(agent: Live(thread:, monitor:), ..)) -> {
+      process.demonitor_process(monitor)
+      process.send(thread, thread.Stop)
+      let stop = state.config.launcher.stop
+      process.spawn_unlinked(fn() { stop(key) })
+      let tailnets = tailnet.stopped(state.tailnets, key)
+      State(..state, threads: dict.delete(state.threads, key), tailnets:)
+    }
+    _ -> state
+  }
+}
+
+fn on_tailnet(state: State, key: String, event: tailnet.Event) -> State {
+  let entry = case event {
+    tailnet.Pressed(channel:, thread_ts:, ..) ->
+      entry_for(state, key, channel, thread_ts)
+    _ -> dict.get(state.threads, key) |> option.from_result
+  }
+  tailnet.handle(state.tailnets, key, option.map(entry, tailnet_view), event)
+  |> apply_tailnet(state, key, entry, _)
+}
+
+fn apply_tailnet(
+  state: State,
+  key: String,
+  entry: Option(Entry),
+  outcome: tailnet.Outcome,
+) -> State {
+  let state = State(..state, tailnets: outcome.tailnets)
+  let state = case outcome.grant, entry {
+    tailnet.Granted(grant), Some(entry) ->
+      set_meta(state, key, entry, Meta(..entry.meta, tailnet: Some(grant)))
+    tailnet.Revoked, Some(entry) ->
+      set_meta(state, key, entry, Meta(..entry.meta, tailnet: None))
+    _, _ -> state
+  }
+  case outcome.note, dict.get(state.threads, key) {
+    Some(#(text, from)), Ok(Entry(agent: Live(thread:, ..), ..) as entry) -> {
+      process.send(thread, thread.Prompt(text, [], from))
+      let entry = Entry(..entry, in_flight: entry.in_flight + 1)
+      State(..state, threads: dict.insert(state.threads, key, entry))
+    }
+    _, _ -> state
+  }
 }

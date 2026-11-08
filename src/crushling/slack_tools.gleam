@@ -38,6 +38,9 @@ pub type Context {
     launcher: Launcher,
     /// The thread actor for a key, if its agent is up.
     lookup: fn(String) -> Option(Subject(thread.Message)),
+    /// Ask the people in a thread to put its sandbox on the tailnet, with
+    /// the agent's reason.
+    ask_tailnet: fn(String, String) -> Result(String, String),
   )
 }
 
@@ -71,7 +74,33 @@ fn schema(
   ])
 }
 
-pub fn tools() -> List(mcp.Tool) {
+/// The tools an agent gets. `tailnet` says whether it may ask to be put on
+/// the tailnet.
+pub fn tools(tailnet tailnet: Bool) -> List(mcp.Tool) {
+  case tailnet {
+    True -> [tailnet_tool(), ..common_tools()]
+    False -> common_tools()
+  }
+}
+
+fn tailnet_tool() -> mcp.Tool {
+  mcp.Tool(
+    "request_tailnet",
+    "Ask the people in this conversation to put your sandbox on their tailnet for a while, so you can reach their machines over ssh or HTTP. They get Allow and Deny buttons in Slack. Ask only when the task needs one of their machines, and say which and why. The call returns at once. If someone allows it, a later message tells you how to connect, so don't wait for it.",
+    schema(
+      [
+        #(
+          "reason",
+          "string",
+          "Which machines you need and why, in a sentence or two.",
+        ),
+      ],
+      ["reason"],
+    ),
+  )
+}
+
+fn common_tools() -> List(mcp.Tool) {
   [
     mcp.Tool(
       "read_conversation",
@@ -228,6 +257,11 @@ pub fn call(
         string_arg(arguments, "path"),
         string_arg(arguments, "comment"),
       )
+    "request_tailnet" ->
+      case string_arg(arguments, "reason") {
+        "" -> Error("say which machines you need and why")
+        reason -> context.ask_tailnet(key, reason)
+      }
     "open_code_channel" -> {
       use opened <- result.try(
         ask(thread, thread.OpenCodeChannel(

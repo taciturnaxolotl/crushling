@@ -570,6 +570,9 @@ pub type Command {
   ResumeCommand
   /// Archive the code channel: the work is done.
   DoneCommand
+  /// `!tailnet` asks to put the sandbox on the tailnet; `!tailnet off`
+  /// takes it off.
+  TailnetCommand(on: Bool)
   /// A `##` aside meant for the people in the thread, not the agent.
   SideComment
   NotACommand
@@ -582,13 +585,15 @@ pub fn command(prompt: String) -> Command {
     "!pause" -> PauseCommand
     "!resume" | "!unpause" -> ResumeCommand
     "!done" | "!archive" -> DoneCommand
+    "!tailnet" | "!tailscale" -> TailnetCommand(on: True)
+    "!tailnet off" | "!tailscale off" -> TailnetCommand(on: False)
     "##" <> _ -> SideComment
     _ -> NotACommand
   }
 }
 
 pub const help =
-  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
+  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
 /// A file attached to a Slack message.
 pub type Attachment {

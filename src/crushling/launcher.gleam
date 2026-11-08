@@ -11,6 +11,7 @@ import crushling/provider
 import crushling/sandbox
 import gleam/erlang/process.{type Subject}
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
@@ -37,6 +38,11 @@ pub type Launcher {
     /// Where Slack attachments are saved: the host directory, and the same
     /// directory relative to the agent's workspace.
     attachments: fn(String) -> #(String, String),
+    /// Run a script in a thread's sandbox, with extra `NAME=value` pairs.
+    /// The local launcher has no sandbox.
+    run_in_sandbox: Option(
+      fn(String, List(String), String) -> Result(String, String),
+    ),
   )
 }
 
@@ -96,6 +102,10 @@ pub fn docker(
         attachments_dir,
       )
     },
+    run_in_sandbox: Some(fn(key, env, script) {
+      sandbox.run_in(policy, key, env, script)
+      |> result.map_error(string.inspect)
+    }),
   )
 }
 
@@ -182,5 +192,6 @@ pub fn local(
     attachments: fn(key) {
       #(dir(key) <> "/work/" <> attachments_dir, attachments_dir)
     },
+    run_in_sandbox: None,
   )
 }

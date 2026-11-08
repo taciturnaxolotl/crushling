@@ -2,15 +2,20 @@ import crushling/crush/client
 import crushling/launcher
 import crushling/meta
 import crushling/registry
+import crushling/registry/incoming as msg
+import crushling/registry/tailnet
 import crushling/slack
 import crushling/snapshot
 import crushling/socket
+import crushling/tailscale
 import crushling/thread
 import crushling/venue
 import gleam/erlang/process
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/set
+import gleam/string
 import slackline
 import slackline/app
 import slackline/event
@@ -51,21 +56,14 @@ pub fn mention_starts_a_thread_test() {
     decode_event(
       "{\"type\":\"app_mention\",\"user\":\"U1\",\"text\":\"<@UBOT> hi\",\"ts\":\"10.1\",\"channel\":\"C1\",\"event_ts\":\"10.1\"}",
     )
-  let assert Ok(registry.Incoming(
-    "C1",
-    "10.1",
-    "10.1",
-    "U1",
-    "<@UBOT> hi",
-    True,
-    [],
-  )) = socket.incoming(mention, "UBOT")
+  let assert Ok(msg.Incoming("C1", "10.1", "10.1", "U1", "<@UBOT> hi", True, [])) =
+    socket.incoming(mention, "UBOT")
 
   let in_thread =
     decode_event(
       "{\"type\":\"app_mention\",\"user\":\"U1\",\"text\":\"<@UBOT> hi\",\"ts\":\"11.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\"}",
     )
-  let assert Ok(registry.Incoming(thread_ts: "10.1", ts: "11.1", ..)) =
+  let assert Ok(msg.Incoming(thread_ts: "10.1", ts: "11.1", ..)) =
     socket.incoming(in_thread, "UBOT")
 }
 
@@ -74,7 +72,7 @@ pub fn thread_replies_route_test() {
     decode_event(
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"more\",\"ts\":\"12.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
     )
-  let assert Ok(registry.Incoming("C1", "10.1", "12.1", "U1", "more", False, [])) =
+  let assert Ok(msg.Incoming("C1", "10.1", "12.1", "U1", "more", False, [])) =
     socket.incoming(reply, "UBOT")
 
   // The app_mention for the same message is the one that counts.
@@ -90,12 +88,8 @@ pub fn thread_replies_route_test() {
     )
   // Routed in case it is in a code channel; the registry drops it
   // anywhere else.
-  let assert Ok(registry.Incoming(
-    thread_ts: "13.1",
-    ts: "13.1",
-    mention: False,
-    ..,
-  )) = socket.incoming(top_level, "UBOT")
+  let assert Ok(msg.Incoming(thread_ts: "13.1", ts: "13.1", mention: False, ..)) =
+    socket.incoming(top_level, "UBOT")
 
   let from_bot =
     decode_event(
@@ -109,7 +103,7 @@ pub fn direct_messages_start_threads_test() {
     decode_event(
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"hi\",\"ts\":\"20.1\",\"channel\":\"D1\",\"channel_type\":\"im\"}",
     )
-  let assert Ok(registry.Incoming("D1", "20.1", "20.1", "U1", "hi", True, [])) =
+  let assert Ok(msg.Incoming("D1", "20.1", "20.1", "U1", "hi", True, [])) =
     socket.incoming(dm, "UBOT")
 }
 
@@ -121,6 +115,13 @@ type Launch {
 /// A registry whose launcher always fails, so no agent is ever needed,
 /// and whose Slack calls go nowhere.
 fn start_registry(launches: process.Subject(Launch)) {
+  start_registry_with(launches, None)
+}
+
+fn start_registry_with(
+  launches: process.Subject(Launch),
+  tailnet: Option(tailnet.Setup),
+) {
   let assert Ok(client) =
     slackline.new("xoxb-test")
     |> slackline.with_base_url("http://127.0.0.1:1/api")
@@ -139,6 +140,7 @@ fn start_registry(launches: process.Subject(Launch)) {
       attachments: fn(key) {
         #("/tmp/crushling-registry-test/" <> key, ".slack")
       },
+      run_in_sandbox: None,
     )
   let assert Ok(r) =
     registry.start(registry.Config(
@@ -151,14 +153,13 @@ fn start_registry(launches: process.Subject(Launch)) {
       idle_ms: 50,
       flush_ms: 50,
       mode: client.Sysadmin,
+      tailnet:,
     ))
   r
 }
 
 fn message(user: String, ts: String, text: String, mention: Bool) {
-  registry.Received(
-    registry.Incoming("C1", "10.1", ts, user, text, mention, []),
-  )
+  registry.Received(msg.Incoming("C1", "10.1", ts, user, text, mention, []))
 }
 
 pub fn registry_routing_test() {
@@ -197,18 +198,14 @@ pub fn replies_resume_threads_from_before_a_restart_test() {
   // C9's thread has a workspace on disk, but this registry never saw it.
   process.send(
     r,
-    registry.Received(
-      registry.Incoming("C9", "1.0", "5.0", "U1", "more", False, []),
-    ),
+    registry.Received(msg.Incoming("C9", "1.0", "5.0", "U1", "more", False, [])),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
   let assert True = key == registry.key("C9", "1.0")
   // A reply in a thread with no workspace is still ignored.
   process.send(
     r,
-    registry.Received(
-      registry.Incoming("C8", "1.0", "5.0", "U1", "more", False, []),
-    ),
+    registry.Received(msg.Incoming("C8", "1.0", "5.0", "U1", "more", False, [])),
   )
   let assert Error(Nil) = process.receive(launches, 100)
   Nil
@@ -250,9 +247,7 @@ pub fn follow_mode_test() {
     )
   let r = start_registry(launches)
   let reply = fn(ts, text, mention) {
-    registry.Received(
-      registry.Incoming("C7", "1.0", ts, "U1", text, mention, []),
-    )
+    registry.Received(msg.Incoming("C7", "1.0", ts, "U1", text, mention, []))
   }
   // A plain reply is chatter for the next turn, not a prompt.
   process.send(r, reply("4.0", "just talking", False))
@@ -265,7 +260,7 @@ pub fn follow_mode_test() {
   process.send(
     r,
     registry.Received(
-      registry.Incoming("C6", "2.0", "2.0", "U1", "<@UBOT> go", True, []),
+      msg.Incoming("C6", "2.0", "2.0", "U1", "<@UBOT> go", True, []),
     ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
@@ -275,7 +270,7 @@ pub fn follow_mode_test() {
   process.send(
     r,
     registry.Received(
-      registry.Incoming("C5", "2.0", "2.5", "U1", "<@UBOT> hi", True, []),
+      msg.Incoming("C5", "2.0", "2.5", "U1", "<@UBOT> hi", True, []),
     ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
@@ -300,7 +295,7 @@ pub fn code_channel_messages_reach_their_thread_test() {
   process.send(
     r,
     registry.Received(
-      registry.Incoming("C4", "8.0", "8.0", "U1", "hello all", False, []),
+      msg.Incoming("C4", "8.0", "8.0", "U1", "hello all", False, []),
     ),
   )
   let assert Error(Nil) = process.receive(launches, 100)
@@ -309,7 +304,7 @@ pub fn code_channel_messages_reach_their_thread_test() {
   process.send(
     r,
     registry.Received(
-      registry.Incoming("CCODE", "9.0", "9.0", "U1", "now the tests", False, []),
+      msg.Incoming("CCODE", "9.0", "9.0", "U1", "now the tests", False, []),
     ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
@@ -360,9 +355,7 @@ pub fn pause_and_resume_test() {
   let assert Ok(Nil) = meta.write(path, meta.new(True))
   let r = start_registry(launches)
   let say = fn(ts, text, mention) {
-    registry.Received(
-      registry.Incoming("C9", "1.0", ts, "U1", text, mention, []),
-    )
+    registry.Received(msg.Incoming("C9", "1.0", ts, "U1", text, mention, []))
   }
   // Pausing a thread that is asleep only changes what it listens to.
   process.send(r, say("2.0", "!pause", False))
@@ -407,14 +400,14 @@ pub fn paused_code_channels_need_a_mention_test() {
   process.send(
     r,
     registry.Received(
-      registry.Incoming("CPAUSE", "9.0", "9.0", "U1", "hey", False, []),
+      msg.Incoming("CPAUSE", "9.0", "9.0", "U1", "hey", False, []),
     ),
   )
   let assert Error(Nil) = process.receive(launches, 100)
   process.send(
     r,
     registry.Received(
-      registry.Incoming("CPAUSE", "9.1", "9.1", "U1", "<@UBOT> hey", True, []),
+      msg.Incoming("CPAUSE", "9.1", "9.1", "U1", "<@UBOT> hey", True, []),
     ),
   )
   let assert Ok(Launched(_)) = process.receive(launches, 1000)
@@ -434,9 +427,7 @@ pub fn the_seeded_request_is_not_run_twice_test() {
     )
   let r = start_registry(launches)
   let say = fn(ts, text, mention) {
-    registry.Received(
-      registry.Incoming("CSEED", ts, ts, "U1", text, mention, []),
-    )
+    registry.Received(msg.Incoming("CSEED", ts, ts, "U1", text, mention, []))
   }
   // Slack's copy of the request, mention and all.
   process.send(r, say("100.5", "<@UBOT> fix it", True))
@@ -452,7 +443,7 @@ pub fn shared_files_route_like_messages_test() {
     decode_event(
       "{\"type\":\"message\",\"subtype\":\"file_share\",\"user\":\"U1\",\"text\":\"look\",\"ts\":\"15.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\",\"files\":[{\"id\":\"F1\",\"name\":\"image.png\",\"mimetype\":\"image/png\",\"size\":10,\"url_private\":\"https://files.slack.com/x\"}]}",
     )
-  let assert Ok(registry.Incoming(
+  let assert Ok(msg.Incoming(
     thread_ts: "10.1",
     ts: "15.1",
     mention: False,
@@ -464,7 +455,7 @@ pub fn shared_files_route_like_messages_test() {
     decode_event(
       "{\"type\":\"message\",\"subtype\":\"file_share\",\"user\":\"U1\",\"text\":\"\",\"ts\":\"16.1\",\"channel\":\"CCODE\",\"channel_type\":\"channel\",\"files\":[]}",
     )
-  let assert Ok(registry.Incoming(thread_ts: "16.1", mention: False, ..)) =
+  let assert Ok(msg.Incoming(thread_ts: "16.1", mention: False, ..)) =
     socket.incoming(top, "UBOT")
 }
 
@@ -489,7 +480,7 @@ pub fn done_archives_the_code_channel_test() {
   process.send(
     r,
     registry.Received(
-      registry.Incoming("CDONE", "50.0", "50.0", "U1", "!done", False, []),
+      msg.Incoming("CDONE", "50.0", "50.0", "U1", "!done", False, []),
     ),
   )
   process.sleep(100)
@@ -511,7 +502,7 @@ pub fn late_deliveries_are_not_run_again_test() {
   let r = start_registry(launches)
   let say = fn(ts) {
     registry.Received(
-      registry.Incoming("C9", "1.0", ts, "U1", "<@UBOT> again?", True, []),
+      msg.Incoming("C9", "1.0", ts, "U1", "<@UBOT> again?", True, []),
     )
   }
   process.send(r, say("4.0"))
@@ -537,7 +528,7 @@ pub fn messages_wait_while_a_code_channel_opens_test() {
   process.send(
     r,
     registry.Received(
-      registry.Incoming("CNEW", "5.0", "5.0", "U1", "<@UBOT> go", True, []),
+      msg.Incoming("CNEW", "5.0", "5.0", "U1", "<@UBOT> go", True, []),
     ),
   )
   let assert Error(Nil) = process.receive(launches, 400)
@@ -559,7 +550,16 @@ pub fn meta_keeps_the_venue_test() {
     venue.Archived("./demo"),
   ]
   list.each(venues, fn(venue) {
-    let saved = meta.Meta(..meta.new(True), cursor: "4.0", venue:)
+    let saved =
+      meta.Meta(
+        ..meta.new(True),
+        cursor: "4.0",
+        venue:,
+        tailnet: Some(meta.Grant(
+          until_ms: 1_800_000_000_000,
+          card: meta.Card("C9", "2.0", "1.0"),
+        )),
+      )
     let assert Ok(Nil) = meta.write(path, saved)
     let assert Ok(read) = meta.read(path)
     let assert True = read == saved
@@ -572,3 +572,82 @@ pub fn meta_keeps_the_venue_test() {
     )
   let assert Ok(meta.Meta(venue: venue.Archived("./old"), ..)) = meta.read(path)
 }
+
+pub fn tailscale_basics_test() {
+  let assert "crushling-c9-1-0" = tailscale.hostname("C9-1.0")
+  let body =
+    tailscale.auth_key_request(tailscale.Config(
+      tailscale.ApiKey("k"),
+      tag: "tag:crushling",
+      tailnet: "-",
+    ))
+  let assert True = string.contains(body, "\"ephemeral\":true")
+  let assert True = string.contains(body, "\"reusable\":false")
+  let assert True = string.contains(body, "\"tags\":[\"tag:crushling\"]")
+  let assert "58 minutes" = tailnet.remaining(3_500_000)
+  let assert "1 hour" = tailnet.remaining(3_700_000)
+  let assert "8 hours" = tailnet.remaining(8 * 3_600_000 - 10_000)
+}
+
+pub fn tailnet_buttons_round_trip_test() {
+  let assert Ok(#(tailnet.Allow(8), "C9", "1.0")) =
+    tailnet.read_button("tailnet_allow_8", "C9|1.0")
+  let assert Ok(#(tailnet.Deny, "C9", "1.0")) =
+    tailnet.read_button("tailnet_deny", "C9|1.0")
+  let assert Ok(#(tailnet.TurnOff, "C9", "1.0")) =
+    tailnet.read_button("tailnet_off", "C9|1.0")
+  // Only the hours the card offers.
+  let assert Error(Nil) = tailnet.read_button("tailnet_allow_99", "C9|1.0")
+  let assert True = list.length(tailnet.action_ids()) == 4
+}
+
+pub fn the_sandbox_is_on_the_tailnet_only_while_wanted_test() {
+  let assert tailnet.Join = tailnet.step(True, None, True)
+  let assert tailnet.Stay = tailnet.step(True, Some(tailnet.Joined), True)
+  // A join in flight finishes first, whatever happened meanwhile.
+  let assert tailnet.Stay =
+    tailnet.step(False, Some(tailnet.Joining(None)), True)
+  let assert tailnet.Leave(log_out: True) =
+    tailnet.step(False, Some(tailnet.Joined), True)
+  // A stopped container took its node with it.
+  let assert tailnet.Leave(log_out: False) =
+    tailnet.step(False, Some(tailnet.Joined), False)
+  let assert tailnet.Stay = tailnet.step(False, None, False)
+}
+
+pub fn tailnet_access_follows_the_buttons_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let path =
+    "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json"
+  let assert Ok(Nil) = meta.write(path, meta.new(True))
+  let setup =
+    tailnet.Setup(
+      api: tailscale.Config(tailscale.ApiKey("k"), "tag:crushling", "-"),
+      run: fn(_, _, _) { Ok("") },
+    )
+  let r = start_registry_with(launches, Some(setup))
+  let card = meta.Card("C9", "2.0", "1.0")
+  let press = fn(choice, user) {
+    registry.Tailnet(
+      registry.key("C9", "1.0"),
+      tailnet.Pressed(choice, "C9", "1.0", user, card),
+    )
+  }
+  // Someone not on the allowlist can't allow it.
+  process.send(r, press(tailnet.Allow(1), "U2"))
+  process.sleep(50)
+  let assert Ok(meta.Meta(tailnet: None, ..)) = meta.read(path)
+  process.send(r, press(tailnet.Allow(1), "U1"))
+  process.sleep(50)
+  let assert Ok(meta.Meta(tailnet: Some(meta.Grant(until_ms:, card: saved)), ..)) =
+    meta.read(path)
+  let assert True = saved == card
+  let assert True = until_ms > system_ms() + 3_500_000
+  process.send(r, press(tailnet.TurnOff, "U1"))
+  process.sleep(50)
+  let assert Ok(meta.Meta(tailnet: None, ..)) = meta.read(path)
+}
+
+@external(erlang, "crushling_ffi", "system_ms")
+fn system_ms() -> Int

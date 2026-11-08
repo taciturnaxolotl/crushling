@@ -21,11 +21,24 @@ pub type Meta {
     /// new to it. "" when it has read nothing.
     cursor: String,
     venue: Venue,
+    /// Tailnet access someone allowed, while it lasts.
+    tailnet: Option(Grant),
   )
 }
 
+/// Tailnet access someone allowed: until when, in milliseconds since the
+/// epoch, and the card that shows it.
+pub type Grant {
+  Grant(until_ms: Int, card: Card)
+}
+
+/// A posted Slack message, kept so it can be updated.
+pub type Card {
+  Card(channel: String, ts: String, thread_ts: String)
+}
+
 pub fn new(follow: Bool) -> Meta {
-  Meta(follow:, paused: False, cursor: "", venue: venue.Thread)
+  Meta(follow:, paused: False, cursor: "", venue: venue.Thread, tailnet: None)
 }
 
 /// Where a code channel came from: the thread that opened it, and when.
@@ -53,11 +66,23 @@ pub fn read(path: String) -> Result(Meta, Nil) {
     // Files from before the venue kept a code channel and its repository.
     use code_channel <- decode.optional_field("code_channel", "", decode.string)
     use repo <- decode.optional_field("repo", "", decode.string)
+    use tailnet <- decode.optional_field(
+      "tailnet",
+      None,
+      decode.optional({
+        use until_ms <- decode.field("until_ms", decode.int)
+        use channel <- decode.field("card_channel", decode.string)
+        use ts <- decode.field("card_ts", decode.string)
+        use thread_ts <- decode.field("card_thread_ts", decode.string)
+        decode.success(Grant(until_ms:, card: Card(channel:, ts:, thread_ts:)))
+      }),
+    )
     decode.success(Meta(
       follow:,
       paused:,
       cursor:,
       venue: legacy_venue(stored, code_channel, repo),
+      tailnet:,
     ))
   })
   |> result.replace_error(Nil)
@@ -78,6 +103,17 @@ pub fn write(path: String, meta: Meta) -> Result(Nil, String) {
     #("paused", json.bool(meta.paused)),
     #("cursor", json.string(meta.cursor)),
     #("venue", venue.to_json(meta.venue)),
+    #(
+      "tailnet",
+      json.nullable(meta.tailnet, fn(grant) {
+        json.object([
+          #("until_ms", json.int(grant.until_ms)),
+          #("card_channel", json.string(grant.card.channel)),
+          #("card_ts", json.string(grant.card.ts)),
+          #("card_thread_ts", json.string(grant.card.thread_ts)),
+        ])
+      }),
+    ),
   ])
   |> json.to_string
   |> write_private(path, _)

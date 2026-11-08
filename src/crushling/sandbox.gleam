@@ -256,6 +256,30 @@ pub fn stop(policy: Policy, key: String) -> Result(Nil, Error) {
   |> result.replace(Nil)
 }
 
+/// The arguments to run `script` with `sh` in a thread's running container,
+/// as its own user, with `env` (`NAME=value` pairs) added.
+pub fn exec_args(
+  key: String,
+  env: List(String),
+  script: String,
+) -> List(String) {
+  list.flatten([
+    ["exec"],
+    list.flat_map(env, fn(pair) { ["--env", pair] }),
+    [container_name(key), "sh", "-c", script],
+  ])
+}
+
+/// Run `script` in a thread's running container and return its output.
+pub fn run_in(
+  policy: Policy,
+  key: String,
+  env: List(String),
+  script: String,
+) -> Result(String, Error) {
+  docker(policy, exec_args(key, env, script))
+}
+
 /// Cold tier: remove the container, keeping the workspace on disk.
 pub fn remove(policy: Policy, key: String) -> Result(Nil, Error) {
   docker(policy, ["rm", "--force", container_name(key)])

@@ -82,6 +82,52 @@ egress filter, so they are off until `CRUSHLING_MCP_URL` names an address it
 can, such as the `sbx-egress` gateway with the bridge bound there and the
 port let through (see `docs/kloe-sandbox.md`).
 
+## Tailnet access
+
+A thread's sandbox can join your tailnet for a while, so the agent can reach
+your machines. The agent asks with its `request_tailnet` tool, or someone
+says `!tailnet` in the thread. Either way a card appears with buttons to
+allow it for 1 or 8 hours, or to deny it. Only people on the allowlist can
+press them. Once it is on, the card shows when it ends and a "Turn off"
+button, and the agent gets a message that tells it how to connect.
+`!tailnet off` also ends it.
+
+Each time, the bridge makes a fresh auth key: single use, ten minutes,
+preauthorized, for an ephemeral node tagged `tag:crushling`. Inside the
+container, `tailscaled` runs in userspace mode, so gVisor needs no TUN
+device and the sandbox reaches Tailscale over HTTPS like anything else. ssh
+goes through `tailscale nc` for tailnet hosts, and other traffic can use the
+SOCKS5 proxy on `localhost:1055` or the HTTP proxy on `localhost:1056`. The
+container never sees the host's own tailnet identity, and the egress filter
+keeps blocking the tailnet's addresses.
+
+Access ends when its time is up, on `!tailnet off` or "Turn off", and on
+`!done`. Then the node logs out, which removes it. When an agent goes
+idle or crashes, its node goes away with the container, and if access hasn't
+ended yet, the next container joins again.
+
+To set it up:
+
+1. Put `tailscale` and `tailscaled` in the sandbox image.
+2. Add the tag and what it may reach to the tailnet policy, for example:
+
+   ```json
+   "tagOwners": { "tag:crushling": ["autogroup:admin"] },
+   "grants": [
+     { "src": ["tag:crushling"], "dst": ["tag:dev"], "ip": ["22", "80", "443"] }
+   ]
+   ```
+
+   Give the agent its own user with few rights on each machine, or use
+   Tailscale SSH with `check` mode so a person approves each login.
+3. Make an OAuth client with the `auth_keys` write scope that owns `tag:crushling`, and set
+   `CRUSHLING_TAILSCALE_CLIENT_ID` and `CRUSHLING_TAILSCALE_CLIENT_SECRET`.
+   An API access token in `CRUSHLING_TAILSCALE_API_KEY` works too, but it
+   expires after 90 days.
+
+The `local` launcher can't do this. Its agents already share your machine's
+network.
+
 ## Providers
 
 Agents use a Claude subscription or Charm Hyper (`crushling/provider`), from
@@ -138,6 +184,9 @@ single use, so the two would revoke each other.
 | `crushling` | Entry point: reads the settings, starts credentials, the registry and Socket Mode. |
 | `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; turns events into `Incoming`. |
 | `crushling/registry` | Maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, and writes all thread meta. |
+| `crushling/tailscale` | The Tailscale API (auth keys) and the scripts that join and leave the tailnet inside a sandbox. |
+| `crushling/registry/tailnet` | Tailnet access for each thread: one rule (on the tailnet while the agent runs and access lasts), the Slack card and its buttons. |
+| `crushling/registry/entry`, `incoming`, `prompt` | A thread's entry in the registry, an incoming Slack message, and the prompt built from it. |
 | `crushling/registry/links` | Links code channels to their threads, in memory and on disk. |
 | `crushling/slack` | The `Sink` over chat.postMessage/update and slackline's `stream` for run replies, with markdown and plan blocks and file uploads; prompt text cleanup. |
 | `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). |
@@ -180,6 +229,9 @@ single use, so the two would revoke each other.
    mount works under gVisor with `--host-uds=create`.
 3. Run the Claude and Hyper-login end-to-end tests once crushling logins are
    seeded.
-4. Smaller things: a cold tier that removes long-idle containers; a prompt
+4. Try tailnet access end to end: `tailscaled` in userspace mode under
+   gVisor, started by `docker exec`, and still running after the exec
+   returns.
+5. Smaller things: a cold tier that removes long-idle containers; a prompt
    the thread actor fails to send never counts as finished, so that thread
    never idles; a Cancel button in addition to replying `stop`.
