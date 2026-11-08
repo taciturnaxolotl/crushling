@@ -223,15 +223,18 @@ single use, so the two would revoke each other.
 ## Left
 
 1. Try it in a real workspace, with `CRUSHLING_LAUNCHER=local` first.
-2. The sandbox image (Nix, with `crush` in it) and the `~/dots` module:
+2. The sandbox image and the `~/dots` module. The image needs `tailscale`
+   and `tailscaled` (the real binary, not nixpkgs' wrapper script), but not
+   `crush`: a static build from the megamerge is mounted from the host with
+   `CRUSHLING_CRUSH`, so updating it means renaming a new binary over the
+   old one. Then:
    `runsc-uds` runtime, `sbx-egress` network and firewall rules, prune
-   filter, service user with a pinned uid. Check that a socket in a bind
-   mount works under gVisor with `--host-uds=create`.
+   filter, service user with a pinned uid. A socket in a bind mount works under
+   gVisor only with `--host-uds=create`, and `tailscaled` started by
+   `docker exec` outlives the exec (both checked by hand on prattle).
 3. Run the Claude and Hyper-login end-to-end tests once crushling logins are
    seeded.
-4. Try tailnet access end to end: `tailscaled` in userspace mode under
-   gVisor, started by `docker exec`, and still running after the exec
-   returns.
+4. Try a real tailnet join from a sandbox, once the OAuth client exists.
 5. Smaller things: a cold tier that removes long-idle containers; a prompt
    the thread actor fails to send never counts as finished, so that thread
    never idles; a Cancel button in addition to replying `stop`.

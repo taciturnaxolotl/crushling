@@ -16,6 +16,7 @@ fn policy() -> sandbox.Policy {
     root: "/storage/crushling/workspaces",
     env: ["EXTRA=1"],
     crush_config: "{}",
+    crush: "",
   )
 }
 
@@ -94,3 +95,34 @@ pub fn exec_runs_without_a_shell_test() {
   let p = sandbox.Policy(..policy(), docker: "echo")
   let assert Ok(sandbox.Missing) = sandbox.observe(p, "k; rm -rf /")
 }
+
+pub fn a_mounted_crush_runs_from_the_mount_test() {
+  let assert Ok("unix:///run/crushling/crush.sock") =
+    list.last(sandbox.run_args(policy(), "k", []))
+  let plain = sandbox.run_args(policy(), "k", [])
+  let assert True =
+    list.contains(list.window_by_2(plain), #(
+      "crushling-sandbox:latest",
+      "crush",
+    ))
+  let mounted =
+    sandbox.run_args(sandbox.Policy(..policy(), crush: "/opt/crush"), "k", [])
+  let pairs = list.window_by_2(mounted)
+  let assert True =
+    list.contains(pairs, #("--volume", "/opt/crush:/opt/crushling/crush:ro"))
+  let assert True =
+    list.contains(pairs, #("crushling-sandbox:latest", "/opt/crushling/crush"))
+}
+
+pub fn a_new_crush_binary_changes_the_fingerprint_test() {
+  let path = "/tmp/crushling-sandbox-test-crush"
+  let assert Ok(Nil) = write_file(path, "one")
+  let p = sandbox.Policy(..policy(), crush: path)
+  let before = sandbox.fingerprint(p)
+  let assert True = before == sandbox.fingerprint(p)
+  let assert Ok(Nil) = write_file(path, "a longer binary")
+  let assert False = before == sandbox.fingerprint(p)
+}
+
+@external(erlang, "crushling_ffi", "write_private")
+fn write_file(path: String, content: String) -> Result(Nil, String)

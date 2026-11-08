@@ -33,8 +33,14 @@ pub type Policy {
     env: List(String),
     /// The container's global crush.json, from `provider.config`.
     crush_config: String,
+    /// A static `crush` binary on the host to mount into the container, or
+    /// "" to use the image's own.
+    crush: String,
   )
 }
+
+/// Where a mounted `crush` binary appears in the container.
+pub const mounted_crush = "/opt/crushling/crush"
 
 pub const label = "crushling-sandbox"
 
@@ -100,12 +106,24 @@ pub fn fingerprint(policy: Policy) -> String {
     int.to_string(policy.gid),
     policy.root,
     policy.crush_config,
+    // A new binary at the same path still means new containers.
+    crush_stamp(policy.crush),
     ..policy.env
   ]
   |> string.join("\u{0}")
   |> sha256_hex
   |> string.slice(0, 16)
 }
+
+fn crush_stamp(path: String) -> String {
+  case path {
+    "" -> ""
+    path -> path <> "@" <> result.unwrap(file_stamp(path), "missing")
+  }
+}
+
+@external(erlang, "crushling_ffi", "file_stamp")
+fn file_stamp(path: String) -> Result(String, Nil)
 
 @external(erlang, "crushling_ffi", "sha256_hex")
 fn sha256_hex(data: String) -> String
@@ -141,7 +159,16 @@ pub fn run_args(
     ["--env", "CRUSH_SERVER_IDLE_TIMEOUT=31536000"],
     ["--env", "CRUSH_SERVER_DETACH_GRACE=120"],
     env,
-    [policy.image, "crush", "server", "--host"],
+    case policy.crush {
+      "" -> [policy.image, "crush"]
+      path -> [
+        "--volume",
+        path <> ":" <> mounted_crush <> ":ro",
+        policy.image,
+        mounted_crush,
+      ]
+    },
+    ["server", "--host"],
     ["unix://" <> socket_dir <> "/" <> socket_name],
   ])
 }

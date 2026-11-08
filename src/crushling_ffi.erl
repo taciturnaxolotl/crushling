@@ -1,7 +1,7 @@
 -module(crushling_ffi).
 
 -export([line_at/2, uuid_v4/0, monotonic_ms/0, system_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
-         file_exists/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
+         file_exists/1, file_stamp/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
          claude_version/0, read_file/1, write_bytes/2]).
 
 line_at(Lines, Index) ->
@@ -31,6 +31,14 @@ log_warning(Text) ->
 
 sha256_hex(Data) ->
     binary:encode_hex(crypto:hash(sha256, Data), lowercase).
+
+%% A file's size and modification time, which change when it is replaced.
+file_stamp(Path) ->
+    case file:read_file_info(Path, [{time, posix}]) of
+        {ok, Info} ->
+            {ok, unicode:characters_to_binary(io_lib:format("~b-~b", [element(2, Info), element(6, Info)]))};
+        {error, _} -> {error, nil}
+    end.
 
 file_exists(Path) ->
     filelib:is_file(Path).
