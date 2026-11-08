@@ -29,9 +29,12 @@ import crushling/provider
 import crushling/registry
 import crushling/render
 import crushling/run
+import crushling/sink
 import crushling/slack_tools
 import crushling/snapshot
+import crushling/sys
 import crushling/thread
+import crushling/venue
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -118,6 +121,7 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { shutdown_cancels_and_stops(wiring) }),
         with_timeout(600, fn() { subagents_get_their_own_threads(wiring) }),
         with_timeout(600, fn() { cloning_moves_to_a_code_channel(wiring) }),
+        with_timeout(600, fn() { failed_code_channel_keeps_the_diff(wiring) }),
         with_timeout(600, fn() { agent_uses_slack_tools(wiring) }),
         with_timeout(600, fn() { prompts_carry_images(wiring) }),
         ..case env("CRUSHLING_TEST_EXTRA", "") {
@@ -288,32 +292,45 @@ fn teardown(env: Env) -> Nil {
   Nil
 }
 
-fn sink(calls: Subject(Call)) -> thread.Sink {
+fn sink(calls: Subject(Call)) -> sink.Sink {
   let progress = fn(text) {
     process.send(calls, Progress(text))
     Ok("ts" <> int.to_string(unique()))
   }
   let plan_text = fn(plan: render.Plan) { render.plan_markdown(plan) }
-  thread.Sink(
+  sink.Sink(
     working: fn(_) { Nil },
     title: fn(_) { Nil },
     post_plan: fn(plan) { progress(plan_text(plan)) },
-    start_stream: fn(_) { Error("no streaming in this test") },
-    append_stream: fn(_, _) { Ok(Nil) },
-    stop_stream: fn(_, _) { Ok(Nil) },
+    reply: fn(_) {
+      fake_reply(progress, fn(text) { progress(text) |> fn(_) { Nil } })
+    },
     update_plan: fn(_, plan) {
       process.send(calls, Progress(plan_text(plan)))
       Ok(Nil)
     },
     post: progress,
     upload: fn(_, _) { Ok(Nil) },
-    finished: fn(finished) { process.send(calls, Done(finished)) },
     branch: fn(_, _) { Error("no branches in this test") },
-    open_code_channel: fn(_, _) { Error("no code channels in this test") },
+    open_code_channel: fn(_) { Error("no code channels in this test") },
     context: fn(_) { Nil },
     code: fn(_, _, _) { Nil },
-    conversation: #("CTEST", "1.0"),
+    conversation: sink.Conversation("CTEST", Some("1.0")),
   )
+}
+
+fn prompt(text: String) -> thread.Message {
+  thread.Prompt(text, [], "")
+}
+
+/// A thread's notices, keeping only the runs that end.
+fn on_finished(then: fn(thread.Finished) -> Nil) -> fn(thread.Notice) -> Nil {
+  fn(notice) {
+    case notice {
+      thread.RunEnded(finished) -> then(finished)
+      _ -> Nil
+    }
+  }
 }
 
 fn start_thread(env: Env) -> #(Subject(thread.Message), Subject(Call)) {
@@ -323,11 +340,11 @@ fn start_thread(env: Env) -> #(Subject(thread.Message), Subject(Call)) {
       socket: env.socket,
       root: env.work,
       title: "crushling real test",
+      venue: venue.Thread,
       sink: sink(calls),
       flush_ms: 250,
       mode: client.Sysadmin,
-      repo: "",
-      in_code_channel: False,
+      notify: on_finished(fn(finished) { process.send(calls, Done(finished)) }),
     ))
   #(t, calls)
 }
@@ -362,13 +379,11 @@ fn queued_prompts_and_bash_diff(wiring: Wiring) -> Nil {
   let #(t, calls) = start_thread(env)
   process.send(
     t,
-    thread.Prompt(
-      "Reply with exactly the word ALPHA and nothing else. Use no tools.",
-    ),
+    prompt("Reply with exactly the word ALPHA and nothing else. Use no tools."),
   )
   process.send(
     t,
-    thread.Prompt(
+    prompt(
       "Use the bash tool to run: printf 'second line\\n' >> notes.txt\nThen reply with exactly the word BETA.",
     ),
   )
@@ -394,7 +409,7 @@ fn queued_prompts_and_bash_diff(wiring: Wiring) -> Nil {
 
 fn shell_parts_in_history(env: Env) -> Int {
   let assert Ok(conn) = gun.connect_unix(env.socket, 5000)
-  let client_id = thread.uuid()
+  let client_id = sys.uuid()
   let assert Ok(workspace_id) =
     client.perform(
       conn,
@@ -418,7 +433,7 @@ fn survives_server_restart(wiring: Wiring) -> Nil {
   let #(t, calls) = start_thread(env)
   process.send(
     t,
-    thread.Prompt(
+    prompt(
       "Use the bash tool to run: sleep 30\nThen reply with exactly the word DONE.",
     ),
   )
@@ -436,9 +451,7 @@ fn survives_server_restart(wiring: Wiring) -> Nil {
   // The same session carries on after the restart.
   process.send(
     t,
-    thread.Prompt(
-      "Reply with exactly the word GAMMA and nothing else. Use no tools.",
-    ),
+    prompt("Reply with exactly the word GAMMA and nothing else. Use no tools."),
   )
   let after = await_finished(calls)
   let assert run.Completed(_) = after.outcome
@@ -501,6 +514,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       client:,
       token: "xoxb-test",
       bot_user: "UBOT",
+      team: "T1",
       allowed: set.from_list(["U1"]),
       idle_ms: 500,
       flush_ms: 250,
@@ -576,6 +590,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       client:,
       token: "xoxb-test",
       bot_user: "UBOT",
+      team: "T1",
       allowed: set.from_list(["U1"]),
       idle_ms: 600_000,
       flush_ms: 250,
@@ -618,7 +633,7 @@ type SubCall {
   MainFinished(solicited: Bool)
 }
 
-fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> thread.Sink {
+fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> sink.Sink {
   let post = fn(text) {
     process.send(calls, case in_branch {
       True -> InBranch(text)
@@ -626,27 +641,22 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> thread.Sink {
     })
     Ok("ts" <> int.to_string(unique()))
   }
-  thread.Sink(
+  sink.Sink(
     working: fn(_) { Nil },
     title: fn(_) { Nil },
     post_plan: fn(plan) { post(render.plan_markdown(plan)) },
-    start_stream: fn(_) { Error("no streaming in this test") },
-    append_stream: fn(_, _) { Ok(Nil) },
-    stop_stream: fn(_, _) { Ok(Nil) },
+    reply: fn(_) { fake_reply(post, fn(_) { Nil }) },
     update_plan: fn(_, _) { Ok(Nil) },
     post:,
     upload: fn(_, _) { Ok(Nil) },
-    finished: fn(finished) {
-      process.send(calls, MainFinished(finished.solicited))
-    },
     branch: fn(intro, title) {
       process.send(calls, Branched(intro, title))
       Ok(#(recording_sink(calls, True), "https://slack.example/thread"))
     },
-    open_code_channel: fn(_, _) { Error("no code channels in this test") },
+    open_code_channel: fn(_) { Error("no code channels in this test") },
     context: fn(_) { Nil },
     code: fn(_, _, _) { Nil },
-    conversation: #("CTEST", "1.0"),
+    conversation: sink.Conversation("CTEST", Some("1.0")),
   )
 }
 
@@ -661,15 +671,17 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
       socket: env.socket,
       root: env.work,
       title: "crushling subagent test",
+      venue: venue.Thread,
       sink: recording_sink(calls, False),
       flush_ms: 250,
       mode: client.Sysadmin,
-      repo: "",
-      in_code_channel: False,
+      notify: on_finished(fn(finished) {
+        process.send(calls, MainFinished(finished.solicited))
+      }),
     ))
   process.send(
     t,
-    thread.Prompt(
+    prompt(
       "Start one subagent (agent_dispatch if you have it, otherwise agent) with the label \"count-files\" and the prompt \"Use the ls tool on the current directory, then reply with how many entries it has.\". Then reply with the word OK.",
     ),
   )
@@ -732,14 +744,20 @@ fn collect_sub_calls(
 }
 
 type CodeCall {
-  Opened(name: String, repo: String)
+  Opened(name: String)
   InThreadPost(String)
   InChannelPost(String)
   CodeView(diff: String)
   CodeFinished(changes: List(snapshot.Change), patch: String)
 }
 
-fn code_sink(calls: Subject(CodeCall), in_channel: Bool) -> thread.Sink {
+/// A sink that records where things are posted. `opens` is whether
+/// Slack lets it open a code channel.
+fn code_sink(
+  calls: Subject(CodeCall),
+  in_channel: Bool,
+  opens: Bool,
+) -> sink.Sink {
   let post = fn(text) {
     process.send(calls, case in_channel {
       True -> InChannelPost(text)
@@ -747,27 +765,21 @@ fn code_sink(calls: Subject(CodeCall), in_channel: Bool) -> thread.Sink {
     })
     Ok("ts" <> int.to_string(unique()))
   }
-  thread.Sink(
+  sink.Sink(
     working: fn(_) { Nil },
     title: fn(_) { Nil },
     post_plan: fn(plan) { post(render.plan_markdown(plan)) },
-    start_stream: fn(_) { Error("no streaming in this test") },
-    append_stream: fn(_, _) { Ok(Nil) },
-    stop_stream: fn(_, _) { Ok(Nil) },
+    reply: fn(_) { fake_reply(post, fn(_) { Nil }) },
     update_plan: fn(_, _) { Ok(Nil) },
     post:,
     upload: fn(_, _) { Ok(Nil) },
-    finished: fn(finished) {
-      process.send(calls, CodeFinished(finished.changes, finished.patch))
-    },
     branch: fn(_, _) { Error("no branches in this test") },
-    open_code_channel: fn(name, repo) {
-      case in_channel {
-        True -> Error("already in a code channel")
-        False -> {
-          process.send(calls, Opened(name, repo))
-          Ok(#(code_sink(calls, True), "CCODE"))
-        }
+    open_code_channel: fn(name) {
+      process.send(calls, Opened(name))
+      case in_channel, opens {
+        True, _ -> Error("already in a code channel")
+        False, False -> Error("not_allowed creating a code channel")
+        False, True -> Ok(#(code_sink(calls, True, True), "CCODE"))
       }
     },
     context: fn(_) { Nil },
@@ -777,7 +789,7 @@ fn code_sink(calls: Subject(CodeCall), in_channel: Bool) -> thread.Sink {
         False -> Nil
       }
     },
-    conversation: #("CTEST", "1.0"),
+    conversation: sink.Conversation("CTEST", Some("1.0")),
   )
 }
 
@@ -792,10 +804,9 @@ fn collect_code_calls(
   }
 }
 
-/// Cloning a repository moves the work to a code channel, whose Code tab
-/// shows the repository's changes instead of an attached patch.
-fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
-  use env <- with_env("code-channel", wiring)
+/// Clone a repository and change it, with a sink that can or can't open
+/// a code channel. What the sinks saw, up to the run's end.
+fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
   let source = env.dir <> "/source"
   let _ =
     sh(
@@ -812,28 +823,33 @@ fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
       socket: env.socket,
       root: env.work,
       title: "crushling code channel test",
-      sink: code_sink(calls, False),
+      venue: venue.Thread,
+      sink: code_sink(calls, False, opens),
       flush_ms: 250,
       mode: client.Sysadmin,
-      repo: "",
-      in_code_channel: False,
+      notify: on_finished(fn(finished) {
+        process.send(calls, CodeFinished(finished.changes, finished.patch))
+      }),
     ))
   process.send(
     t,
-    thread.Prompt(
+    prompt(
       "Use the bash tool to run exactly `git clone "
       <> source
       <> " demo`. Then use bash to append the line two to demo/notes.txt. Then reply with the word DONE.",
     ),
   )
   let seen = collect_code_calls(calls, [])
-  let assert True =
-    list.any(seen, fn(call) {
-      case call {
-        Opened("source", repo) -> string.contains(repo, "demo")
-        _ -> False
-      }
-    })
+  process.send(t, thread.Stop)
+  seen
+}
+
+/// Cloning a repository moves the work to a code channel, whose Code tab
+/// shows the repository's changes instead of an attached patch.
+fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
+  use env <- with_env("code-channel", wiring)
+  let seen = clone_and_edit(env, True)
+  let assert True = list.contains(seen, Opened("source"))
   let assert True =
     list.any(seen, fn(call) {
       case call {
@@ -855,11 +871,39 @@ fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
         _ -> False
       }
     })
+  // The run moved mid-turn, and the channel's Code tab lists the changes:
+  // no line naming them, and no patch.
+  let assert False =
+    list.any(seen, fn(call) {
+      case call {
+        InChannelPost(text) -> string.contains(text, "notes.txt")
+        _ -> False
+      }
+    })
   let assert Ok(CodeFinished(
     changes: [snapshot.Change("notes.txt", Ok(1), Ok(0))],
     patch: "",
   )) = list.last(seen)
-  process.send(t, thread.Stop)
+  Nil
+}
+
+/// When Slack won't open a code channel the work stays in the thread, and
+/// so does the run's diff.
+fn failed_code_channel_keeps_the_diff(wiring: Wiring) -> Nil {
+  use env <- with_env("code-channel-refused", wiring)
+  let seen = clone_and_edit(env, False)
+  let assert True = list.contains(seen, Opened("source"))
+  let assert False =
+    list.any(seen, fn(call) {
+      case call {
+        InChannelPost(_) | CodeView(_) -> True
+        _ -> False
+      }
+    })
+  let assert Ok(CodeFinished(changes:, patch:)) = list.last(seen)
+  let assert True = changes != []
+  let assert True = string.contains(patch, "+two")
+  Nil
 }
 
 /// The agent reaches crushling's Slack tools over MCP, with its own token.
@@ -893,7 +937,7 @@ fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
   let #(t, finished) = start_thread(env)
   process.send(
     t,
-    thread.Prompt(
+    prompt(
       "Call the post_message tool from the slack MCP server with the text HELLO-MCP. Then reply with the word DONE.",
     ),
   )
@@ -919,7 +963,7 @@ fn prompts_carry_images(wiring: Wiring) -> Nil {
     )
   process.send(
     t,
-    thread.PromptWith(
+    thread.Prompt(
       "An image may be attached. Use no tools; reply with the word SEEN.",
       [
         client.Attachment(
@@ -929,6 +973,7 @@ fn prompts_carry_images(wiring: Wiring) -> Nil {
           content: png,
         ),
       ],
+      "",
     ),
   )
   let finished = await_finished(calls)
@@ -958,15 +1003,17 @@ fn subagents_use_extra_providers(wiring: Wiring) -> Nil {
       socket: env.socket,
       root: env.work,
       title: "crushling extra provider test",
+      venue: venue.Thread,
       sink: recording_sink(calls, False),
       flush_ms: 250,
       mode: client.Sysadmin,
-      repo: "",
-      in_code_channel: False,
+      notify: on_finished(fn(finished) {
+        process.send(calls, MainFinished(finished.solicited))
+      }),
     ))
   process.send(
     t,
-    thread.Prompt(
+    prompt(
       "Start one subagent with agent_dispatch, label \"hello\", provider \"anthropic\", model \"claude-haiku-4-5-20251001\", and the prompt \"Reply with the word HI.\". Then reply with the word OK.",
     ),
   )
@@ -999,5 +1046,45 @@ fn await_report(calls: Subject(SubCall), reported: Bool, done: Bool) -> Nil {
         Ok(_) -> await_report(calls, reported, done)
         Error(Nil) -> panic as "the subagent never reported back"
       }
+  }
+}
+
+/// A reply that posts its last text, and its closing line, when it
+/// finishes; `progress` sees each step list as markdown.
+fn fake_reply(
+  post: fn(String) -> Result(String, String),
+  progress: fn(String) -> Nil,
+) -> sink.Reply {
+  let latest = process.new_subject()
+  sink.Reply(
+    show: fn(text, tasks, title) {
+      process.send(latest, text)
+      case tasks {
+        [] -> Nil
+        tasks -> progress(render.plan_markdown(render.Plan(title:, tasks:)))
+      }
+    },
+    finish: fn(closing) {
+      let text = drain(latest, "")
+      case
+        [text, closing]
+        |> list.filter(fn(part) { part != "" })
+        |> string.join("\n\n")
+      {
+        "" -> []
+        text ->
+          case post(text) {
+            Ok(ts) -> [ts]
+            Error(_) -> []
+          }
+      }
+    },
+  )
+}
+
+fn drain(subject: Subject(String), last: String) -> String {
+  case process.receive(subject, 0) {
+    Ok(text) -> drain(subject, text)
+    Error(Nil) -> last
   }
 }

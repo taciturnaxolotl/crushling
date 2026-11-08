@@ -15,6 +15,7 @@
 //// so two processes refreshing the same login revoke each other.
 
 import crushling/gun
+import crushling/sys
 import gleam/bit_array
 import gleam/erlang/process.{type Subject}
 import gleam/http
@@ -87,9 +88,6 @@ fn write_managed(
 
 @external(erlang, "crushling_token_ffi", "decode_grant")
 fn decode_grant(body: BitArray) -> Result(Grant, Nil)
-
-@external(erlang, "crushling_ffi", "log_warning")
-fn warn(text: String) -> Nil
 
 @external(erlang, "os", "system_time")
 fn system_time(unit: SecondUnit) -> Int
@@ -207,7 +205,7 @@ fn refresh(state: State, token: Token) -> State {
         <> "); sign in again with CRUSH_GLOBAL_DATA=<dir of "
         <> login.path
         <> "> crush login"
-      warn("crushling: " <> message)
+      sys.warn("crushling: " <> message)
       State(..state, token: Error(message))
     }
     Ok(grant) -> {
@@ -237,7 +235,7 @@ fn refresh(state: State, token: Token) -> State {
         Error(reason) ->
           // The rotated refresh token now only lives in memory; losing it
           // means signing in again.
-          warn("crushling: could not save the refreshed login: " <> reason)
+          sys.warn("crushling: could not save the refreshed login: " <> reason)
       }
       broadcast(State(..state, token: Ok(fresh)))
     }
@@ -251,7 +249,7 @@ fn broadcast(state: State) -> State {
         case publish(state.login, token, path) {
           Ok(Nil) -> Nil
           Error(reason) ->
-            warn("crushling: could not update " <> path <> ": " <> reason)
+            sys.warn("crushling: could not update " <> path <> ": " <> reason)
         }
       })
     Error(_) -> Nil

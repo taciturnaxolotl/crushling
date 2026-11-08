@@ -9,11 +9,9 @@
 
 import crushling/run.{type Run}
 import crushling/snapshot
-import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/result
 import gleam/string
 
 /// Slack's markdown block accepts up to 12,000 characters; stay well under.
@@ -68,8 +66,17 @@ pub fn progress_title(run: Run) -> String {
 
 /// One row per tool call, the most recent kept and earlier ones folded.
 pub fn tasks(run: Run, root: String) -> List(Task) {
-  let rows = list.map(run.tools, task(_, root, run.outcome))
-  fold(rows)
+  fold(rows(run, root))
+}
+
+/// One task per tool call, none folded away: a streamed reply carries on in
+/// a new message when one holds too many.
+pub fn all_tasks(run: Run, root: String) -> List(Task) {
+  rows(run, root)
+}
+
+fn rows(run: Run, root: String) -> List(Task) {
+  list.map(run.tools, task(_, root, run.outcome))
 }
 
 fn steps(count: Int) -> String {
@@ -452,116 +459,5 @@ fn last_index(haystack: String, needle: String) -> Result(Int, Nil) {
       let assert Ok(last) = list.last(parts)
       Ok(string.length(haystack) - string.length(last) - string.length(needle))
     }
-  }
-}
-
-/// A piece of a streamed message: the agent's text as it arrives, a new
-/// title for the plan, or one of its tasks as it changes.
-pub type Chunk {
-  ChunkText(text: String)
-  ChunkTitle(title: String)
-  ChunkTask(task: Task)
-}
-
-/// What a streamed message has already been told.
-pub type Shown {
-  Shown(
-    /// The text shown, by message id: crush rewrites a message as it grows.
-    sent: dict.Dict(String, String),
-    tasks: dict.Dict(String, Task),
-    title: String,
-    /// The text shown so far, in order, to know what is left to post.
-    text: String,
-  )
-}
-
-pub fn empty_shown() -> Shown {
-  Shown(sent: dict.new(), tasks: dict.new(), title: "", text: "")
-}
-
-/// What a streamed message still has to be told, and what it will show once
-/// it has been.
-pub type Pending {
-  Pending(chunks: List(Chunk), shown: Shown)
-}
-
-/// The next pieces of a run as it streams: the text said since it was last
-/// shown, the tasks that changed, and a new plan title.
-pub fn pending(run: Run, root: String, shown: Shown) -> Pending {
-  let #(text_chunks, sent, said) =
-    list.fold(
-      run.messages(run, True),
-      #([], shown.sent, shown.text),
-      fn(acc, pair) {
-        let #(id, text) = pair
-        let #(chunks, sent, said) = acc
-        let before = dict.get(sent, id) |> result.unwrap("")
-        // A message only grows as it streams, so what is new is what follows
-        // what was shown; only the text is held to one message's worth.
-        case
-          string.starts_with(text, before),
-          string.length(said) < message_limit
-        {
-          True, True ->
-            case string.drop_start(text, string.length(before)) {
-              "" -> acc
-              tail -> {
-                // A new message follows the one before it, as the reply would.
-                let delta = case before, said {
-                  "", "" -> tail
-                  "", _ -> "\n\n" <> tail
-                  _, _ -> tail
-                }
-                #(
-                  [ChunkText(delta), ..chunks],
-                  dict.insert(sent, id, text),
-                  said <> delta,
-                )
-              }
-            }
-          _, _ -> acc
-        }
-      },
-    )
-  let #(task_chunks, tasks) =
-    list.fold(tasks(run, root), #([], shown.tasks), fn(acc, task) {
-      let #(chunks, seen) = acc
-      let seen = dict.insert(seen, task.id, task)
-      case dict.get(shown.tasks, task.id) == Ok(task) {
-        True -> #(chunks, seen)
-        False -> #([ChunkTask(task), ..chunks], seen)
-      }
-    })
-  // A run with no tool call has no plan, and so no title to show.
-  let title = case run.tools {
-    [] -> ""
-    _ -> progress_title(run)
-  }
-  let named = case title, title == shown.title {
-    "", _ -> []
-    _, True -> []
-    _, False -> [ChunkTitle(title)]
-  }
-  Pending(
-    chunks: list.append(
-      list.reverse(text_chunks),
-      list.append(list.reverse(task_chunks), named),
-    ),
-    shown: Shown(sent:, tasks:, title:, text: said),
-  )
-}
-
-/// The part of `reply` a stream hasn't shown yet.
-pub fn remainder(reply: String, shown: String) -> String {
-  case shown {
-    // Nothing was streamed, so the message only carries the plan.
-    "" -> reply
-    _ ->
-      case string.starts_with(reply, shown) {
-        True -> string.drop_start(reply, string.length(shown)) |> string.trim
-        // The text was rewritten under the stream, so it already says what
-        // the agent said; don't say it twice.
-        False -> ""
-      }
   }
 }

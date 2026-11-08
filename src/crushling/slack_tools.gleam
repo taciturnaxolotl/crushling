@@ -23,9 +23,6 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import slackline
-import slackline/api/conversations
-import slackline/api/conversations/history
-import slackline/api/conversations/replies
 import slackline/api/files/complete_upload_external
 import slackline/api/users
 import slackline/api/users/conversations as users_conversations
@@ -188,7 +185,10 @@ pub fn call(
     context.lookup(key)
     |> option.to_result("this thread's agent isn't running"),
   )
-  use #(channel, thread_ts, root) <- result.try(ask(thread, thread.Where))
+  use location <- result.try(ask(thread, thread.Where))
+  let thread.Location(conversation:, root:) = location
+  let channel = conversation.channel
+  let thread_ts = option.unwrap(conversation.thread_ts, "")
   case name {
     "read_conversation" ->
       read(context, channel, thread_ts, limit_arg(arguments))
@@ -251,25 +251,14 @@ fn read(
   thread_ts: String,
   limit: Int,
 ) -> Result(String, String) {
-  let messages = case thread_ts {
-    "" ->
-      conversations.history(channel:)
-      |> history.limit(limit)
-      |> httpc.send(context.client)
-      // History is newest first.
-      |> result.map(fn(found) {
-        option.unwrap(found.messages, []) |> list.reverse
-      })
-    ts ->
-      conversations.replies(channel:, ts:)
-      |> replies.limit(200)
-      |> httpc.send(context.client)
-      |> result.map(fn(found) {
-        let all = option.unwrap(found.messages, [])
-        list.drop(all, int.max(list.length(all) - limit, 0))
-      })
-  }
-  use messages <- result.try(messages |> result.map_error(slack.describe))
+  use messages <- result.try(slack.read_conversation(
+    context.client,
+    channel,
+    thread_ts,
+    "",
+    "",
+  ))
+  let messages = list.drop(messages, int.max(list.length(messages) - limit, 0))
   case list.filter_map(messages, fn(m) { line(context, m) }) {
     [] -> Ok("(no messages)")
     lines -> Ok(string.join(lines, "\n"))
@@ -286,13 +275,7 @@ fn line(context: Context, message: message.Message) -> Result(String, Nil) {
   }
   let text =
     slack.prompt_text(option.unwrap(message.text, ""), context.bot_user)
-  let files = case slack.attachments(message.files) {
-    [] -> ""
-    files ->
-      " [attached: "
-      <> string.join(list.map(files, fn(file) { file.name }), ", ")
-      <> "]"
-  }
+  let files = slack.files_note(slack.attachments(message.files))
   let thread = case message.reply_count {
     Some(count) if count > 0 ->
       " [thread: " <> int.to_string(count) <> " replies]"

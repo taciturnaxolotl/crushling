@@ -7,6 +7,7 @@
 //// points at the endpoint (`provider.config_with`). Requests are answered
 //// with plain JSON; there is no server-initiated stream.
 
+import crushling/sys
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dynamic.{type Dynamic}
@@ -33,9 +34,6 @@ pub type Call =
 
 @external(erlang, "crushling_ffi", "sha256_hex")
 fn sha256_hex(data: String) -> String
-
-@external(erlang, "crushling_ffi", "log_warning")
-fn warn(text: String) -> Nil
 
 /// The token a thread presents.
 pub fn token(secret: String, key: String) -> String {
@@ -241,7 +239,7 @@ pub fn start(
   |> mist.start
   |> result.map(fn(_) { Nil })
   |> result.map_error(fn(error) {
-    warn("crushling: tool server: " <> string.inspect(error))
+    sys.warn("crushling: tool server: " <> string.inspect(error))
     "could not serve the Slack tools on "
     <> bind
     <> ":"
