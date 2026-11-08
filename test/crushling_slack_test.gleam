@@ -1,4 +1,5 @@
 import crushling/crush/client
+import crushling/events
 import crushling/launcher
 import crushling/meta
 import crushling/registry
@@ -11,6 +12,10 @@ import crushling/tailscale
 import crushling/thread
 import crushling/venue
 import gleam/erlang/process
+import gleam/http
+import gleam/http/request
+import gleam/httpc
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -19,6 +24,7 @@ import gleam/string
 import slackline
 import slackline/app
 import slackline/event
+import slackline/verify
 
 pub fn prompt_text_test() {
   let assert "fix the build" =
@@ -221,7 +227,7 @@ pub fn shutdown_with_nothing_running_stops_at_once_test() {
 
 pub fn native_stop_reaches_the_registry_test() {
   let registry = process.new_subject()
-  let router = socket.router(registry, "UBOT")
+  let router = socket.router(app.unverified(), registry, "UBOT")
   let frame =
     "{\"envelope_id\":\"e2\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev1\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"C1\",\"user\":\"U1\",\"thread_ts\":\"10.1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
   let assert app.Send(after:, ..) = app.handle_socket(router, frame)
@@ -313,7 +319,7 @@ pub fn code_channel_messages_reach_their_thread_test() {
 
 pub fn native_stop_in_a_code_channel_test() {
   let registry = process.new_subject()
-  let router = socket.router(registry, "UBOT")
+  let router = socket.router(app.unverified(), registry, "UBOT")
   let frame =
     "{\"envelope_id\":\"e3\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev2\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"CCODE\",\"user\":\"U1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
   let assert app.Send(after:, ..) = app.handle_socket(router, frame)
@@ -651,3 +657,37 @@ pub fn tailnet_access_follows_the_buttons_test() {
 
 @external(erlang, "crushling_ffi", "system_ms")
 fn system_ms() -> Int
+
+pub fn events_arrive_over_http_test() {
+  let launches = process.new_subject()
+  let r = start_registry(launches)
+  let secret = "test-signing-secret"
+  let port = 18_000 + int.absolute_value(unique()) % 2000
+  let router = socket.router(app.new(secret), r, "UBOT")
+  let assert Ok(Nil) = events.start("127.0.0.1", port, router)
+  let post = fn(body, signature) {
+    let now = verify.now_seconds()
+    let assert Ok(req) =
+      request.to("http://127.0.0.1:" <> int.to_string(port) <> "/slack/events")
+    req
+    |> request.set_method(http.Post)
+    |> request.set_header("content-type", "application/json")
+    |> request.set_header("x-slack-request-timestamp", int.to_string(now))
+    |> request.set_header("x-slack-signature", signature(secret, now, body))
+    |> request.set_body(body)
+    |> httpc.send
+  }
+  let challenge =
+    "{\"type\":\"url_verification\",\"token\":\"t\",\"challenge\":\"abc123\"}"
+  // Slack proves the URL is ours before it sends anything else.
+  let assert Ok(response) = post(challenge, verify.sign)
+  let assert 200 = response.status
+  let assert True = string.contains(response.body, "abc123")
+  // Anything not signed with the app's secret is turned away.
+  let assert Ok(response) =
+    post(challenge, fn(_, now, body) { verify.sign("someone-else", now, body) })
+  let assert 401 = response.status
+}
+
+@external(erlang, "erlang", "unique_integer")
+fn unique() -> Int

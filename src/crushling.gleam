@@ -7,7 +7,9 @@
 //// | Variable | Meaning |
 //// |---|---|
 //// | `SLACK_BOT_TOKEN` | `xoxb-` token for the Web API |
-//// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode |
+//// | `SLACK_SIGNING_SECRET` | the app's signing secret; set it to take events over HTTP at `/slack/events` instead of Socket Mode |
+//// | `CRUSHLING_EVENTS_BIND`, `CRUSHLING_EVENTS_PORT` | where that endpoint listens; default `127.0.0.1:7470` |
+//// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode, used when there is no signing secret |
 //// | `CRUSHLING_ALLOWED_USERS` | comma-separated Slack user ids who may use it |
 //// | `CRUSHLING_BACKEND` | `claude` (default), `hyper`, or `hyper-key` |
 //// | `CRUSHLING_LOGIN` | the backend's login crush.json; default `~/.local/state/crushling/<claude\|hyper>/crush.json` |
@@ -32,6 +34,7 @@
 
 import crushling/credentials
 import crushling/crush/client
+import crushling/events
 import crushling/launcher
 import crushling/mcp
 import crushling/provider
@@ -52,6 +55,7 @@ import gleam/set
 import gleam/string
 import slackline
 import slackline/api/auth
+import slackline/app
 import slackline/httpc
 
 @external(erlang, "crushling_ffi", "getenv")
@@ -93,7 +97,7 @@ fn halt(code: Int) -> Nil
 
 fn start() -> Result(Nil, String) {
   use bot_token <- result.try(required("SLACK_BOT_TOKEN"))
-  use app_token <- result.try(required("SLACK_APP_TOKEN"))
+  use delivery <- result.try(delivery())
   use allowed <- result.try(allowed_users())
   use backend <- result.try(backend())
   use mode <- result.try(case setting("CRUSHLING_MODE", "sysadmin") {
@@ -212,8 +216,29 @@ fn start() -> Result(Nil, String) {
   let grace_s =
     int.parse(setting("CRUSHLING_SHUTDOWN_GRACE_SECONDS", "60"))
     |> result.unwrap(60)
-  let router = socket.router(registry, me.user_id)
-  let socket = process.spawn_unlinked(fn() { socket.run(app_token, router) })
+  use socket <- result.try(case delivery {
+    SocketMode(app_token) -> {
+      let router = socket.router(app.unverified(), registry, me.user_id)
+      io.println("crushling: taking events over Socket Mode")
+      Ok(
+        option.Some(
+          process.spawn_unlinked(fn() { socket.run(app_token, router) }),
+        ),
+      )
+    }
+    Http(signing_secret:, bind:, port:) -> {
+      let router = socket.router(app.new(signing_secret), registry, me.user_id)
+      use _ <- result.map(events.start(bind, port, router))
+      io.println(
+        "crushling: taking events at "
+        <> bind
+        <> ":"
+        <> int.to_string(port)
+        <> "/slack/events",
+      )
+      option.None
+    }
+  })
 
   let terminate = process.new_subject()
   use _ <- result.try(install_sigterm(terminate))
@@ -222,7 +247,8 @@ fn start() -> Result(Nil, String) {
   // Take no new work, give running turns their grace period, then stop
   // every agent before exiting.
   io.println("crushling: shutting down")
-  process.kill(socket)
+  // Over HTTP the registry ignores new messages once it is draining.
+  option.map(socket, process.kill)
   let done = process.new_subject()
   process.send(registry, registry.Shutdown(grace_s * 1000, done))
   let _ = process.receive(done, grace_s * 1000 + 60_000)
@@ -428,5 +454,34 @@ fn tailnet(launcher: launcher.Launcher) -> option.Option(tailnet.Setup) {
         run:,
       ))
     _, _ -> option.None
+  }
+}
+
+/// How Slack's events arrive.
+type Delivery {
+  /// Over a WebSocket the bridge opens with this app-level token.
+  SocketMode(app_token: String)
+  /// Posted to `/slack/events`, signed with the app's signing secret.
+  Http(signing_secret: String, bind: String, port: Int)
+}
+
+/// HTTP when a signing secret is set, otherwise Socket Mode.
+fn delivery() -> Result(Delivery, String) {
+  case getenv("SLACK_SIGNING_SECRET"), getenv("SLACK_APP_TOKEN") {
+    Ok(signing_secret), _ ->
+      int.parse(setting("CRUSHLING_EVENTS_PORT", "7470"))
+      |> result.replace_error("CRUSHLING_EVENTS_PORT is not a number")
+      |> result.map(fn(port) {
+        Http(
+          signing_secret:,
+          bind: setting("CRUSHLING_EVENTS_BIND", "127.0.0.1"),
+          port:,
+        )
+      })
+    Error(Nil), Ok(app_token) -> Ok(SocketMode(app_token))
+    Error(Nil), Error(Nil) ->
+      Error(
+        "set SLACK_SIGNING_SECRET to take events over HTTP, or SLACK_APP_TOKEN for Socket Mode",
+      )
   }
 }

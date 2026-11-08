@@ -20,12 +20,14 @@ import slackline/httpc
 import slackline/interaction
 import stratus
 
-/// The router: Slack events in, `registry.Received` out.
+/// The router: Slack events in, `registry.Received` out. Over Socket Mode
+/// it is `router(app.unverified(), …)`; over HTTP, `app.new(signing_secret)`.
 pub fn router(
+  base: app.App,
   registry: Subject(registry.Message),
   bot_user: String,
 ) -> app.App {
-  app.unverified()
+  base
   |> app.on_event(fn(event, _delivery) {
     case event {
       // Slack's own stop control, shown while a session is processing.
