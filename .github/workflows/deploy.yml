@@ -20,17 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: "28"
-          gleam-version: "1.19.2"
-          rebar3-version: "3"
-      - run: gleam format --check src test
-      # slackline's generated modules are deep enough to overflow the stack
-      # of the prebuilt gleam's compiler threads.
-      - run: ulimit -s unlimited && gleam test
-        env:
-          RUST_MIN_STACK: "268435456"
+      # The same gleam and OTP prattle runs. The prebuilt gleam from
+      # setup-beam segfaults compiling slackline.
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - run: nix shell github:nixos/nixpkgs/nixos-26.05#{gleam,erlang,rebar3} -c gleam format --check src test
+      - run: nix shell github:nixos/nixpkgs/nixos-26.05#{gleam,erlang,rebar3} -c gleam test
 
   # The unit runs `gleam run`, which compiles on start, so a deploy is a pull
   # and a restart.
