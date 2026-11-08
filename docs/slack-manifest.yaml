@@ -34,6 +34,7 @@ oauth_config:
   pkce_enabled: false
 settings:
   event_subscriptions:
+    request_url: https://crushling.dunkirk.sh/slack/events
     bot_events:
       - agent_session_stopped
       - app_mention
@@ -42,8 +43,9 @@ settings:
       - message.im
   interactivity:
     is_enabled: true
+    request_url: https://crushling.dunkirk.sh/slack/events
   org_deploy_enabled: false
-  socket_mode_enabled: true
+  socket_mode_enabled: false
   is_mcp_enabled: false
   token_rotation_enabled: false
   app_level_token_rotation_enabled: false
