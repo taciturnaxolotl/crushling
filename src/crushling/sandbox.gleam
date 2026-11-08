@@ -285,7 +285,14 @@ pub fn ensure(
   })
   // gVisor and crush take a few seconds to boot. Wait here, rather than
   // have the thread spend its reconnect attempts on a socket not there yet.
-  wait_for_socket(host_socket(policy, key), socket_wait_ms / 100)
+  // A sandbox that never answers is stopped, or nothing would ever stop it.
+  case wait_for_socket(host_socket(policy, key), socket_wait_ms / 100) {
+    Ok(path) -> Ok(path)
+    Error(error) -> {
+      let _ = stop(policy, key)
+      Error(error)
+    }
+  }
 }
 
 const socket_wait_ms = 30_000
