@@ -28,7 +28,7 @@ packages = [
   { name = "mimetype", version = "0.25.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "mimetype", source = "hex", outer_checksum = "42D21B2A77ABB6D8AC24500DCC1ED073AE264BF0A2F0655AEDA5FD9E61C43344" },
   { name = "mist", version = "6.0.3", build_tools = ["gleam"], requirements = ["exception", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "glisten", "gramps", "hpack_erl", "logging"], otp_app = "mist", source = "hex", outer_checksum = "1B07F321D5FA0CB162D81496F2DE96AEB6EF8980F4F38230A4CC3F849497E020" },
   { name = "multipartkit", version = "0.15.0", build_tools = ["gleam"], requirements = ["gleam_stdlib", "gleam_yielder", "mimetype"], otp_app = "multipartkit", source = "hex", outer_checksum = "A991D771F2394F6EEB873820C8869F0BC17E71102B87885FE58C0F231ADAFD68" },
-  { name = "slackline", version = "1.0.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_erlang", "gleam_fetch", "gleam_http", "gleam_httpc", "gleam_javascript", "gleam_json", "gleam_otp", "gleam_stdlib", "multipartkit"], source = "local", path = "../slackline" },
+  { name = "slackline", version = "1.0.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_erlang", "gleam_fetch", "gleam_http", "gleam_httpc", "gleam_javascript", "gleam_json", "gleam_otp", "gleam_stdlib", "multipartkit"], otp_app = "slackline", source = "hex", outer_checksum = "7FFB98D732BF5024A0CD26638CC1FFCAD4C2FCBF66FD4FA44B7D947E9EA91277" },
   { name = "splitter", version = "1.3.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "splitter", source = "hex", outer_checksum = "8F1485306E0D59168A39E12ED8844F9F616EC59C3C63AFCFDAE04DBD68690CBC" },
   { name = "stratus", version = "3.0.0", build_tools = ["gleam"], requirements = ["exception", "gleam_crypto", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "gramps", "logging"], otp_app = "stratus", source = "hex", outer_checksum = "21C93D657E4E7964E36EACDE83609459F259289DF403B5FEBD3C60612594BE24" },
 ]
@@ -43,5 +43,5 @@ gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.11.0 and < 2.0.0" }
 gun = { version = ">= 2.7.0 and < 3.0.0" }
 mist = { version = ">= 6.0.3 and < 7.0.0" }
-slackline = { path = "../slackline" }
+slackline = { version = ">= 1.0.0 and < 2.0.0" }
 stratus = { version = ">= 3.0.0 and < 4.0.0" }

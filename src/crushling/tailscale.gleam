@@ -141,11 +141,12 @@ const paths = "dir=\"$HOME/.tailscale\"\nsock=\"$dir/tailscaled.sock\"\n"
 pub fn join_script() -> String {
   paths <> "set -e
 mkdir -p \"$dir\" \"$HOME/.ssh\"
-if ! tailscale --socket=\"$sock\" status >/dev/null 2>&1; then
+if ! { [ -f \"$dir/tailscaled.pid\" ] && kill -0 \"$(cat \"$dir/tailscaled.pid\")\" 2>/dev/null; }; then
   nohup tailscaled --tun=userspace-networking --state=mem: \\
     --statedir=\"$dir\" --socket=\"$sock\" \\
-    --socks5-server=localhost:" <> int.to_string(socks_port) <> " \\
-    --outbound-http-proxy-listen=localhost:" <> int.to_string(http_port) <> " \\
+    --socks5-server=127.0.0.1:" <> int.to_string(socks_port) <> " \\
+    --outbound-http-proxy-listen=127.0.0.1:" <> int.to_string(http_port) <> " \\
+    --no-logs-no-support \\
     >\"$dir/tailscaled.log\" 2>&1 &
   echo $! >\"$dir/tailscaled.pid\"
   i=0
