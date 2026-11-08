@@ -10,6 +10,7 @@
 //// The argument building and the adopt/start/recreate decision are pure and
 //// tested; `ensure`, `stop` and `remove` shell out to docker.
 
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/result
@@ -282,7 +283,22 @@ pub fn ensure(
     }
     Create -> docker(policy, run_args(policy, key, key_env))
   })
-  Ok(host_socket(policy, key))
+  // gVisor and crush take a few seconds to boot. Wait here, rather than
+  // have the thread spend its reconnect attempts on a socket not there yet.
+  wait_for_socket(host_socket(policy, key), socket_wait_ms / 100)
+}
+
+const socket_wait_ms = 30_000
+
+fn wait_for_socket(path: String, tries: Int) -> Result(String, Error) {
+  case socket_ready(path), tries {
+    True, _ -> Ok(path)
+    False, 0 -> Error(DockerUnavailable("crush never opened " <> path))
+    False, _ -> {
+      process.sleep(100)
+      wait_for_socket(path, tries - 1)
+    }
+  }
 }
 
 /// Warm tier: stop the container but keep it, so installed state survives.
