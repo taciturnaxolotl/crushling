@@ -7,9 +7,9 @@
 //// | Variable | Meaning |
 //// |---|---|
 //// | `SLACK_BOT_TOKEN` | `xoxb-` token for the Web API |
-//// | `SLACK_SIGNING_SECRET` | the app's signing secret; set it to take events over HTTP at `/slack/events` instead of Socket Mode |
+//// | `SLACK_SIGNING_SECRET` | the app's signing secret; set it to take events over HTTP at `/slack/events` |
 //// | `CRUSHLING_EVENTS_BIND`, `CRUSHLING_EVENTS_PORT` | where that endpoint listens; default `127.0.0.1:7470` |
-//// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode, used when there is no signing secret |
+//// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode; with both set, events are taken both ways |
 //// | `CRUSHLING_ALLOWED_USERS` | comma-separated Slack user ids who may use it |
 //// | `CRUSHLING_BACKEND` | `claude` (default), `hyper`, or `hyper-key` |
 //// | `CRUSHLING_LOGIN` | the backend's login crush.json; default `~/.local/state/crushling/<claude\|hyper>/crush.json` |
@@ -216,17 +216,11 @@ fn start() -> Result(Nil, String) {
   let grace_s =
     int.parse(setting("CRUSHLING_SHUTDOWN_GRACE_SECONDS", "60"))
     |> result.unwrap(60)
-  use socket <- result.try(case delivery {
-    SocketMode(app_token) -> {
-      let router = socket.router(app.unverified(), registry, me.user_id)
-      io.println("crushling: taking events over Socket Mode")
-      Ok(
-        option.Some(
-          process.spawn_unlinked(fn() { socket.run(app_token, router) }),
-        ),
-      )
-    }
-    Http(signing_secret:, bind:, port:) -> {
+  // Slack sends each event one way, so taking both while the app moves
+  // from Socket Mode to HTTP loses nothing, and the registry drops repeats.
+  use _ <- result.try(case delivery.http {
+    option.None -> Ok(Nil)
+    option.Some(Http(signing_secret:, bind:, port:)) -> {
       let router = socket.router(app.new(signing_secret), registry, me.user_id)
       use _ <- result.map(events.start(bind, port, router))
       io.println(
@@ -236,9 +230,14 @@ fn start() -> Result(Nil, String) {
         <> int.to_string(port)
         <> "/slack/events",
       )
-      option.None
     }
   })
+  let socket =
+    option.map(delivery.socket_mode, fn(app_token) {
+      let router = socket.router(app.unverified(), registry, me.user_id)
+      io.println("crushling: taking events over Socket Mode")
+      process.spawn_unlinked(fn() { socket.run(app_token, router) })
+    })
 
   let terminate = process.new_subject()
   use _ <- result.try(install_sigterm(terminate))
@@ -458,30 +457,35 @@ fn tailnet(launcher: launcher.Launcher) -> option.Option(tailnet.Setup) {
 }
 
 /// How Slack's events arrive.
+/// How Slack's events arrive: over Socket Mode with an app-level token,
+/// posted over HTTP and signed with the app's signing secret, or both.
 type Delivery {
-  /// Over a WebSocket the bridge opens with this app-level token.
-  SocketMode(app_token: String)
-  /// Posted to `/slack/events`, signed with the app's signing secret.
+  Delivery(socket_mode: option.Option(String), http: option.Option(Http))
+}
+
+type Http {
   Http(signing_secret: String, bind: String, port: Int)
 }
 
-/// HTTP when a signing secret is set, otherwise Socket Mode.
 fn delivery() -> Result(Delivery, String) {
-  case getenv("SLACK_SIGNING_SECRET"), getenv("SLACK_APP_TOKEN") {
-    Ok(signing_secret), _ ->
+  use http <- result.try(case getenv("SLACK_SIGNING_SECRET") {
+    Error(Nil) -> Ok(option.None)
+    Ok(signing_secret) ->
       int.parse(setting("CRUSHLING_EVENTS_PORT", "7470"))
       |> result.replace_error("CRUSHLING_EVENTS_PORT is not a number")
       |> result.map(fn(port) {
-        Http(
+        option.Some(Http(
           signing_secret:,
           bind: setting("CRUSHLING_EVENTS_BIND", "127.0.0.1"),
           port:,
-        )
+        ))
       })
-    Error(Nil), Ok(app_token) -> Ok(SocketMode(app_token))
-    Error(Nil), Error(Nil) ->
+  })
+  case getenv("SLACK_APP_TOKEN"), http {
+    Error(Nil), option.None ->
       Error(
         "set SLACK_SIGNING_SECRET to take events over HTTP, or SLACK_APP_TOKEN for Socket Mode",
       )
+    app_token, http -> Ok(Delivery(option.from_result(app_token), http))
   }
 }
