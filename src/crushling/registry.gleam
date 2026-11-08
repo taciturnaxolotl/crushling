@@ -916,6 +916,14 @@ fn thread_down(state: State, down: process.Down) -> State {
       )
     })
   })
+  // Nothing will clear "Working…" for a thread that died mid-run.
+  dict.each(gone, fn(_, dead) {
+    let client = state.config.client
+    let #(channel, thread_ts) = entry.conversation(dead)
+    process.spawn_unlinked(fn() {
+      slack.session_done(client, channel, thread_ts)
+    })
+  })
   // Its container may still be running, and on the tailnet.
   dict.fold(gone, state, fn(state, key, _) { stop_agent(state, key) })
 }

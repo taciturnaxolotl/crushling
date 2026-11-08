@@ -462,13 +462,24 @@ fn session_status(
   let call =
     agents.sessions_set_status(status:)
     |> sessions_set_status.channel_id(channel)
-  let _ =
+  let sent =
     case thread_ts {
       Some(ts) -> sessions_set_status.thread_ts(call, ts)
       None -> call
     }
     |> httpc.send(client)
-  Nil
+  case sent {
+    Ok(_) -> Nil
+    Error(error) ->
+      sys.warn(
+        "crushling: setting the session in "
+        <> channel
+        <> " to "
+        <> agents.agent_status_to_string(status)
+        <> " failed: "
+        <> describe(error),
+      )
+  }
 }
 
 /// Mark the agent session as ready for the next prompt. `thread_ts` is ""
