@@ -1,0 +1,42 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "gleam.toml"
+      - "manifest.toml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          gleam-version: "1.19.2"
+          rebar3-version: "3"
+      - run: gleam format --check src test
+      - run: gleam test
+
+  # The unit runs `gleam run`, which compiles on start, so a deploy is a pull
+  # and a restart.
+  deploy:
+    needs: check
+    uses: taciturnaxolotl/dots/.github/workflows/deploy-service.yml@main
+    with:
+      service: crushling
+      host: prattle
+      install_command: "true"
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
