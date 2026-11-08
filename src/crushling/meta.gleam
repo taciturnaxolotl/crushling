@@ -6,8 +6,10 @@
 import crushling/venue.{type Venue}
 import gleam/dynamic/decode
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 
 pub type Meta {
   Meta(
@@ -50,7 +52,24 @@ pub type Link {
 fn read_file(path: String) -> Result(String, Nil)
 
 @external(erlang, "crushling_ffi", "write_private")
-fn write_private(path: String, content: String) -> Result(Nil, String)
+fn write_file(path: String, content: String) -> Result(Nil, String)
+
+@external(erlang, "crushling_ffi", "mkdir_p")
+fn mkdir_p(path: String) -> Result(Nil, String)
+
+/// Write a file whole, making its directory first: a new thread's meta is
+/// saved before its launch creates the thread's directory.
+fn write_private(path: String, content: String) -> Result(Nil, String) {
+  use _ <- result.try(mkdir_p(filepath_dir(path)))
+  write_file(path, content)
+}
+
+fn filepath_dir(path: String) -> String {
+  case string.split(path, "/") |> list.reverse {
+    [_, ..rest] -> list.reverse(rest) |> string.join("/")
+    [] -> "."
+  }
+}
 
 pub fn read(path: String) -> Result(Meta, Nil) {
   use text <- result.try(read_file(path))
