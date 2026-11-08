@@ -21,6 +21,7 @@
 //// | `CRUSHLING_IDLE_MINUTES` | idle time before a thread's agent is stopped; default 15 |
 //// | `CRUSHLING_SHUTDOWN_GRACE_SECONDS` | on SIGTERM, how long running turns get to finish before they are cancelled; default 60 |
 //// | `CRUSHLING_CRUSH` | for `docker`, a static `crush` binary on this machine to mount into each sandbox instead of the image's own; replacing the file (rename over it) gives new sandboxes the new one |
+//// | `CRUSHLING_DNS` | for `docker`, comma-separated nameservers for the sandboxes, since docker's DNS doesn't answer gVisor on a custom network; default `1.1.1.1,9.9.9.9`, or `off` for docker's own |
 //// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc-uds`, `sbx-egress` |
 //// | `CRUSHLING_MCP_PORT`, `CRUSHLING_MCP_BIND` | where the agents' Slack tools are served; default `7469` on `127.0.0.1` |
 //// | `CRUSHLING_TAILSCALE_CLIENT_ID`, `CRUSHLING_TAILSCALE_CLIENT_SECRET` | an OAuth client with the `auth_keys` scope that owns the tag; with it, people can put a thread's sandbox on the tailnet for a while |
@@ -381,6 +382,13 @@ fn launcher_for(
           env: provider.env_for(backend, extras),
           crush_config: provider.config_for(backend, extras, bridge.url),
           crush: setting("CRUSHLING_CRUSH", ""),
+          dns: case setting("CRUSHLING_DNS", "1.1.1.1,9.9.9.9") {
+            "off" -> []
+            servers ->
+              string.split(servers, ",")
+              |> list.map(string.trim)
+              |> list.filter(fn(server) { server != "" })
+          },
         )
       Ok(launcher.docker(policy, creds, bridge))
     }

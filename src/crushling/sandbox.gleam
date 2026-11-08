@@ -36,6 +36,9 @@ pub type Policy {
     /// A static `crush` binary on the host to mount into the container, or
     /// "" to use the image's own.
     crush: String,
+    /// Nameservers for the container's own resolv.conf, or [] for docker's.
+    /// Docker's embedded DNS doesn't answer gVisor on a custom network.
+    dns: List(String),
   )
 }
 
@@ -108,6 +111,7 @@ pub fn fingerprint(policy: Policy) -> String {
     policy.crush_config,
     // A new binary at the same path still means new containers.
     crush_stamp(policy.crush),
+    string.join(policy.dns, ","),
     ..policy.env
   ]
   |> string.join("\u{0}")
@@ -159,6 +163,10 @@ pub fn run_args(
     ["--env", "CRUSH_SERVER_IDLE_TIMEOUT=31536000"],
     ["--env", "CRUSH_SERVER_DETACH_GRACE=120"],
     env,
+    case policy.dns {
+      [] -> []
+      _ -> ["--volume", host_resolv_conf(policy) <> ":/etc/resolv.conf:ro"]
+    },
     case policy.crush {
       "" -> [policy.image, "crush"]
       path -> [
@@ -325,6 +333,11 @@ pub fn host_crush_data(policy: Policy, key: String) -> String {
   host_workspace(policy, key) <> "/.home/.local/share/crush"
 }
 
+/// The resolv.conf every container shares, beside the threads.
+pub fn host_resolv_conf(policy: Policy) -> String {
+  policy.root <> "/resolv.conf"
+}
+
 /// Create the thread's host directories as the bridge's own user. Left to
 /// docker, missing mount sources are created owned by root, and the
 /// container's uid could then not write its workspace or socket.
@@ -337,6 +350,14 @@ pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
   )
   let data = host_crush_data(policy, key)
   use _ <- result.try(mkdir_p(data) |> result.map_error(Filesystem))
+  use _ <- result.try(case policy.dns {
+    [] -> Ok(Nil)
+    servers ->
+      list.map(servers, fn(server) { "nameserver " <> server <> "\n" })
+      |> string.concat
+      |> write_private(host_resolv_conf(policy), _)
+      |> result.map_error(Filesystem)
+  })
   write_private(data <> "/crush.json", policy.crush_config)
   |> result.map_error(Filesystem)
 }

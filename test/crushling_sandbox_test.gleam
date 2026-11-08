@@ -17,6 +17,7 @@ fn policy() -> sandbox.Policy {
     env: ["EXTRA=1"],
     crush_config: "{}",
     crush: "",
+    dns: [],
   )
 }
 
@@ -126,3 +127,20 @@ pub fn a_new_crush_binary_changes_the_fingerprint_test() {
 
 @external(erlang, "crushling_ffi", "write_private")
 fn write_file(path: String, content: String) -> Result(Nil, String)
+
+pub fn sandboxes_get_their_own_nameservers_test() {
+  let plain = list.window_by_2(sandbox.run_args(policy(), "k", []))
+  let assert False =
+    list.contains(plain, #(
+      "--volume",
+      "/storage/crushling/workspaces/resolv.conf:/etc/resolv.conf:ro",
+    ))
+  let with_dns = sandbox.Policy(..policy(), dns: ["1.1.1.1"])
+  let assert True =
+    list.contains(list.window_by_2(sandbox.run_args(with_dns, "k", [])), #(
+      "--volume",
+      "/storage/crushling/workspaces/resolv.conf:/etc/resolv.conf:ro",
+    ))
+  let assert False =
+    sandbox.fingerprint(policy()) == sandbox.fingerprint(with_dns)
+}
