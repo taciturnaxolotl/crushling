@@ -5,8 +5,11 @@ import crushling/registry
 import crushling/slack
 import crushling/snapshot
 import crushling/socket
+import crushling/thread
+import crushling/venue
 import gleam/erlang/process
 import gleam/json
+import gleam/list
 import gleam/set
 import slackline
 import slackline/app
@@ -143,6 +146,7 @@ fn start_registry(launches: process.Subject(Launch)) {
       client:,
       token: "xoxb-test",
       bot_user: "UBOT",
+      team: "T1",
       allowed: set.from_list(["U1"]),
       idle_ms: 50,
       flush_ms: 50,
@@ -232,6 +236,9 @@ pub fn native_stop_reaches_the_registry_test() {
 @external(erlang, "crushling_ffi", "mkdir_p")
 fn mkdir_p(path: String) -> Result(Nil, String)
 
+@external(erlang, "crushling_ffi", "write_private")
+fn write_file(path: String, content: String) -> Result(Nil, String)
+
 pub fn follow_mode_test() {
   let launches = process.new_subject()
   let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
@@ -282,11 +289,11 @@ pub fn code_channel_messages_reach_their_thread_test() {
   let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
   // CCODE holds the work of C9's thread, which is on disk.
   let assert Ok(Nil) =
-    meta.write(
+    meta.write_link(
       "/tmp/crushling-registry-test/"
         <> registry.key("CCODE", "code")
         <> ".json",
-      meta.Meta(..meta.new(True), origin_channel: "C9", origin_ts: "1.0"),
+      meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: ""),
     )
   let r = start_registry(launches)
   // Top-level chatter in another channel reaches nobody.
@@ -381,16 +388,20 @@ pub fn paused_code_channels_need_a_mention_test() {
   let launches = process.new_subject()
   let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
   let assert Ok(Nil) =
-    meta.write(
+    meta.write_link(
       "/tmp/crushling-registry-test/"
         <> registry.key("CPAUSE", "code")
         <> ".json",
-      meta.Meta(..meta.new(True), origin_channel: "C7", origin_ts: "1.0"),
+      meta.Link(origin_channel: "C7", origin_ts: "1.0", opened_ts: ""),
     )
   let assert Ok(Nil) =
     meta.write(
       "/tmp/crushling-registry-test/" <> registry.key("C7", "1.0") <> ".json",
-      meta.Meta(..meta.new(True), paused: True, code_channel: "CPAUSE"),
+      meta.Meta(
+        ..meta.new(True),
+        paused: True,
+        venue: venue.CodeChannel("CPAUSE", "./demo"),
+      ),
     )
   let r = start_registry(launches)
   process.send(
@@ -415,16 +426,11 @@ pub fn the_seeded_request_is_not_run_twice_test() {
   let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
   // CSEED was opened at 100.0 for C9's thread.
   let assert Ok(Nil) =
-    meta.write(
+    meta.write_link(
       "/tmp/crushling-registry-test/"
         <> registry.key("CSEED", "code")
         <> ".json",
-      meta.Meta(
-        ..meta.new(True),
-        cursor: "100.0",
-        origin_channel: "C9",
-        origin_ts: "1.0",
-      ),
+      meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: "100.0"),
     )
   let r = start_registry(launches)
   let say = fn(ts, text, mention) {
@@ -468,16 +474,16 @@ pub fn done_archives_the_code_channel_test() {
   let thread_path =
     "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json"
   let assert Ok(Nil) =
-    meta.write(
+    meta.write_link(
       "/tmp/crushling-registry-test/"
         <> registry.key("CDONE", "code")
         <> ".json",
-      meta.Meta(..meta.new(True), origin_channel: "C9", origin_ts: "1.0"),
+      meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: ""),
     )
   let assert Ok(Nil) =
     meta.write(
       thread_path,
-      meta.Meta(..meta.new(True), code_channel: "CDONE", repo: "./demo"),
+      meta.Meta(..meta.new(True), venue: venue.CodeChannel("CDONE", "./demo")),
     )
   let r = start_registry(launches)
   process.send(
@@ -488,7 +494,81 @@ pub fn done_archives_the_code_channel_test() {
   )
   process.sleep(100)
   let assert Error(Nil) = process.receive(launches, 50)
-  let assert Ok(meta.Meta(code_channel: "", repo: "./demo", ..)) =
+  let assert Ok(meta.Meta(venue: venue.Archived("./demo"), ..)) =
     meta.read(thread_path)
   Nil
+}
+
+pub fn late_deliveries_are_not_run_again_test() {
+  let launches = process.new_subject()
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  // The agent's last prompt was the message at 5.0, so it has read 4.0.
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json",
+      meta.Meta(..meta.new(True), cursor: "5.0"),
+    )
+  let r = start_registry(launches)
+  let say = fn(ts) {
+    registry.Received(
+      registry.Incoming("C9", "1.0", ts, "U1", "<@UBOT> again?", True, []),
+    )
+  }
+  process.send(r, say("4.0"))
+  let assert Error(Nil) = process.receive(launches, 100)
+  process.send(r, say("6.0"))
+  let assert Ok(Launched(_)) = process.receive(launches, 1000)
+  // Other tests share C9's thread.
+  let assert Ok(Nil) =
+    meta.write(
+      "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json",
+      meta.new(True),
+    )
+  Nil
+}
+
+pub fn messages_wait_while_a_code_channel_opens_test() {
+  let launches = process.new_subject()
+  let r = start_registry(launches)
+  let opener = registry.key("C3", "1.0")
+  process.send(r, registry.FromThread(opener, thread.Opening))
+  // Possibly the new channel's seed: held until the thread says where it
+  // went.
+  process.send(
+    r,
+    registry.Received(
+      registry.Incoming("CNEW", "5.0", "5.0", "U1", "<@UBOT> go", True, []),
+    ),
+  )
+  let assert Error(Nil) = process.receive(launches, 400)
+  process.send(
+    r,
+    registry.FromThread(opener, thread.Moved(venue.ThreadOnly("./demo"), "")),
+  )
+  let assert Ok(Launched(key)) = process.receive(launches, 1000)
+  let assert True = key == registry.key("CNEW", "5.0")
+}
+
+pub fn meta_keeps_the_venue_test() {
+  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let path = "/tmp/crushling-registry-test/venue.json"
+  let venues = [
+    venue.Thread,
+    venue.ThreadOnly("./demo"),
+    venue.CodeChannel("CCODE", "./demo"),
+    venue.Archived("./demo"),
+  ]
+  list.each(venues, fn(venue) {
+    let saved = meta.Meta(..meta.new(True), cursor: "4.0", venue:)
+    let assert Ok(Nil) = meta.write(path, saved)
+    let assert Ok(read) = meta.read(path)
+    let assert True = read == saved
+  })
+  // Files from before the venue kept the channel and repository instead.
+  let assert Ok(Nil) =
+    write_file(
+      path,
+      "{\"follow\":true,\"code_channel\":\"\",\"repo\":\"./old\"}",
+    )
+  let assert Ok(meta.Meta(venue: venue.Archived("./old"), ..)) = meta.read(path)
 }

@@ -1,11 +1,12 @@
-//// The Slack side of a thread: a `thread.Sink` that shows a run as an agent
+//// The Slack side of a thread: a `Sink` that shows a run as an agent
 //// session (Slack's "Working…" and Stop), a plan card and markdown replies, and the helpers that turn a Slack
 //// message back into a prompt.
 
 import crushling/crush/client
 import crushling/gun
 import crushling/render
-import crushling/thread
+import crushling/sink.{type Sink} as thread_sink
+import crushling/sys
 import gleam/bit_array
 import gleam/bool
 import gleam/erlang/process
@@ -26,11 +27,8 @@ import slackline/api/agents/conversations_set_view
 import slackline/api/agents/sessions_rename
 import slackline/api/agents/sessions_set_status
 import slackline/api/chat
-import slackline/api/chat/append_stream
 import slackline/api/chat/post_ephemeral
 import slackline/api/chat/post_message
-import slackline/api/chat/start_stream
-import slackline/api/chat/stop_stream
 import slackline/api/chat/update
 import slackline/api/conversations
 import slackline/api/conversations/history
@@ -39,6 +37,9 @@ import slackline/api/files/complete_upload_external
 import slackline/block
 import slackline/file
 import slackline/httpc
+import slackline/message
+import slackline/stream
+import slackline/stream/httpc as reply
 import slackline/value
 
 /// Notifications and old clients show `text`; keep it short.
@@ -89,25 +90,18 @@ fn plan_blocks(plan: render.Plan) -> List(block.Block) {
   [block.plan(plan.title, tasks, [])]
 }
 
-/// A streamed message's pieces as Slack's streaming API wants them.
-fn stream_chunks(chunks: List(render.Chunk)) -> List(chat.StreamChunk) {
-  list.map(chunks, fn(chunk) {
-    case chunk {
-      render.ChunkText(text) -> chat.MarkdownTextChunk(text:)
-      render.ChunkTitle(title) -> chat.PlanUpdateChunk(title:)
-      render.ChunkTask(task) ->
-        chat.TaskUpdateChunk(
-          id: task.id,
-          title: task.title,
-          status: task_status(task.status),
-          hide_title: None,
-          icon: None,
-          details: optional(task.details),
-          output: optional(task.output),
-          sources: None,
-        )
-    }
-  })
+fn stream_task(task: render.Task) -> stream.Task {
+  stream.Task(
+    id: task.id,
+    title: task.title,
+    status: case task.status {
+      render.InProgress -> stream.Running
+      render.Complete -> stream.Done
+      render.Failed -> stream.Failed
+    },
+    details: task.details,
+    output: task.output,
+  )
 }
 
 fn task_status(status: render.TaskStatus) -> block.TaskStatus {
@@ -115,13 +109,6 @@ fn task_status(status: render.TaskStatus) -> block.TaskStatus {
     render.InProgress -> block.TaskInProgress
     render.Complete -> block.TaskComplete
     render.Failed -> block.TaskError
-  }
-}
-
-fn optional(text: String) -> Option(String) {
-  case text {
-    "" -> None
-    text -> Some(text)
   }
 }
 
@@ -136,23 +123,15 @@ pub type Place {
   InCodeThread(thread_ts: String)
 }
 
-/// What the registry hears about a thread: a run finished, or the work
-/// moved to a code channel (its id and the repository directory).
-pub type Hooks {
-  Hooks(finished: fn(thread.Finished) -> Nil, moved: fn(String, String) -> Nil)
-}
-
-pub fn no_hooks() -> Hooks {
-  Hooks(finished: fn(_) { Nil }, moved: fn(_, _) { Nil })
-}
-
 /// Everything a thread actor needs to reply in one place in Slack.
+/// `team` is the workspace's id: Slack streams a reply in a channel to one
+/// person, named by user and team.
 pub fn sink(
   client: slackline.Client,
+  team: String,
   channel: String,
   place: Place,
-  hooks: Hooks,
-) -> thread.Sink {
+) -> Sink {
   let thread_ts = case place {
     InThread(ts) | InCodeThread(ts) -> Some(ts)
     InCodeChannel -> None
@@ -187,36 +166,46 @@ pub fn sink(
     |> httpc.send(client)
     |> result.replace(Nil)
   }
-  // A streamed message: one message per run, the agent's text and its
-  // steps as they happen. Slack only streams into a thread or into a code
-  // channel's top level.
-  let start = fn(chunks) {
-    send(fn() {
-      let call =
-        chat.start_stream(channel:)
-        |> start_stream.chunks(stream_chunks(chunks))
-        |> start_stream.task_display_mode(chat.Plan)
-      case thread_ts {
-        Some(ts) -> start_stream.thread_ts(call, ts)
-        None -> call
+  // A run's reply streams where Slack can, and falls back to a plan card
+  // and messages where it can't; slackline's stream handles both.
+  let open_reply = fn(from) {
+    let builder =
+      stream.new(client, channel:)
+      |> stream.to(user: from, team:)
+    let builder = case thread_ts {
+      Some(ts) -> stream.in_thread(builder, ts)
+      None -> builder
+    }
+    case reply.open(builder) {
+      Error(error) -> {
+        sys.warn("crushling: couldn't open a reply: " <> string.inspect(error))
+        thread_sink.Reply(show: fn(_, _, _) { Nil }, finish: fn(_) { [] })
       }
-      |> httpc.send(client)
-      |> result.map(fn(started) { started.ts })
-    })
-  }
-  let append = fn(ts, chunks) {
-    use <- send
-    chat.append_stream(channel:, ts:)
-    |> append_stream.chunks(stream_chunks(chunks))
-    |> httpc.send(client)
-    |> result.replace(Nil)
-  }
-  let stop = fn(ts, chunks) {
-    use <- send
-    chat.stop_stream(channel:, ts:)
-    |> stop_stream.chunks(stream_chunks(chunks))
-    |> httpc.send(client)
-    |> result.replace(Nil)
+      Ok(opened) ->
+        thread_sink.Reply(
+          show: fn(text, tasks, title) {
+            reply.text(opened, text)
+            list.each(tasks, fn(task) { reply.task(opened, stream_task(task)) })
+            reply.title(opened, title)
+          },
+          finish: fn(closing) {
+            case reply.finish(opened, closing:) {
+              Ok(finished) -> {
+                case finished.problem {
+                  Some(problem) ->
+                    sys.warn("crushling: the reply didn't stream: " <> problem)
+                  None -> Nil
+                }
+                finished.messages
+              }
+              Error(Nil) -> {
+                sys.warn("crushling: the reply's writer stopped answering")
+                []
+              }
+            }
+          },
+        )
+    }
   }
   let set_status = fn(status) {
     case has_session {
@@ -245,11 +234,12 @@ pub fn sink(
       |> httpc.send(client)
       |> result.map(fn(found) { found.permalink })
       |> result.unwrap("")
-    let branch = sink(client, channel, child(root), no_hooks())
+    let branch = sink(client, team, channel, child(root))
     branch.title(title)
     Ok(#(branch, link))
   }
-  thread.Sink(
+  thread_sink.Sink(
+    conversation: thread_sink.Conversation(channel, thread_ts),
     // Slack shows "Working…" with its Stop control until the session is
     // set back to active; posting doesn't clear it.
     working: fn(working) {
@@ -294,9 +284,7 @@ pub fn sink(
         }
       }
     },
-    start_stream: start,
-    append_stream: append,
-    stop_stream: stop,
+    reply: open_reply,
     post: fn(markdown) { post(markdown, markdown_blocks(markdown)) },
     upload: fn(name, content) {
       case in_code_channel {
@@ -321,10 +309,8 @@ pub fn sink(
         }
       }
     },
-    finished: hooks.finished,
     branch:,
-    conversation: #(channel, option.unwrap(thread_ts, "")),
-    open_code_channel: fn(name, repo) {
+    open_code_channel: fn(name) {
       case place {
         InThread(root) -> {
           use opened <- result.try(
@@ -334,15 +320,14 @@ pub fn sink(
             |> conversations_create.origin_message_ts(root)
             // A session that was archived and picked up again gets a new
             // channel, so the id can't be the thread alone; kept short.
-            |> conversations_create.session_id(uuid_v4())
+            |> conversations_create.session_id(sys.uuid())
             |> httpc.send(client)
             |> result.map_error(fn(error) {
               describe(error) <> " creating a code channel named " <> name
             }),
           )
           let code = opened.channel_id
-          hooks.moved(code, repo)
-          let channel_sink = sink(client, code, InCodeChannel, hooks)
+          let channel_sink = sink(client, team, code, InCodeChannel)
           channel_sink.title(name)
           Ok(#(channel_sink, code))
         }
@@ -414,7 +399,7 @@ pub fn sink(
           case sent {
             Ok(_) -> Nil
             Error(reason) ->
-              logger_warn("crushling: Code tab update failed: " <> reason)
+              sys.warn("crushling: Code tab update failed: " <> reason)
           }
         }
         _ -> Nil
@@ -422,9 +407,6 @@ pub fn sink(
     },
   )
 }
-
-@external(erlang, "crushling_ffi", "log_warning")
-fn logger_warn(text: String) -> Nil
 
 /// A Slack error for logs and the agent, with the detail Slack gives for
 /// vague codes like `invalid_arguments` in `response_metadata.messages`.
@@ -450,9 +432,6 @@ pub fn describe(error: slackline.Error) -> String {
     _ -> base
   }
 }
-
-@external(erlang, "crushling_ffi", "uuid_v4")
-fn uuid_v4() -> String
 
 /// Archive a code channel once its work is done, keeping `summary_ts` (a
 /// message in it, or "") as its summary.
@@ -721,12 +700,12 @@ pub fn save_attachments(
 /// can open those too.
 pub fn save_earlier_attachments(
   token: String,
-  earlier: List(#(String, List(Attachment))),
+  earlier: List(Earlier),
   dirs: #(String, String),
 ) -> #(String, List(client.Attachment)) {
   let saved =
     list.map(earlier, fn(message) {
-      let #(ts, files) = message
+      let Earlier(ts:, files:) = message
       save_attachments_as(
         token,
         files,
@@ -819,6 +798,65 @@ pub fn ts_value(ts: String) -> Float {
   }
 }
 
+/// Read a conversation, oldest first: a thread's replies, or with no
+/// `thread_ts` a channel's top level. `after_ts` and `before_ts` ("" for
+/// no bound) narrow a channel's history; a thread's replies come whole.
+/// At most 200 messages.
+pub fn read_conversation(
+  client: slackline.Client,
+  channel: String,
+  thread_ts: String,
+  after_ts: String,
+  before_ts: String,
+) -> Result(List(message.Message), String) {
+  case thread_ts {
+    "" -> {
+      let call = conversations.history(channel:) |> history.limit(200)
+      let call = case before_ts {
+        "" -> call
+        ts -> history.latest(call, ts)
+      }
+      case after_ts {
+        "" -> call
+        ts -> history.oldest(call, ts)
+      }
+      |> httpc.send(client)
+      // History is newest first.
+      |> result.map(fn(response) {
+        option.unwrap(response.messages, []) |> list.reverse
+      })
+    }
+    ts ->
+      conversations.replies(channel:, ts:)
+      |> replies.limit(200)
+      |> httpc.send(client)
+      |> result.map(fn(response) { option.unwrap(response.messages, []) })
+  }
+  |> result.map_error(describe)
+}
+
+/// " [attached: a.png, b.txt]" for a message's files, or "".
+pub fn files_note(files: List(Attachment)) -> String {
+  case files {
+    [] -> ""
+    files ->
+      " [attached: "
+      <> string.join(list.map(files, fn(file) { file.name }), ", ")
+      <> "]"
+  }
+}
+
+/// An earlier message's files, to save with the prompt that catches up on
+/// it.
+pub type Earlier {
+  Earlier(ts: String, files: List(Attachment))
+}
+
+/// What a prompt says of what came before it, and the earlier files.
+pub type CatchUp {
+  CatchUp(text: String, earlier: List(Earlier))
+}
+
 /// What happened in a thread between `after_ts` (exclusive; "" for the
 /// start) and `before_ts` (exclusive), from people, as context for the next
 /// prompt. The last `limit` messages are kept; `##` asides are left out.
@@ -830,34 +868,14 @@ pub fn catch_up(
   before_ts: String,
   bot_user: String,
   limit: Int,
-) -> #(String, List(#(String, List(Attachment)))) {
+) -> CatchUp {
   let after = case after_ts {
     "" -> -1.0
     ts -> ts_value(ts)
   }
   let before = ts_value(before_ts)
-  // A code channel is caught up on as a whole; its history is newest first.
-  let found = case thread_ts {
-    "" -> {
-      let call =
-        conversations.history(channel:)
-        |> history.limit(200)
-        |> history.latest(before_ts)
-      case after_ts {
-        "" -> call
-        ts -> history.oldest(call, ts)
-      }
-      |> httpc.send(client)
-      |> result.map(fn(response) {
-        option.unwrap(response.messages, []) |> list.reverse
-      })
-    }
-    ts ->
-      conversations.replies(channel:, ts:)
-      |> replies.limit(200)
-      |> httpc.send(client)
-      |> result.map(fn(response) { option.unwrap(response.messages, []) })
-  }
+  // A code channel is caught up on as a whole.
+  let found = read_conversation(client, channel, thread_ts, after_ts, before_ts)
   let kept =
     result.unwrap(found, [])
     |> list.filter_map(fn(message) {
@@ -866,16 +884,14 @@ pub fn catch_up(
           let at = ts_value(ts)
           case at >. after && at <. before, command(text) {
             True, NotACommand -> {
-              let files = case attachments(message.files) {
-                [] -> ""
-                files ->
-                  " [attached: "
-                  <> string.join(list.map(files, fn(f) { f.name }), ", ")
-                  <> "]"
-              }
+              let files = attachments(message.files)
               Ok(#(
-                "[<@" <> user <> ">] " <> prompt_text(text, bot_user) <> files,
-                #(ts, attachments(message.files)),
+                "[<@"
+                  <> user
+                  <> ">] "
+                  <> prompt_text(text, bot_user)
+                  <> files_note(files),
+                Earlier(ts, files),
               ))
             }
             _, _ -> Error(Nil)
@@ -887,10 +903,10 @@ pub fn catch_up(
   let count = list.length(kept)
   let kept = list.drop(kept, int.max(count - limit, 0))
   let lines = list.map(kept, fn(pair) { pair.0 })
-  let files =
+  let earlier =
     list.filter_map(kept, fn(pair) {
       case pair.1 {
-        #(_, []) -> Error(Nil)
+        Earlier(files: [], ..) -> Error(Nil)
         with_files -> Ok(with_files)
       }
     })
@@ -913,5 +929,5 @@ pub fn catch_up(
       <> ":\n"
       <> string.join(lines, "\n")
   }
-  #(text, files)
+  CatchUp(text:, earlier:)
 }

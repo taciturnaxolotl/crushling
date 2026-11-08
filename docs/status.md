@@ -48,14 +48,19 @@ there, every message in it is a prompt, the context bar shows the repo,
 branch and changed files, and the Code tab holds the diff against the
 default branch. The channel stays open while the agent sleeps; `!done` archives
 it with the last reply as its summary, and a later message in the thread
-opens a new one.
+opens a new one. If Slack will not open a code channel, the work stays in
+the thread. Each run's reply then lists the repository's changed files and
+attaches its diff.
 
 A run is one message: what the agent says streams into it as it is written,
 its steps sit in a plan block in the same message, and the block settles to
-"Done · N steps" while the closing line names the files it changed. That is
-`chat.startStream` / `chat.appendStream` / `chat.stopStream` with plan-mode
-task chunks; where a workspace refuses the streaming API the plan card and
-separate reply messages are used instead, as before.
+"Done · N steps" while the closing line names the files it changed. The
+streaming is slackline's `stream` module: the thread hands it the whole
+reply so far each flush, and it sends only what is new, carries a long run
+on in a new message before Slack's ten-minute and size limits, posts any
+text rewritten after it streamed, and falls back to a plan card and plain
+messages where Slack won't stream. Slack only streams in a channel to a
+named recipient, so each run carries the id of who asked.
 
 A subagent's thread shows what it says between tool calls as it goes, not
 only its final answer.
@@ -119,15 +124,22 @@ single use, so the two would revoke each other.
 | `crushling/crush/event` | Decodes the SSE envelope into `MessageEvent`, `RunCompleteEvent`, `AgentError`, `FileEvent`, or `Other`. |
 | `crushling/run` | Pure state for one run: text by message id, tool calls and their status, file baselines and latest contents. |
 | `crushling/diff` | Myers line diff and unified hunks, so diffs never need `git` on the host. |
-| `crushling/render` | The run as it streams and the final reply: plan title, task rows, live text, split under Slack's markdown-block limit with code fences kept balanced. |
-| `crushling/thread` | One actor per thread. Owns two connections, a workspace and a session; sends prompts with fresh run ids; throttles updates through a `Sink`; reconnects and settles runs stranded by a dropped stream. |
+| `crushling/render` | The run as text and steps: plan title, task rows, the reply so far, split under Slack's markdown-block limit with code fences kept balanced. |
+| `crushling/thread` | One actor per thread. Sends each prompt with a new run id, shows progress through a `Sink`, and ends runs that a dropped stream left open. Keeps the thread's `Venue`, moves the work to a code channel, and tells the registry what happens through `Notice`s. |
+| `crushling/thread/conn` | A thread's two connections to its server, its workspace and session, and shell commands that stay out of the agent's history. |
+| `crushling/thread/subagents` | Gives each subagent its own Slack thread with a plan card and notes, and posts its report back to the parent. |
+| `crushling/thread/repo` | Finds a repository in the workspace, lists its changes, and updates a code channel's context bar and Code tab. |
+| `crushling/venue` | Where a thread's work is. That is the thread, a code channel, an archived channel, or the thread after Slack refused a code channel. |
+| `crushling/sink` | The functions a thread uses to post in Slack. `crushling/slack` builds the real one. |
+| `crushling/meta` | What the bridge saves for each thread (follow, pause, cursor, venue) and each code channel (its thread). Files are replaced whole. |
 | `crushling/snapshot` | Shell commands that snapshot the workspace into a private bare repo under `.crush/` and diff two snapshots. |
 | `crushling/provider` | Claude, Hyper login, or Hyper key: the container's crush.json, env, and login. |
 | `crushling/credentials` | The one refresher of a login; keeps a managed token fresh in every watched container config. |
 | `crushling` | Entry point: reads the settings, starts credentials, the registry and Socket Mode. |
 | `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; turns events into `Incoming`. |
-| `crushling/registry` | Thread key to actor; allowlist, dedupe, `stop`, lazy launch, idle shutdown. |
-| `crushling/slack` | The `Sink` over chat.postMessage/update and chat.startStream/appendStream/stopStream, with markdown and plan blocks and file uploads; prompt text cleanup. |
+| `crushling/registry` | Maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, and writes all thread meta. |
+| `crushling/registry/links` | Links code channels to their threads, in memory and on disk. |
+| `crushling/slack` | The `Sink` over chat.postMessage/update and slackline's `stream` for run replies, with markdown and plan blocks and file uploads; prompt text cleanup. |
 | `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). |
 | `crushling/sandbox` | `docker run` arguments, a policy fingerprint label, adopt/start/recreate, stop (warm) and remove (cold). |
 

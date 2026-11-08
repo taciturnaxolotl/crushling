@@ -33,6 +33,7 @@ import crushling/registry
 import crushling/sandbox
 import crushling/slack_tools
 import crushling/socket
+import crushling/sys
 import gleam/erlang/process
 import gleam/int
 import gleam/io
@@ -140,6 +141,7 @@ fn start() -> Result(Nil, String) {
       client:,
       token: bot_token,
       bot_user: me.user_id,
+      team: me.team_id,
       allowed:,
       idle_ms: idle_minutes * 60_000,
       flush_ms: 1000,
@@ -317,9 +319,6 @@ fn mkdir_p(path: String) -> Result(Nil, String)
 @external(erlang, "crushling_ffi", "write_private")
 fn write_private(path: String, content: String) -> Result(Nil, String)
 
-@external(erlang, "crushling_ffi", "uuid_v4")
-fn uuid_v4() -> String
-
 /// The secret every thread's tool token is derived from, kept beside the
 /// threads so tokens survive a restart.
 fn mcp_secret(root: String) -> Result(String, String) {
@@ -327,7 +326,7 @@ fn mcp_secret(root: String) -> Result(String, String) {
   case read_file(path) {
     Ok(secret) if secret != "" -> Ok(string.trim(secret))
     _ -> {
-      let secret = uuid_v4() <> uuid_v4()
+      let secret = sys.uuid() <> sys.uuid()
       use _ <- result.try(mkdir_p(root))
       use _ <- result.map(write_private(path, secret))
       secret

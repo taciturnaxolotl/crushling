@@ -1,10 +1,12 @@
-//// What the bridge remembers about a thread between restarts, kept next to
-//// its workspace: whether it answers every reply, and how far into the
-//// thread it has read.
+//// What the bridge saves between restarts. For each thread, it saves whether
+//// the thread answers every reply, how far it has read, and where its work is.
+//// For each code channel, it saves the thread the channel belongs to. Each
+//// file is replaced whole, so a crash never leaves half a file.
 
-import gleam/bit_array
+import crushling/venue.{type Venue}
 import gleam/dynamic/decode
 import gleam/json
+import gleam/option.{type Option, None, Some}
 import gleam/result
 
 pub type Meta {
@@ -12,40 +14,30 @@ pub type Meta {
     /// Answer every reply in the thread, not just mentions. Set when the
     /// bot was mentioned in the thread's first message, or in a DM.
     follow: Bool,
-    /// `!pause`d: only mentions reach the agent, even where it would
-    /// otherwise answer everything, until `!resume`.
+    /// Set by `!pause`. Until `!resume`, only mentions reach the agent, even
+    /// where it would otherwise answer everything.
     paused: Bool,
     /// The ts of the last message sent to the agent; later messages are
     /// new to it. "" when it has read nothing.
     cursor: String,
-    /// The code channel the work moved to once the agent cloned a repo,
-    /// and the repo's directory in the workspace. "" until then.
-    code_channel: String,
-    repo: String,
-    /// Set on a code channel's own entry: the thread whose workspace it
-    /// shares, so the channel's messages reach that thread's agent.
-    origin_channel: String,
-    origin_ts: String,
+    venue: Venue,
   )
 }
 
 pub fn new(follow: Bool) -> Meta {
-  Meta(
-    follow:,
-    paused: False,
-    cursor: "",
-    code_channel: "",
-    repo: "",
-    origin_channel: "",
-    origin_ts: "",
-  )
+  Meta(follow:, paused: False, cursor: "", venue: venue.Thread)
+}
+
+/// Where a code channel came from: the thread that opened it, and when.
+pub type Link {
+  Link(origin_channel: String, origin_ts: String, opened_ts: String)
 }
 
 @external(erlang, "crushling_ffi", "read_file")
 fn read_file(path: String) -> Result(String, Nil)
 
-@external(erlang, "crushling_ffi", "write_bytes")
-fn write_bytes(path: String, content: BitArray) -> Result(Nil, String)
+@external(erlang, "crushling_ffi", "write_private")
+fn write_private(path: String, content: String) -> Result(Nil, String)
 
 pub fn read(path: String) -> Result(Meta, Nil) {
   use text <- result.try(read_file(path))
@@ -53,25 +45,31 @@ pub fn read(path: String) -> Result(Meta, Nil) {
     use follow <- decode.optional_field("follow", False, decode.bool)
     use paused <- decode.optional_field("paused", False, decode.bool)
     use cursor <- decode.optional_field("cursor", "", decode.string)
+    use stored <- decode.optional_field(
+      "venue",
+      None,
+      decode.map(venue.decoder(), Some),
+    )
+    // Files from before the venue kept a code channel and its repository.
     use code_channel <- decode.optional_field("code_channel", "", decode.string)
     use repo <- decode.optional_field("repo", "", decode.string)
-    use origin_channel <- decode.optional_field(
-      "origin_channel",
-      "",
-      decode.string,
-    )
-    use origin_ts <- decode.optional_field("origin_ts", "", decode.string)
     decode.success(Meta(
       follow:,
       paused:,
       cursor:,
-      code_channel:,
-      repo:,
-      origin_channel:,
-      origin_ts:,
+      venue: legacy_venue(stored, code_channel, repo),
     ))
   })
   |> result.replace_error(Nil)
+}
+
+fn legacy_venue(stored: Option(Venue), channel: String, repo: String) -> Venue {
+  case stored, channel, repo {
+    Some(venue), _, _ -> venue
+    None, "", "" -> venue.Thread
+    None, "", repo -> venue.Archived(repo)
+    None, channel, repo -> venue.CodeChannel(channel, repo)
+  }
 }
 
 pub fn write(path: String, meta: Meta) -> Result(Nil, String) {
@@ -79,12 +77,31 @@ pub fn write(path: String, meta: Meta) -> Result(Nil, String) {
     #("follow", json.bool(meta.follow)),
     #("paused", json.bool(meta.paused)),
     #("cursor", json.string(meta.cursor)),
-    #("code_channel", json.string(meta.code_channel)),
-    #("repo", json.string(meta.repo)),
-    #("origin_channel", json.string(meta.origin_channel)),
-    #("origin_ts", json.string(meta.origin_ts)),
+    #("venue", venue.to_json(meta.venue)),
   ])
   |> json.to_string
-  |> bit_array.from_string
-  |> write_bytes(path, _)
+  |> write_private(path, _)
+}
+
+pub fn read_link(path: String) -> Result(Link, Nil) {
+  use text <- result.try(read_file(path))
+  json.parse(text, {
+    use origin_channel <- decode.field("origin_channel", decode.string)
+    use origin_ts <- decode.field("origin_ts", decode.string)
+    // Older files kept the opening time as `cursor`.
+    use cursor <- decode.optional_field("cursor", "", decode.string)
+    use opened_ts <- decode.optional_field("opened_ts", cursor, decode.string)
+    decode.success(Link(origin_channel:, origin_ts:, opened_ts:))
+  })
+  |> result.replace_error(Nil)
+}
+
+pub fn write_link(path: String, link: Link) -> Result(Nil, String) {
+  json.object([
+    #("origin_channel", json.string(link.origin_channel)),
+    #("origin_ts", json.string(link.origin_ts)),
+    #("opened_ts", json.string(link.opened_ts)),
+  ])
+  |> json.to_string
+  |> write_private(path, _)
 }

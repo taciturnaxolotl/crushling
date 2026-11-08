@@ -3,6 +3,7 @@
 
 import crushling/registry
 import crushling/slack
+import crushling/sys
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/option.{None, Some}
@@ -13,9 +14,6 @@ import slackline/app
 import slackline/event
 import slackline/httpc
 import stratus
-
-@external(erlang, "crushling_ffi", "log_warning")
-fn warn(text: String) -> Nil
 
 /// The router: Slack events in, `registry.Received` out.
 pub fn router(
@@ -158,7 +156,9 @@ pub fn incoming(
 pub fn run(app_token: String, router: app.App) -> Nil {
   case apps.connections_open() |> httpc.send(slackline.new(app_token)) {
     Error(error) -> {
-      warn("crushling: connections.open: " <> slackline.describe_error(error))
+      sys.warn(
+        "crushling: connections.open: " <> slackline.describe_error(error),
+      )
       process.sleep(5000)
       run(app_token, router)
     }
@@ -180,7 +180,7 @@ fn session(url: String, router: app.App) -> Nil {
   }
   let done = process.new_subject()
   case request.to(url) {
-    Error(Nil) -> warn("crushling: bad Socket Mode url")
+    Error(Nil) -> sys.warn("crushling: bad Socket Mode url")
     Ok(req) -> {
       let started =
         stratus.new(request: req, state: Nil)
@@ -206,7 +206,7 @@ fn session(url: String, router: app.App) -> Nil {
         |> stratus.start
       case started {
         Error(error) ->
-          warn("crushling: Socket Mode connect: " <> string.inspect(error))
+          sys.warn("crushling: Socket Mode connect: " <> string.inspect(error))
         Ok(started) -> {
           let monitor = process.monitor(started.pid)
           let selector =
