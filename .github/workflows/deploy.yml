@@ -26,7 +26,11 @@ jobs:
           gleam-version: "1.19.2"
           rebar3-version: "3"
       - run: gleam format --check src test
-      - run: gleam test
+      # slackline's generated modules are deep enough to overflow the stack
+      # of the prebuilt gleam's compiler threads.
+      - run: ulimit -s unlimited && gleam test
+        env:
+          RUST_MIN_STACK: "268435456"
 
   # The unit runs `gleam run`, which compiles on start, so a deploy is a pull
   # and a restart.
