@@ -84,10 +84,10 @@ pub fn docker_missing_is_unavailable_test() {
 pub fn prepare_creates_dirs_test() {
   let p = sandbox.Policy(..policy(), root: "/tmp/crushling-sandbox-test")
   let assert Ok(Nil) = sandbox.prepare(p, "k")
-  let assert True = sandbox.socket_ready(sandbox.host_workspace(p, "k"))
-  let assert True = sandbox.socket_ready(sandbox.host_socket_dir(p, "k"))
+  let assert True = file_exists(sandbox.host_workspace(p, "k"))
+  let assert True = file_exists(sandbox.host_socket_dir(p, "k"))
   let assert True =
-    sandbox.socket_ready(sandbox.host_crush_data(p, "k") <> "/crush.json")
+    file_exists(sandbox.host_crush_data(p, "k") <> "/crush.json")
 }
 
 pub fn exec_runs_without_a_shell_test() {
@@ -144,3 +144,18 @@ pub fn sandboxes_get_their_own_nameservers_test() {
   let assert False =
     sandbox.fingerprint(policy()) == sandbox.fingerprint(with_dns)
 }
+
+pub fn a_socket_counts_as_ready_test() {
+  let path = "/tmp/crushling-ready-test.sock"
+  let assert Ok(Nil) = listen_unix(path)
+  let assert True = sandbox.socket_ready(path)
+  // Missing, or a plain file, is not ready.
+  let assert False = sandbox.socket_ready("/tmp/crushling-no-such.sock")
+  let assert False = sandbox.socket_ready("/etc/hosts")
+}
+
+@external(erlang, "crushling_test_ffi", "listen_unix")
+fn listen_unix(path: String) -> Result(Nil, String)
+
+@external(erlang, "crushling_ffi", "file_exists")
+fn file_exists(path: String) -> Bool
