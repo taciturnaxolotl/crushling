@@ -245,8 +245,10 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
     Stop -> {
       case state.active {
-        Some(active) ->
+        Some(active) -> {
           close_reply(state.sink, state.config.root, active, "_stopped._")
+          state.sink.working(False)
+        }
         None -> Nil
       }
       case state.connection {
@@ -392,6 +394,10 @@ fn fail_everything(state: State, reason: String) -> State {
       Nil
     }
   }
+  case state.waiting, state.active {
+    [], None -> Nil
+    _, _ -> state.sink.working(False)
+  }
   State(..state, waiting: [], active: None)
 }
 
@@ -531,7 +537,16 @@ fn on_event(state: State, event: event.Event) -> State {
     None -> state
     Some(active) -> {
       let run = run.apply(active.run, state.known, event)
-      let active = Active(..active, run:, last_event_ms: sys.monotonic_ms())
+      let now = sys.monotonic_ms()
+      // The stall note cleared "Working…"; the agent is back, so is it.
+      let active = case active.stalled {
+        True -> {
+          state.sink.working(True)
+          Active(..active, stalled: False, working_since_ms: now)
+        }
+        False -> active
+      }
+      let active = Active(..active, run:, last_event_ms: now)
       State(..state, active: Some(active))
       |> move_on_clone(event)
       |> finish_if_done
