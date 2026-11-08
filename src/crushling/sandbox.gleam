@@ -378,5 +378,5 @@ pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
   |> result.map_error(Filesystem)
 }
 
-@external(erlang, "crushling_ffi", "file_exists")
+@external(erlang, "crushling_ffi", "is_socket")
 pub fn socket_ready(path: String) -> Bool

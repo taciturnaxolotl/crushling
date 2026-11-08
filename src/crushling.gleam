@@ -62,6 +62,9 @@ import slackline/httpc
 @external(erlang, "crushling_ffi", "getenv")
 fn getenv(name: String) -> Result(String, Nil)
 
+@external(erlang, "crushling_ffi", "file_exists")
+fn file_exists(path: String) -> Bool
+
 @external(erlang, "crushling_ffi", "expand_home")
 fn expand_home(path: String) -> String
 
@@ -281,7 +284,7 @@ fn login_path(name: String, main: Bool) -> Result(String, String) {
       True -> setting("CRUSHLING_LOGIN", default)
       False -> default
     })
-  case sandbox.socket_ready(path) {
+  case file_exists(path) {
     True -> Ok(path)
     False ->
       Error(
