@@ -25,10 +25,10 @@ packages = [
   { name = "gun", version = "2.7.0", build_tools = ["make", "rebar3"], requirements = ["cowlib"], otp_app = "gun", source = "hex", outer_checksum = "2A90D073069E72654B6C9A91FAE365B746FF5CE385A4A5BBF71EF53A8BF95D82" },
   { name = "hpack_erl", version = "0.3.0", build_tools = ["rebar3"], requirements = [], otp_app = "hpack", source = "hex", outer_checksum = "D6137D7079169D8C485C6962DFE261AF5B9EF60FBC557344511C1E65E3D95FB0" },
   { name = "logging", version = "1.5.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "logging", source = "hex", outer_checksum = "BC5F18CE5DD9686100229FE5409BDC3DD5C46D5A7DF2F804AD2D8F0DD6C5060E" },
-  { name = "mimetype", version = "0.25.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "mimetype", source = "hex", outer_checksum = "42D21B2A77ABB6D8AC24500DCC1ED073AE264BF0A2F0655AEDA5FD9E61C43344" },
+  { name = "mimetype", version = "0.26.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "mimetype", source = "hex", outer_checksum = "93BEE229CD27802FBC991951B92E558C5DE9BD496CF0F6A0444FC0BA156204B7" },
   { name = "mist", version = "6.0.3", build_tools = ["gleam"], requirements = ["exception", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "glisten", "gramps", "hpack_erl", "logging"], otp_app = "mist", source = "hex", outer_checksum = "1B07F321D5FA0CB162D81496F2DE96AEB6EF8980F4F38230A4CC3F849497E020" },
-  { name = "multipartkit", version = "0.15.0", build_tools = ["gleam"], requirements = ["gleam_stdlib", "gleam_yielder", "mimetype"], otp_app = "multipartkit", source = "hex", outer_checksum = "A991D771F2394F6EEB873820C8869F0BC17E71102B87885FE58C0F231ADAFD68" },
-  { name = "slackline", version = "1.0.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_erlang", "gleam_fetch", "gleam_http", "gleam_httpc", "gleam_javascript", "gleam_json", "gleam_otp", "gleam_stdlib", "multipartkit"], otp_app = "slackline", source = "hex", outer_checksum = "7FFB98D732BF5024A0CD26638CC1FFCAD4C2FCBF66FD4FA44B7D947E9EA91277" },
+  { name = "multipartkit", version = "0.16.0", build_tools = ["gleam"], requirements = ["gleam_stdlib", "gleam_yielder", "mimetype"], otp_app = "multipartkit", source = "hex", outer_checksum = "31CD7F42E0AF6D44312724390C3D70DE3D85129918B553D6EAA875F3EA32B4E7" },
+  { name = "slackline", version = "2.0.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_erlang", "gleam_fetch", "gleam_http", "gleam_httpc", "gleam_javascript", "gleam_json", "gleam_otp", "gleam_stdlib", "multipartkit"], otp_app = "slackline", source = "hex", outer_checksum = "25F63BAEBD1878425E0BD9A2B28E4119C4630F3684F9E5288780401EE9C3DFAF" },
   { name = "splitter", version = "1.3.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "splitter", source = "hex", outer_checksum = "8F1485306E0D59168A39E12ED8844F9F616EC59C3C63AFCFDAE04DBD68690CBC" },
   { name = "stratus", version = "3.0.0", build_tools = ["gleam"], requirements = ["exception", "gleam_crypto", "gleam_erlang", "gleam_http", "gleam_otp", "gleam_stdlib", "gramps", "logging"], otp_app = "stratus", source = "hex", outer_checksum = "21C93D657E4E7964E36EACDE83609459F259289DF403B5FEBD3C60612594BE24" },
 ]
@@ -43,5 +43,5 @@ gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.11.0 and < 2.0.0" }
 gun = { version = ">= 2.7.0 and < 3.0.0" }
 mist = { version = ">= 6.0.3 and < 7.0.0" }
-slackline = { version = ">= 1.0.0 and < 2.0.0" }
+slackline = { version = ">= 2.0.0 and < 3.0.0" }
 stratus = { version = ">= 3.0.0 and < 4.0.0" }
