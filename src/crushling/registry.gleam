@@ -531,6 +531,7 @@ fn launch(state: State, key: String, entry: Entry) -> State {
           flush_ms: config.flush_ms,
           mode: config.mode,
           notify: fn(notice) { process.send(self, FromThread(key, notice)) },
+          on_connect: fn(_) { Nil },
         ),
       )
       |> result.map_error(fn(error) { "thread: " <> string.inspect(error) })

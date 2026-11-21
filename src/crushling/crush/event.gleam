@@ -69,6 +69,10 @@ pub type Event {
   RunCompleteEvent(RunComplete)
   AgentError(session_id: String, run_id: String, error: String)
   FileEvent(FileVersion)
+  /// The stream could not resume from the `Last-Event-ID` it was opened
+  /// with, so events may have been missed. `reason` is one of `invalid_id`,
+  /// `epoch_mismatch`, `unknown_id`, `expired` or `gap`.
+  Resync(reason: String, last_event_id: String)
   Other(kind: String)
 }
 
@@ -78,6 +82,19 @@ pub fn parse(data: String) -> Result(Event, json.DecodeError) {
 
 pub fn decoder() -> Decoder(Event) {
   use kind <- decode.field("type", decode.string)
+  case kind {
+    // A resync's payload is the body itself, with no operation.
+    "resync" ->
+      decode.at(["payload"], {
+        use reason <- str("reason")
+        use last_event_id <- str("last_event_id")
+        decode.success(Resync(reason:, last_event_id:))
+      })
+    _ -> operation_decoder(kind)
+  }
+}
+
+fn operation_decoder(kind: String) -> Decoder(Event) {
   use op <- decode.subfield(["payload", "type"], lenient_string())
   case kind {
     "message" -> body(message_decoder()) |> decode.map(MessageEvent(op, _))

@@ -95,6 +95,15 @@ fn with_timeout(seconds: Int, body: fn() -> Nil) -> Dynamic
 @external(erlang, "real_server_ffi", "kill_on_socket")
 fn kill_on_socket(socket: String) -> Nil
 
+@external(erlang, "real_server_ffi", "suspend")
+fn suspend(pid: process.Pid) -> Nil
+
+@external(erlang, "real_server_ffi", "resume")
+fn resume(pid: process.Pid) -> Nil
+
+@external(erlang, "real_server_ffi", "close_socket")
+fn close_socket(conn: gun.Conn) -> Nil
+
 @external(erlang, "real_server_ffi", "guarded")
 fn guarded(body: fn() -> a, cleanup: fn() -> Nil) -> a
 
@@ -119,6 +128,7 @@ pub fn real_server_test_() -> Dynamic {
       to_dynamic([
         with_timeout(600, fn() { queued_prompts_and_bash_diff(wiring) }),
         with_timeout(600, fn() { survives_server_restart(wiring) }),
+        with_timeout(600, fn() { resumes_a_dropped_stream(wiring) }),
         with_timeout(600, fn() { registry_launches_and_idles(wiring) }),
         with_timeout(600, fn() { shutdown_cancels_and_stops(wiring) }),
         with_timeout(600, fn() { subagents_get_their_own_threads(wiring) }),
@@ -336,6 +346,14 @@ fn on_finished(then: fn(thread.Finished) -> Nil) -> fn(thread.Notice) -> Nil {
 }
 
 fn start_thread(env: Env) -> #(Subject(thread.Message), Subject(Call)) {
+  start_observed(env, fn(_) { Nil })
+}
+
+/// A thread that hands each event connection it opens to `on_connect`.
+fn start_observed(
+  env: Env,
+  on_connect: fn(gun.Conn) -> Nil,
+) -> #(Subject(thread.Message), Subject(Call)) {
   let calls = process.new_subject()
   let assert Ok(t) =
     thread.start(thread.Config(
@@ -347,6 +365,7 @@ fn start_thread(env: Env) -> #(Subject(thread.Message), Subject(Call)) {
       flush_ms: 250,
       mode: client.Sysadmin,
       notify: on_finished(fn(finished) { process.send(calls, Done(finished)) }),
+      on_connect:,
     ))
   #(t, calls)
 }
@@ -460,6 +479,82 @@ fn survives_server_restart(wiring: Wiring) -> Nil {
   let assert True = says(after, "GAMMA")
 
   process.send(t, thread.Stop)
+}
+
+/// The thread's event connection drops mid-run and stays down until the run
+/// has ended on the server. The reconnected stream replays the missed
+/// events, so the run finishes normally from its replayed `run_complete`.
+fn resumes_a_dropped_stream(wiring: Wiring) -> Nil {
+  use env <- with_env("resume", wiring)
+  let opened = process.new_subject()
+  let #(t, calls) = start_observed(env, process.send(opened, _))
+  let assert Ok(pid) = process.subject_owner(t)
+  let assert Ok(events) = process.receive(opened, 30_000)
+  process.send(
+    t,
+    prompt(
+      "Use the bash tool to run: sleep 5\nThen reply with exactly the word DONE.",
+    ),
+  )
+  await_progress(calls, "▸")
+
+  // Hold the workspace with a client of the test's own, so it outlives the
+  // thread's detach grace however long the run takes.
+  let assert Ok(watcher) = gun.connect_unix(env.socket, 5000)
+  let watcher_id = sys.uuid()
+  let assert Ok(workspace_id) =
+    client.perform(
+      watcher,
+      client.create_workspace(env.work, watcher_id, client.Yolo, []),
+    )
+  let assert Ok(Some(session_id)) =
+    client.perform(watcher, client.latest_session(workspace_id))
+
+  // Drop the event connection from the client's side while the thread is
+  // paused, so it can't reconnect before the run ends.
+  suspend(pid)
+  close_socket(events)
+  await_idle(watcher, workspace_id, session_id, 120)
+  resume(pid)
+
+  let #(finished, said) = await_finished_saying(calls, [])
+  let assert run.Completed(_) = finished.outcome
+  let assert True = says(finished, "DONE")
+  let assert False =
+    list.any(said, fn(text) { string.contains(text, "lost the connection") })
+
+  let _ = client.perform(watcher, client.retire_client(watcher_id))
+  gun.close(watcher)
+  process.send(t, thread.Stop)
+}
+
+/// Wait up to `tries` half seconds for the session to stop being busy.
+fn await_idle(
+  conn: gun.Conn,
+  workspace_id: String,
+  session_id: String,
+  tries: Int,
+) -> Nil {
+  case client.perform(conn, client.session_busy(workspace_id, session_id)) {
+    Ok(False) -> Nil
+    _ if tries > 0 -> {
+      process.sleep(500)
+      await_idle(conn, workspace_id, session_id, tries - 1)
+    }
+    _ -> panic as "the run never ended on the server"
+  }
+}
+
+/// The next finished run, and everything posted before it.
+fn await_finished_saying(
+  calls: Subject(Call),
+  said: List(String),
+) -> #(thread.Finished, List(String)) {
+  case process.receive(calls, 240_000) {
+    Ok(Done(finished)) -> #(finished, said)
+    Ok(Progress(text)) -> await_finished_saying(calls, [text, ..said])
+    Error(Nil) -> panic as "no run finished within 4 minutes"
+  }
 }
 
 type Launch {
@@ -673,18 +768,21 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
   use env <- with_env("subagent", wiring)
   let calls = process.new_subject()
   let assert Ok(t) =
-    thread.start(thread.Config(
-      socket: env.socket,
-      root: env.work,
-      title: "crushling subagent test",
-      venue: venue.Thread,
-      sink: recording_sink(calls, False),
-      flush_ms: 250,
-      mode: client.Sysadmin,
-      notify: on_finished(fn(finished) {
-        process.send(calls, MainFinished(finished.solicited))
-      }),
-    ))
+    thread.start(
+      thread.Config(
+        socket: env.socket,
+        root: env.work,
+        title: "crushling subagent test",
+        venue: venue.Thread,
+        sink: recording_sink(calls, False),
+        flush_ms: 250,
+        mode: client.Sysadmin,
+        notify: on_finished(fn(finished) {
+          process.send(calls, MainFinished(finished.solicited))
+        }),
+        on_connect: fn(_) { Nil },
+      ),
+    )
   process.send(
     t,
     prompt(
@@ -825,18 +923,21 @@ fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
     )
   let calls = process.new_subject()
   let assert Ok(t) =
-    thread.start(thread.Config(
-      socket: env.socket,
-      root: env.work,
-      title: "crushling code channel test",
-      venue: venue.Thread,
-      sink: code_sink(calls, False, opens),
-      flush_ms: 250,
-      mode: client.Sysadmin,
-      notify: on_finished(fn(finished) {
-        process.send(calls, CodeFinished(finished.changes, finished.patch))
-      }),
-    ))
+    thread.start(
+      thread.Config(
+        socket: env.socket,
+        root: env.work,
+        title: "crushling code channel test",
+        venue: venue.Thread,
+        sink: code_sink(calls, False, opens),
+        flush_ms: 250,
+        mode: client.Sysadmin,
+        notify: on_finished(fn(finished) {
+          process.send(calls, CodeFinished(finished.changes, finished.patch))
+        }),
+        on_connect: fn(_) { Nil },
+      ),
+    )
   process.send(
     t,
     prompt(
@@ -1005,18 +1106,21 @@ fn subagents_use_extra_providers(wiring: Wiring) -> Nil {
   use <- guarded(_, fn() { teardown(env) })
   let calls = process.new_subject()
   let assert Ok(t) =
-    thread.start(thread.Config(
-      socket: env.socket,
-      root: env.work,
-      title: "crushling extra provider test",
-      venue: venue.Thread,
-      sink: recording_sink(calls, False),
-      flush_ms: 250,
-      mode: client.Sysadmin,
-      notify: on_finished(fn(finished) {
-        process.send(calls, MainFinished(finished.solicited))
-      }),
-    ))
+    thread.start(
+      thread.Config(
+        socket: env.socket,
+        root: env.work,
+        title: "crushling extra provider test",
+        venue: venue.Thread,
+        sink: recording_sink(calls, False),
+        flush_ms: 250,
+        mode: client.Sysadmin,
+        notify: on_finished(fn(finished) {
+          process.send(calls, MainFinished(finished.solicited))
+        }),
+        on_connect: fn(_) { Nil },
+      ),
+    )
   process.send(
     t,
     prompt(

@@ -22,6 +22,7 @@ import crushling/snapshot
 import crushling/sys
 import crushling/thread/conn.{type Connection}
 import crushling/thread/repo
+import crushling/thread/resume
 import crushling/thread/subagents.{type Subagents}
 import crushling/venue.{type Venue}
 import gleam/dict
@@ -81,6 +82,9 @@ pub type Config {
     /// list of dangerous commands.
     mode: client.PermissionMode,
     notify: fn(Notice) -> Nil,
+    /// Called with the event stream's connection each time it attaches. Tests
+    /// use it to drop the connection; elsewhere it does nothing.
+    on_connect: fn(gun.Conn) -> Nil,
   )
 }
 
@@ -155,6 +159,12 @@ type State {
     /// Kept across reconnects. Sessions are stored in the sandbox's database,
     /// so a new actor for the same workspace finds the latest one.
     session_id: Option(String),
+    /// The workspace joined last, kept across reconnects so a dropped
+    /// connection rejoins it instead of setting up a new one.
+    workspace_id: Option(String),
+    /// Where the event stream left off, kept across reconnects so a new
+    /// stream replays what the old one missed.
+    cursor: resume.Cursor,
     venue: Venue,
     sink: Sink,
     waiting: List(Queued),
@@ -219,6 +229,8 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       ),
       connection: None,
       session_id: None,
+      workspace_id: None,
+      cursor: resume.new(),
       venue: config.venue,
       sink: config.sink,
       waiting: [],
@@ -334,19 +346,41 @@ fn cancel(state: State, note: Option(String)) -> State {
 
 /// Connect (or reconnect) to the server, join the workspace, open the event
 /// stream, and get a session.
+///
+/// A reconnect rejoins the same workspace when the server still has it, and
+/// resumes the event stream after the last event handled. The server then
+/// replays what was missed, so a run that went on, or even ended, while the
+/// stream was down carries on as if nothing happened. If it can't, the stream
+/// starts with a resync, and `on_sse` settles the run. Without an event to
+/// resume from, the run is settled at once.
+///
+/// `conn.open` returns once the event stream is attached, so queued prompts
+/// are only sent, and an orphaned run only settled, on a ready connection.
 fn connect(state: State) -> State {
   close_connection(state)
   let state = State(..state, connection: None)
-  case conn.open(state.target, state.session_id) {
-    Ok(connection) ->
-      State(
-        ..state,
-        connection: Some(connection),
-        session_id: Some(connection.session_id),
-        retries: 0,
-      )
-      |> settle_orphan(connection)
+  let resume =
+    conn.Resume(
+      workspace_id: state.workspace_id,
+      last_event_id: resume.last(state.cursor),
+    )
+  case conn.open(state.target, state.session_id, resume) {
+    Ok(connection) -> {
+      state.config.on_connect(connection.events)
+      let state =
+        State(
+          ..state,
+          connection: Some(connection),
+          session_id: Some(connection.session_id),
+          workspace_id: Some(connection.workspace_id),
+          retries: 0,
+        )
+      case connection.resumed {
+        True -> state
+        False -> settle_orphan(state, connection)
+      }
       |> send_next
+    }
     Error(reason) -> {
       sys.warn("crushling: connect failed: " <> reason)
       case state.retries >= max_retries {
@@ -360,8 +394,9 @@ fn connect(state: State) -> State {
   }
 }
 
-/// After a reconnect, a run whose `run_complete` may have been missed is
-/// finished with what was seen, unless the session is still busy.
+/// After a reconnect that could not replay what was missed, a run whose
+/// `run_complete` may have been missed is finished with what was seen, unless
+/// the session is still busy.
 fn settle_orphan(state: State, connection: Connection) -> State {
   case state.active {
     None -> state
@@ -496,18 +531,7 @@ fn on_gun(state: State, message: gun.Message) -> State {
     Some(connection) ->
       case message {
         gun.Event(stream:, event: sse, ..) if stream == connection.stream ->
-          case event.parse(sse.data) {
-            Ok(parsed) -> on_event(state, parsed)
-            Error(_) -> state
-          }
-        gun.StreamResponse(stream:, status:, ..)
-          if stream == connection.stream && status != 200
-        -> {
-          sys.warn(
-            "crushling: event stream refused: " <> string.inspect(status),
-          )
-          reconnect_soon(state)
-        }
+          on_sse(state, connection, sse)
         gun.StreamEnd(stream:, ..)
           | gun.StreamError(stream:, ..)
           if stream == connection.stream
@@ -520,6 +544,26 @@ fn on_gun(state: State, message: gun.Message) -> State {
         }
         _ -> state
       }
+  }
+}
+
+/// Handle an event from the stream, once. An event with an id that was
+/// already handled, before a drop or earlier in a replay, is skipped.
+fn on_sse(state: State, connection: Connection, sse: gun.SseEvent) -> State {
+  case event.parse(sse.data) {
+    Ok(event.Resync(reason:, ..)) -> {
+      sys.warn("crushling: event stream could not resume: " <> reason)
+      State(..state, cursor: resume.resynced(state.cursor, sse.id))
+      |> settle_orphan(connection)
+    }
+    parsed -> {
+      let #(fresh, cursor) = resume.admit(state.cursor, sse.id)
+      let state = State(..state, cursor:)
+      case fresh, parsed {
+        True, Ok(parsed) -> on_event(state, parsed)
+        _, _ -> state
+      }
+    }
   }
 }
 

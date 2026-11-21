@@ -135,6 +135,18 @@ pub fn create_workspace(
   )
 }
 
+/// Check that a workspace still exists on the server, without joining it.
+/// A workspace that is gone answers 404.
+pub fn get_workspace(id: String) -> Call(Nil) {
+  Call(
+    Get,
+    workspace(id),
+    None,
+    200,
+    parse_with(decode.at(["id"], decode.string) |> decode.map(fn(_) { Nil })),
+  )
+}
+
 /// The SSE stream path. It must be opened within 30s of creating the
 /// workspace and kept open, or the server releases the workspace.
 pub fn events_path(workspace_id: String, client_id: String) -> String {

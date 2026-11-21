@@ -20,6 +20,8 @@ pub type Response {
 }
 
 pub type SseEvent {
+  /// `id` is set only when the frame itself had an `id:` line, unlike the
+  /// SSE spec's last event id, which carries over to frames without one.
   SseEvent(event: String, id: Option(String), data: String)
 }
 
@@ -96,6 +98,33 @@ pub fn stream(
   path: String,
   headers: List(#(String, String)),
 ) -> StreamRef
+
+/// Open a GET event stream that resumes after `last_event_id`, sent as the
+/// `Last-Event-ID` header.
+@external(erlang, "crushling_gun_ffi", "stream")
+pub fn resume_stream(
+  conn: Conn,
+  path: String,
+  headers: List(#(String, String)),
+  last_event_id: Option(String),
+) -> StreamRef
+
+/// The request headers of an event stream, for `resume_stream`.
+@external(erlang, "crushling_gun_ffi", "stream_headers")
+pub fn stream_headers(
+  headers: List(#(String, String)),
+  last_event_id: Option(String),
+) -> List(#(String, String))
+
+/// Wait for a stream's response status. The events after it are delivered
+/// as messages as usual; a stream answered with anything but 200 is
+/// cancelled.
+@external(erlang, "crushling_gun_ffi", "await_stream")
+pub fn await_stream(
+  conn: Conn,
+  stream: StreamRef,
+  timeout_ms: Int,
+) -> Result(Int, String)
 
 @external(erlang, "crushling_gun_ffi", "cancel")
 pub fn cancel(conn: Conn, stream: StreamRef) -> Nil

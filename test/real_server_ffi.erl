@@ -3,7 +3,8 @@
 %% Run and kill a real `crush server` for the gated end-to-end test.
 
 -export([enabled/0, start/4, kill/1, wait_for_file/2, sh/2, env/2, timeout/2,
-         api_key/1, claude_version/0, expand_home/1, guarded/2, kill_on_socket/1]).
+         api_key/1, claude_version/0, expand_home/1, guarded/2, kill_on_socket/1,
+         suspend/1, resume/1, close_socket/1]).
 
 enabled() ->
     case os:getenv("CRUSHLING_REAL") of
@@ -136,4 +137,20 @@ guarded(Body, Cleanup) ->
 %% Kill every server listening on Socket, whichever restart started it.
 kill_on_socket(Socket) ->
     os:cmd("pkill -9 -f 'crush server --host unix://" ++ unicode:characters_to_list(Socket) ++ "'"),
+    nil.
+
+%% Pause and resume an actor. Messages for it queue up meanwhile.
+suspend(Pid) ->
+    sys:suspend(Pid),
+    nil.
+
+resume(Pid) ->
+    sys:resume(Pid),
+    nil.
+
+%% Shut down a gun connection's socket from the client's side, as a network
+%% drop would; gun then tells the connection's owner it is down.
+close_socket(Conn) ->
+    #{socket := Socket} = gun:info(Conn),
+    ok = gen_tcp:shutdown(Socket, read_write),
     nil.
