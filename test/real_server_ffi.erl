@@ -3,7 +3,7 @@
 %% Run and kill a real `crush server` for the gated end-to-end test.
 
 -export([enabled/0, start/4, kill/1, wait_for_file/2, sh/2, env/2, timeout/2,
-         api_key/1, claude_version/0, expand_home/1, guarded/2, kill_on_socket/1,
+         api_key/1, expand_home/1, guarded/2, kill_on_socket/1,
          suspend/1, resume/1, close_socket/1]).
 
 enabled() ->
@@ -23,7 +23,8 @@ env(Name, Default) ->
 %% Start `crush server` on Socket, logging to Log, with its global config
 %% and data in Home and Extra ("K=V" strings) in its environment. Provider
 %% variables from the caller's environment are cleared so the server only
-%% sees what the test gives it. Returns the OS pid.
+%% sees what the test gives it: crush lets CRUSH_<NAME> override <NAME>, so
+%% CRUSH_HYPER_API_KEY would take Hyper around the proxy. Returns the OS pid.
 start(Socket, Log, Home, Extra) ->
     Crush = case os:find_executable("crush") of
         false -> error(crush_not_on_path);
@@ -31,17 +32,21 @@ start(Socket, Log, Home, Extra) ->
     end,
     Cmd = io_lib:format("exec '~ts' server --host 'unix://~ts' >>'~ts' 2>&1",
                         [Crush, Socket, Log]),
+    Given = [list_to_tuple(string:split(unicode:characters_to_list(E), "="))
+             || E <- Extra],
+    Names = [N || {N, _} <- Given],
+    Cleared = [{N, false} || N <- ["HYPER_URL", "HYPER_API_KEY", "CRUSH_HYPER_URL",
+                                   "CRUSH_HYPER_API_KEY", "ANTHROPIC_API_KEY",
+                                   "HONCHO_API_KEY"],
+                             not lists:member(N, Names)],
     Port = open_port({spawn_executable, "/bin/sh"},
                      [{args, ["-c", lists:flatten(Cmd)]},
-                      {env, [{"HYPER_URL", false}, {"HYPER_API_KEY", false},
-                             {"ANTHROPIC_API_KEY", false},
-                             {"CRUSH_SERVER_IDLE_TIMEOUT", "600"},
+                      {env, Cleared ++
+                            [{"CRUSH_SERVER_IDLE_TIMEOUT", "600"},
                              {"CRUSH_GLOBAL_CONFIG", unicode:characters_to_list([Home, "/config"])},
                              {"CRUSH_GLOBAL_DATA", unicode:characters_to_list([Home, "/data"])},
-                             {"HONCHO_CONFIG_DIR", unicode:characters_to_list([Home, "/honcho"])},
-                             {"HONCHO_API_KEY", false}
-                             | [list_to_tuple(string:split(unicode:characters_to_list(E), "="))
-                                || E <- Extra]]},
+                             {"HONCHO_CONFIG_DIR", unicode:characters_to_list([Home, "/honcho"])}
+                             | Given]},
                       exit_status, hide]),
     {os_pid, OsPid} = erlang:port_info(Port, os_pid),
     unlink(Port),
@@ -78,22 +83,6 @@ api_key(Name) ->
     case first_set([unicode:characters_to_list(Name)]) of
         {ok, V} -> {ok, unicode:characters_to_binary(V)};
         none -> {error, nil}
-    end.
-
-%% The installed Claude Code's version, or crush's floor without one.
-claude_version() ->
-    case first_set(["CRUSHLING_CLAUDE_VERSION"]) of
-        {ok, V} -> unicode:characters_to_binary(V);
-        none ->
-            case os:find_executable("claude") of
-                false -> <<"2.1.282">>;
-                Claude ->
-                    Out = os:cmd(Claude ++ " --version 2>/dev/null"),
-                    case re:run(Out, "[0-9]+\\.[0-9]+\\.[0-9]+", [{capture, first, binary}]) of
-                        {match, [V]} -> V;
-                        nomatch -> <<"2.1.282">>
-                    end
-            end
     end.
 
 expand_home(<<"~/", Rest/binary>>) ->

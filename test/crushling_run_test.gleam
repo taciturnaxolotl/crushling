@@ -367,8 +367,15 @@ pub fn explain_test() {
     cause(
       "bad request: 400 {\"message\":\"prompt is too long: 241668 tokens > 200000 maximum\"}",
     )
-  let assert "The model provider rejected crushling's login" =
+  let assert "The bridge's Hyper key was rejected" =
     cause("unauthorized: authentication failed")
+  let assert True =
+    string.contains(
+      render.explain("401 invalid api key").1,
+      "CRUSHLING_HYPER_KEY",
+    )
+  // No Claude login or version advice is left.
+  let assert "Something went wrong" = cause("claude_code_version_too_old")
   let assert "The model provider is rate limiting us" =
     cause("429 Too Many Requests: rate_limit_error")
   let assert "The model provider is having trouble" =

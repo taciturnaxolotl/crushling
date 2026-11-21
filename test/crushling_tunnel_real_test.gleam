@@ -105,8 +105,8 @@ fn dial_health_events_bye() -> Nil {
   let assert Ok(events) = gun.connect_unix(shim, 5000)
   let stream = gun.stream(events, client.events_path(workspace, client_id), [])
   let selector = gun.select(process.new_selector(), fn(m) { m })
-  let assert Ok(gun.StreamResponse(status: 200, stream: got, ..)) =
-    process.selector_receive(selector, 10_000)
+  let assert gun.StreamResponse(status: 200, stream: got, ..) =
+    next_for(selector, events)
   let assert True = got == stream
   // The request connection still works while the stream is open.
   let assert Ok(Nil) = client.perform(requests, client.health())
@@ -116,4 +116,21 @@ fn dial_health_events_bye() -> Nil {
   tunnel.bye(tunnels, key)
   let assert Ok(0) = wait_exit(crush, 30_000)
   Nil
+}
+
+/// The next gun message about `conn`. Earlier tests in the same process can
+/// leave messages about their own connections behind.
+fn next_for(
+  selector: process.Selector(gun.Message),
+  conn: gun.Conn,
+) -> gun.Message {
+  let assert Ok(message) = process.selector_receive(selector, 10_000)
+  case message {
+    gun.Ignored -> next_for(selector, conn)
+    gun.ConnDown(conn: other, ..)
+      | gun.StreamResponse(conn: other, ..)
+      if other != conn
+    -> next_for(selector, conn)
+    _ -> message
+  }
 }

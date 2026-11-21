@@ -11,33 +11,29 @@
 //// | `CRUSHLING_EVENTS_BIND`, `CRUSHLING_EVENTS_PORT` | where that endpoint listens; default `127.0.0.1:7470` |
 //// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode; with both set, events are taken both ways |
 //// | `CRUSHLING_ALLOWED_USERS` | comma-separated Slack user ids who may use it |
-//// | `CRUSHLING_BACKEND` | `claude` (default), `hyper`, or `hyper-key` |
-//// | `CRUSHLING_LOGIN` | the backend's login crush.json; default `~/.local/state/crushling/<claude\|hyper>/crush.json` |
-//// | `CRUSH_HYPER_API_KEY` | the key, for `hyper-key` |
-//// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | models |
-//// | `CRUSHLING_EXTRA_BACKENDS` | comma-separated extra backends (`claude`, `hyper`, `hyper-key`) whose models agents can pick for subagents; each login lives at its default path |
-//// | `CRUSHLING_CLAUDE_VERSION` | Claude Code version to present; default the installed `claude`, else crush's floor |
+//// | `CRUSHLING_HYPER_KEY` | required: the org's Charm Hyper API key. Agents use Hyper through the bridge's inference proxy at `/proxy/<thread>` and never see the key |
+//// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | Hyper models; default `deepseek-v4.1-flash` and `prism-flash` |
 //// | `CRUSHLING_MODE` | `sysadmin` (default: no permission prompts and no blocked commands) or `yolo` |
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
-//// | `CRUSHLING_ROOT` | where thread workspaces live; default `~/.local/state/crushling/threads` |
+//// | `CRUSHLING_ROOT` | where thread workspaces live; default `~/.local/state/crushling/threads`. The tunnels' unix sockets live under it too, so it must be at most 79 bytes |
 //// | `CRUSHLING_IDLE_MINUTES` | idle time before a thread's agent is stopped; default 15 |
 //// | `CRUSHLING_SHUTDOWN_GRACE_SECONDS` | on SIGTERM, how long running turns get to finish before they are cancelled; default 60 |
-//// | `CRUSHLING_CRUSH` | for `docker`, a static `crush` binary on this machine to mount into each sandbox instead of the image's own; replacing the file (rename over it) gives new sandboxes the new one |
+//// | `CRUSHLING_CRUSH` | a `crush` with `--dial` to run instead of the default. For `docker`, a static linux binary on this machine to mount into each sandbox instead of the image's own; replacing the file (rename over it) gives new sandboxes the new one. For `local`, a binary for this machine instead of the `crush` on `PATH` |
 //// | `CRUSHLING_DNS` | for `docker`, comma-separated nameservers for the sandboxes, since docker's DNS doesn't answer gVisor on a custom network; default `1.1.1.1,9.9.9.9`, or `off` for docker's own |
 //// | `HONCHO_API_KEY`, `HONCHO_URL`, `HONCHO_WORKSPACE`, `HONCHO_PEER_NAME`, `HONCHO_AI_PEER` | passed into every sandbox, so agents remember across threads with Honcho |
-//// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc-uds`, `sbx-egress` |
-//// | `CRUSHLING_MCP_PORT`, `CRUSHLING_MCP_BIND` | where the agents' Slack tools are served; default `7469` on `127.0.0.1` |
+//// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc`, `sbx-egress` |
+//// | `CRUSHLING_BRIDGE_PORT`, `CRUSHLING_BRIDGE_BIND` | where the sandbox server listens: the one port agents reach the bridge on, for their tunnels, the inference proxy and their Slack tools; default `7469` on `127.0.0.1`. `CRUSHLING_MCP_PORT` and `CRUSHLING_MCP_BIND` are the old names, still read |
+//// | `CRUSHLING_BRIDGE_URL` | how an agent reaches that port; default `http://127.0.0.1:<port>` for `local`, required for `docker` (an address the sandbox network may reach, such as its gateway). `CRUSHLING_MCP_URL` is the old name, still read |
+//// | `CRUSHLING_SANDBOX_CPUS`, `CRUSHLING_SANDBOX_MEMORY` | each docker sandbox's CPU and memory caps, as docker's `--cpus` and `--memory` take them; default `2` and `4g` |
+//// | `CRUSHLING_HELLO_TIMEOUT_SECONDS` | how long a starting agent gets to dial in before it is stopped; default 30 |
 //// | `CRUSHLING_TAILSCALE_CLIENT_ID`, `CRUSHLING_TAILSCALE_CLIENT_SECRET` | an OAuth client with the `auth_keys` scope that owns the tag; with it, people can put a thread's sandbox on the tailnet for a while |
 //// | `CRUSHLING_TAILSCALE_API_KEY` | an API access token, instead of the OAuth client |
 //// | `CRUSHLING_TAILSCALE_TAG` | the tag sandboxes join with; default `tag:crushling` |
 //// | `CRUSHLING_TAILSCALE_TAILNET` | the tailnet's name; default `-`, the credential's own |
-//// | `CRUSHLING_HYPER_KEY` | the org's Hyper API key for the inference proxy at `/proxy/<thread>` on the sandbox server; without it the proxy is off |
 //// | `CRUSHLING_PROXY_UPSTREAM` | where the proxy sends requests; default `https://hyper.charm.land` |
 //// | `CRUSHLING_PROXY_THREAD_CAP_USD`, `CRUSHLING_PROXY_THREAD_CAP_TOKENS` | what one thread may spend through the proxy, in US dollars and/or tokens; unset is unlimited |
 //// | `CRUSHLING_PROXY_INSTANCE_CAP_USD`, `CRUSHLING_PROXY_INSTANCE_CAP_TOKENS` | the same for all threads together |
-//// | `CRUSHLING_MCP_URL` | how an agent reaches them; default `http://127.0.0.1:<port>` for `local`, none for `docker` (set it to an address the sandbox network may reach, or `off`) |
 
-import crushling/credentials
 import crushling/crush/client
 import crushling/events
 import crushling/launcher
@@ -69,14 +65,8 @@ import slackline/httpc
 @external(erlang, "crushling_ffi", "getenv")
 fn getenv(name: String) -> Result(String, Nil)
 
-@external(erlang, "crushling_ffi", "file_exists")
-fn file_exists(path: String) -> Bool
-
 @external(erlang, "crushling_ffi", "expand_home")
 fn expand_home(path: String) -> String
-
-@external(erlang, "crushling_ffi", "claude_version")
-fn installed_claude_version() -> String
 
 @external(erlang, "crushling_ffi", "exec")
 fn exec(
@@ -110,7 +100,6 @@ fn start() -> Result(Nil, String) {
   use bot_token <- result.try(required("SLACK_BOT_TOKEN"))
   use delivery <- result.try(delivery())
   use allowed <- result.try(allowed_users())
-  use backend <- result.try(backend())
   use mode <- result.try(case setting("CRUSHLING_MODE", "sysadmin") {
     "sysadmin" -> Ok(client.Sysadmin)
     "yolo" -> Ok(client.Yolo)
@@ -121,6 +110,38 @@ fn start() -> Result(Nil, String) {
     |> result.replace_error("CRUSHLING_IDLE_MINUTES is not a number"),
   )
 
+  let root =
+    expand_home(setting("CRUSHLING_ROOT", "~/.local/state/crushling/threads"))
+  use _ <- result.try(
+    tunnel.check_root(root)
+    |> result.map_error(fn(reason) { "CRUSHLING_ROOT: " <> reason }),
+  )
+  use secret <- result.try(mcp_secret(root))
+  use proxy <- result.try(proxy_from_settings(secret))
+  use tunnels <- result.try(tunnel.start(
+    tunnel.Config(..tunnel.config(secret, root), on_event: log_tunnel_event),
+  ))
+  use port <- result.try(
+    int.parse(fallback("CRUSHLING_BRIDGE_PORT", "CRUSHLING_MCP_PORT", "7469"))
+    |> result.replace_error("CRUSHLING_BRIDGE_PORT is not a number"),
+  )
+  let local = setting("CRUSHLING_LAUNCHER", "docker") == "local"
+  use bridge_url <- result.try(bridge_url(local, port))
+  use hello_s <- result.try(
+    int.parse(setting("CRUSHLING_HELLO_TIMEOUT_SECONDS", "30"))
+    |> result.replace_error("CRUSHLING_HELLO_TIMEOUT_SECONDS is not a number"),
+  )
+  let bridge =
+    launcher.bridge(
+      url: bridge_url,
+      secret:,
+      tunnels:,
+      proxy:,
+      hello_timeout_ms: hello_s * 1000,
+    )
+  use launcher <- result.try(launcher_for(root, models(), bridge))
+  let tailnet = tailnet(launcher)
+
   let client = slackline.new(bot_token)
   use me <- result.try(
     auth.test_()
@@ -129,39 +150,6 @@ fn start() -> Result(Nil, String) {
       "auth.test: " <> slackline.describe_error(error)
     }),
   )
-
-  use extras <- result.try(extra_backends())
-  use creds <- result.try(
-    provider.logins(backend, extras)
-    |> list.try_map(fn(login) {
-      credentials.start(login)
-      |> result.map_error(fn(error) { "credentials: " <> string.inspect(error) })
-    }),
-  )
-
-  let root =
-    expand_home(setting("CRUSHLING_ROOT", "~/.local/state/crushling/threads"))
-  use secret <- result.try(mcp_secret(root))
-  // Dial-out tunnels, served with the Slack tools. No launcher uses them
-  // yet: crush still listens on a socket.
-  use tunnels <- result.try(tunnel.start(tunnel.config(secret, root)))
-  use port <- result.try(
-    int.parse(setting("CRUSHLING_MCP_PORT", "7469"))
-    |> result.replace_error("CRUSHLING_MCP_PORT is not a number"),
-  )
-  let local = setting("CRUSHLING_LAUNCHER", "docker") == "local"
-  let mcp_url = case getenv("CRUSHLING_MCP_URL"), local {
-    Ok("off"), _ -> ""
-    Ok(url), _ -> url
-    Error(Nil), True -> "http://127.0.0.1:" <> int.to_string(port)
-    Error(Nil), False -> ""
-  }
-  let bridge = case mcp_url {
-    "" -> launcher.no_bridge()
-    url -> launcher.Bridge(url:, env: fn(key) { mcp.env(secret, key) })
-  }
-  use launcher <- result.try(launcher_for(root, backend, extras, creds, bridge))
-  let tailnet = tailnet(launcher)
 
   use registry <- result.try(
     registry.start(registry.Config(
@@ -175,6 +163,7 @@ fn start() -> Result(Nil, String) {
       flush_ms: 1000,
       mode:,
       tailnet:,
+      stop_backoff_ms: registry.default_stop_backoff_ms,
     ))
     |> result.map_error(fn(error) { "registry: " <> string.inspect(error) }),
   )
@@ -190,68 +179,43 @@ fn start() -> Result(Nil, String) {
     <> int.to_string(set.size(allowed))
     <> " allowed users",
   )
-  use proxy <- result.try(proxy_from_settings(secret))
-  let mcp_routes = case mcp_url {
-    "" -> {
-      io.println(
-        "crushling: Slack tools off; set CRUSHLING_MCP_URL so agents can reach them",
-      )
-      []
-    }
-    _ -> {
-      let context =
-        slack_tools.Context(
-          client:,
-          bot_user: me.user_id,
-          launcher:,
-          lookup: fn(key) {
-            process.call(registry, 5000, registry.Lookup(key, _))
-          },
-          ask_tailnet: fn(key, reason) {
-            process.call(registry, 5000, fn(reply) {
-              registry.Tailnet(key, tailnet.Asked(reason, reply))
-            })
-          },
-        )
-      [
-        mcp.route(
-          secret,
-          slack_tools.tools(tailnet: tailnet != option.None),
-          fn(key, name, arguments) {
-            slack_tools.call(context, key, name, arguments)
-          },
-        ),
-      ]
-    }
-  }
-  let proxy_routes = case proxy {
-    option.Some(proxy) -> [proxy.route(proxy)]
-    option.None -> []
-  }
-  use _ <- result.try(case list.append(mcp_routes, proxy_routes) {
-    [] -> Ok(Nil)
-    routes -> {
-      let bind = setting("CRUSHLING_MCP_BIND", "127.0.0.1")
-      use _ <- result.map(
-        sandbox_http.start(bind, port, [tunnel.route(tunnels), ..routes]),
-      )
-      case mcp_url {
-        "" -> Nil
-        url -> io.println("crushling: Slack tools at " <> url)
-      }
-      case proxy {
-        option.Some(_) ->
-          io.println(
-            "crushling: inference proxy at "
-            <> bind
-            <> ":"
-            <> int.to_string(port)
-            <> "/proxy/<thread>",
-          )
-        option.None -> Nil
-      }
-    }
-  })
+  let context =
+    slack_tools.Context(
+      client:,
+      bot_user: me.user_id,
+      launcher:,
+      lookup: fn(key) { process.call(registry, 5000, registry.Lookup(key, _)) },
+      ask_tailnet: fn(key, reason) {
+        process.call(registry, 5000, fn(reply) {
+          registry.Tailnet(key, tailnet.Asked(reason, reply))
+        })
+      },
+    )
+  // Every agent reaches the bridge here: its tunnel, its inference and its
+  // Slack tools.
+  let bind =
+    fallback("CRUSHLING_BRIDGE_BIND", "CRUSHLING_MCP_BIND", "127.0.0.1")
+  use _ <- result.try(
+    sandbox_http.start(bind, port, [
+      tunnel.route(tunnels),
+      proxy.route(proxy),
+      mcp.route(
+        secret,
+        slack_tools.tools(tailnet: tailnet != option.None),
+        fn(key, name, arguments) {
+          slack_tools.call(context, key, name, arguments)
+        },
+      ),
+    ]),
+  )
+  io.println(
+    "crushling: sandbox server at "
+    <> bind
+    <> ":"
+    <> int.to_string(port)
+    <> ", reached by agents at "
+    <> bridge_url,
+  )
 
   let grace_s =
     int.parse(setting("CRUSHLING_SHUTDOWN_GRACE_SECONDS", "60"))
@@ -289,10 +253,25 @@ fn start() -> Result(Nil, String) {
   // Over HTTP the registry ignores new messages once it is draining.
   option.map(socket, process.kill)
   let done = process.new_subject()
-  process.send(registry, registry.Shutdown(grace_s * 1000, done))
-  let _ = process.receive(done, grace_s * 1000 + 60_000)
-  io.println("crushling: stopped")
-  halt(0)
+  let grace_ms = grace_s * 1000
+  process.send(registry, registry.Shutdown(grace_ms, done))
+  // One deadline for all of it, from the registry's own timers.
+  case process.receive(done, registry.shutdown_budget_ms(grace_ms)) {
+    Ok(registry.Clean) -> {
+      io.println("crushling: stopped")
+      halt(0)
+    }
+    Ok(outcome) -> {
+      io.println_error(
+        "crushling: shutdown incomplete: " <> string.inspect(outcome),
+      )
+      halt(1)
+    }
+    Error(Nil) -> {
+      io.println_error("crushling: shutdown timed out")
+      halt(1)
+    }
+  }
   Ok(Nil)
 }
 
@@ -313,81 +292,52 @@ fn allowed_users() -> Result(set.Set(String), String) {
   }
 }
 
-fn login_path(name: String, main: Bool) -> Result(String, String) {
-  let default = "~/.local/state/crushling/" <> name <> "/crush.json"
-  let path =
-    expand_home(case main {
-      True -> setting("CRUSHLING_LOGIN", default)
-      False -> default
-    })
-  case file_exists(path) {
-    True -> Ok(path)
-    False ->
-      Error(
-        "no "
-        <> name
-        <> " login at "
-        <> path
-        <> "; seed one with CRUSH_GLOBAL_DATA=<its dir> crush login "
-        <> name,
-      )
+/// A setting under its current name, else its old one.
+fn fallback(name: String, old: String, default: String) -> String {
+  case getenv(name) {
+    Ok(value) -> value
+    Error(Nil) -> setting(old, default)
   }
 }
 
-fn backend() -> Result(provider.Backend, String) {
-  backend_named(setting("CRUSHLING_BACKEND", "claude"), True)
+fn models() -> provider.Models {
+  provider.Models(
+    large: setting("CRUSHLING_LARGE", provider.default_large),
+    small: setting("CRUSHLING_SMALL", provider.default_small),
+  )
 }
 
-/// Providers the agents can also pick models from for subagents, from
-/// `CRUSHLING_EXTRA_BACKENDS`.
-fn extra_backends() -> Result(List(provider.Backend), String) {
-  setting("CRUSHLING_EXTRA_BACKENDS", "")
-  |> string.split(",")
-  |> list.map(string.trim)
-  |> list.filter(fn(name) { name != "" })
-  |> list.try_map(fn(name) { backend_named(name, False) })
-}
-
-/// `main` is whether this is the main backend, which `CRUSHLING_LOGIN` and
-/// the model settings apply to.
-fn backend_named(name: String, main: Bool) -> Result(provider.Backend, String) {
-  let login_path = fn(name) { login_path(name, main) }
-  let model = fn(key, default) {
-    case main {
-      True -> setting(key, default)
-      False -> default
-    }
+/// How agents reach the sandbox server. Sandboxes can't reach the host's
+/// loopback, so docker has no default.
+fn bridge_url(local: Bool, port: Int) -> Result(String, String) {
+  let url = case getenv("CRUSHLING_BRIDGE_URL"), getenv("CRUSHLING_MCP_URL") {
+    Ok(url), _ | Error(Nil), Ok(url) -> url
+    Error(Nil), Error(Nil) -> ""
   }
-  case name {
-    "claude" -> {
-      use login <- result.try(login_path("claude"))
-      Ok(provider.Claude(
-        login:,
-        version: setting("CRUSHLING_CLAUDE_VERSION", installed_claude_version()),
-        large: model("CRUSHLING_LARGE", "claude-opus-4-8"),
-        small: model("CRUSHLING_SMALL", "claude-haiku-4-5-20251001"),
-      ))
-    }
-    "hyper" -> {
-      use login <- result.try(login_path("hyper"))
-      Ok(provider.Hyper(
-        login:,
-        large: model("CRUSHLING_LARGE", "deepseek-v4.1-flash"),
-        small: model("CRUSHLING_SMALL", "prism-flash"),
-      ))
-    }
-    "hyper-key" -> {
-      use key <- result.try(required("CRUSH_HYPER_API_KEY"))
-      Ok(provider.HyperKey(
-        key:,
-        large: model("CRUSHLING_LARGE", "deepseek-v4.1-flash"),
-        small: model("CRUSHLING_SMALL", "prism-flash"),
-      ))
-    }
-    other ->
+  let url = case string.ends_with(url, "/") {
+    True -> string.drop_end(url, 1)
+    False -> url
+  }
+  case url, local {
+    "off", _ ->
       Error(
-        "backend " <> other <> " is unknown; use claude, hyper, or hyper-key",
+        "CRUSHLING_BRIDGE_URL can no longer be off: agents dial the bridge there",
       )
+    "", True -> Ok("http://127.0.0.1:" <> int.to_string(port))
+    "", False ->
+      Error(
+        "CRUSHLING_BRIDGE_URL is not set; set it to an address of this machine the sandbox network may reach on the bridge port",
+      )
+    url, _ -> Ok(url)
+  }
+}
+
+/// Whether a thread's crush is connected only matters to its launch, which
+/// waits for it; the rest is for the log.
+fn log_tunnel_event(event: tunnel.Event) -> Nil {
+  case event {
+    tunnel.Dialed(key) -> sys.info("crushling: " <> key <> " dialed in")
+    tunnel.Undialed(key) -> sys.info("crushling: " <> key <> " hung up")
   }
 }
 
@@ -417,17 +367,16 @@ fn mcp_secret(root: String) -> Result(String, String) {
 
 fn launcher_for(
   root: String,
-  backend: provider.Backend,
-  extras: List(provider.Backend),
-  creds: launcher.Credentials,
+  models: provider.Models,
   bridge: launcher.Bridge,
 ) -> Result(launcher.Launcher, String) {
+  let crush = setting("CRUSHLING_CRUSH", "")
   case setting("CRUSHLING_LAUNCHER", "docker") {
     "local" -> {
       io.println(
         "crushling: local launcher, agents run unsandboxed with your access",
       )
-      Ok(launcher.local(root, backend, extras, creds, bridge))
+      Ok(launcher.local(root, crush, models, bridge))
     }
     "docker" -> {
       use uid <- result.try(id("-u"))
@@ -436,17 +385,17 @@ fn launcher_for(
         sandbox.Policy(
           docker: "docker",
           image: setting("CRUSHLING_IMAGE", "crushling-sandbox:latest"),
-          runtime: setting("CRUSHLING_RUNTIME", "runsc-uds"),
+          runtime: setting("CRUSHLING_RUNTIME", "runsc"),
           network: setting("CRUSHLING_NETWORK", "sbx-egress"),
-          cpus: "2",
-          memory: "4g",
+          cpus: setting("CRUSHLING_SANDBOX_CPUS", "2"),
+          memory: setting("CRUSHLING_SANDBOX_MEMORY", "4g"),
           pids: 1024,
           uid:,
           gid:,
           root:,
-          env: list.append(provider.env_for(backend, extras), honcho_env()),
-          crush_config: provider.config_for(backend, extras, bridge.url),
-          crush: setting("CRUSHLING_CRUSH", ""),
+          env: honcho_env(),
+          crush_config: provider.config(models, bridge.url),
+          crush:,
           dns: case setting("CRUSHLING_DNS", "1.1.1.1,9.9.9.9") {
             "off" -> []
             servers ->
@@ -454,8 +403,9 @@ fn launcher_for(
               |> list.map(string.trim)
               |> list.filter(fn(server) { server != "" })
           },
+          bridge_url: bridge.url,
         )
-      Ok(launcher.docker(policy, creds, bridge))
+      Ok(launcher.docker(policy, bridge))
     }
     other -> Error("CRUSHLING_LAUNCHER is " <> other <> "; use docker or local")
   }
@@ -542,38 +492,37 @@ fn honcho_env() -> List(String) {
   })
 }
 
-/// The inference proxy, when `CRUSHLING_HYPER_KEY` is set. Errors name the
-/// setting, never its value.
-fn proxy_from_settings(
-  secret: String,
-) -> Result(option.Option(proxy.Proxy), String) {
-  case getenv("CRUSHLING_HYPER_KEY") {
-    Error(Nil) | Ok("") -> Ok(option.None)
-    Ok(org_key) -> {
-      let cap = fn(scope) {
-        let name = fn(unit) { "CRUSHLING_PROXY_" <> scope <> "_CAP_" <> unit }
-        proxy.parse_cap(setting(name("TOKENS"), ""), setting(name("USD"), ""))
-        |> result.map_error(fn(error) {
-          case error {
-            proxy.BadTokens -> name("TOKENS") <> " is not a whole number"
-            proxy.BadUsd -> name("USD") <> " is not a dollar amount"
-          }
-        })
+/// The inference proxy, with the org's key from `CRUSHLING_HYPER_KEY`.
+/// Errors name the setting, never its value.
+fn proxy_from_settings(secret: String) -> Result(proxy.Proxy, String) {
+  use org_key <- result.try(case getenv("CRUSHLING_HYPER_KEY") {
+    Ok(key) if key != "" -> Ok(key)
+    _ ->
+      Error(
+        "CRUSHLING_HYPER_KEY is not set; agents use Hyper through the bridge with the org's key",
+      )
+  })
+  let cap = fn(scope) {
+    let name = fn(unit) { "CRUSHLING_PROXY_" <> scope <> "_CAP_" <> unit }
+    proxy.parse_cap(setting(name("TOKENS"), ""), setting(name("USD"), ""))
+    |> result.map_error(fn(error) {
+      case error {
+        proxy.BadTokens -> name("TOKENS") <> " is not a whole number"
+        proxy.BadUsd -> name("USD") <> " is not a dollar amount"
       }
-      use thread_cap <- result.try(cap("THREAD"))
-      use instance_cap <- result.try(cap("INSTANCE"))
-      proxy.start(proxy.Config(
-        secret:,
-        org_key:,
-        upstream: setting("CRUSHLING_PROXY_UPSTREAM", proxy.default_upstream),
-        thread_cap:,
-        instance_cap:,
-        max_per_thread: proxy.default_max_per_thread,
-        max_uploads: proxy.default_max_uploads,
-        upload_timeout_ms: proxy.default_upload_timeout_ms,
-      ))
-      |> result.map(option.Some)
-      |> result.map_error(fn(reason) { "CRUSHLING_PROXY_UPSTREAM " <> reason })
-    }
+    })
   }
+  use thread_cap <- result.try(cap("THREAD"))
+  use instance_cap <- result.try(cap("INSTANCE"))
+  proxy.start(proxy.Config(
+    secret:,
+    org_key:,
+    upstream: setting("CRUSHLING_PROXY_UPSTREAM", proxy.default_upstream),
+    thread_cap:,
+    instance_cap:,
+    max_per_thread: proxy.default_max_per_thread,
+    max_uploads: proxy.default_max_uploads,
+    upload_timeout_ms: proxy.default_upload_timeout_ms,
+  ))
+  |> result.map_error(fn(reason) { "CRUSHLING_PROXY_UPSTREAM " <> reason })
 }

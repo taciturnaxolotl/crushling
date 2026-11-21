@@ -282,7 +282,9 @@ pub fn unknown_data_id_is_404_test() {
 pub fn hello_marks_the_key_dialed_test() {
   let b = bridge()
   let assert Ok(path) = tunnel.open(b.tunnels, b.key)
-  let assert True = path == b.root <> "/" <> b.key <> "/shim.sock"
+  let assert True = path == tunnel.shim_path(b.root, b.key)
+  let assert True = string.starts_with(path, b.root <> "/s/")
+  let assert True = string.ends_with(path, ".sock")
   let assert Error(_) = tunnel.await_hello(b.tunnels, b.key, 50)
   let assert False = tunnel.dialed(b.tunnels, b.key)
   let seen = process.new_subject()
@@ -542,7 +544,21 @@ pub fn open_checks_the_key_and_path_test() {
     tunnel.start(tunnel.config(secret, "/tmp/" <> string.repeat("r", 95)))
   let assert Error(reason) = tunnel.open(long, "C1-1.2")
   let assert True = string.contains(reason, "too long")
-  let assert True = string.contains(reason, "/shim.sock")
+  let assert True = string.contains(reason, ".sock")
+}
+
+pub fn shim_paths_fit_any_key_test() {
+  let root = "/tmp/" <> string.repeat("r", 70)
+  let assert Ok(Nil) = tunnel.check_root(root)
+  let long = string.repeat("k", 64)
+  let assert True =
+    string.byte_size(tunnel.shim_path(root, long))
+    == string.byte_size(tunnel.shim_path(root, "C1-1.0"))
+  let assert False =
+    tunnel.shim_path(root, "C1-1.0") == tunnel.shim_path(root, "C1-1.00")
+  let assert Error(reason) =
+    tunnel.check_root("/tmp/" <> string.repeat("r", 95))
+  let assert True = string.contains(reason, "at most")
 }
 
 pub fn reissued_open_that_times_out_is_forgotten_test() {

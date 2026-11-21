@@ -1,31 +1,26 @@
 //// End to end against a real `crush server` and a real model, wired as in
 //// production. Skipped unless `CRUSHLING_REAL=1`:
 ////
-////     CRUSHLING_REAL=1 gleam test                               # hyper key
-////     CRUSHLING_REAL=1 CRUSHLING_TEST_BACKEND=claude gleam test # Claude
-////     CRUSHLING_REAL=1 CRUSHLING_TEST_BACKEND=hyper-login gleam test
+////     PATH=~/.local/state/crushling-dev:$PATH CRUSHLING_REAL=1 gleam test
 ////
-//// The hyper key comes from `CRUSH_HYPER_API_KEY` (environment or `.env`).
-//// The logins are crush.json files only crushling uses, at
-//// `CRUSHLING_CLAUDE_LOGIN` / `CRUSHLING_HYPER_LOGIN` (default
-//// `~/.local/state/crushling/<claude|hyper>/crush.json`). Seed one with
-////
-////     CRUSH_GLOBAL_DATA=~/.local/state/crushling/claude crush login claude
-////
-//// With a login, the server only ever holds a managed token (no refresh
-//// token) that `credentials` keeps fresh, as a container does. Never point a
-//// test at the login your own crush uses: refresh tokens are single use.
+//// The `crush` on `PATH` must have `--dial` and resumable event streams.
+//// Every agent uses Hyper through a real inference proxy (`crushling/proxy`)
+//// with the org's key from `CRUSHLING_HYPER_KEY`, else `CRUSH_HYPER_API_KEY`
+//// (environment or `.env`). The agents themselves only ever see a thread
+//// token. Agents the local launcher starts dial in through the tunnel, as a
+//// sandbox does; the others listen on a unix socket the test connects to.
 ////
 //// Models can be overridden with `CRUSHLING_TEST_LARGE` and
 //// `CRUSHLING_TEST_SMALL`. Assertions are about structure (order, diffs,
 //// history), never wording, beyond asking the model to echo a marker word.
 
-import crushling/credentials
 import crushling/crush/client
 import crushling/gun
 import crushling/launcher
 import crushling/mcp
 import crushling/provider
+import crushling/proxy
+import crushling/proxy/meter
 import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/render
@@ -36,6 +31,7 @@ import crushling/slack_tools
 import crushling/snapshot
 import crushling/sys
 import crushling/thread
+import crushling/tunnel
 import crushling/venue
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
@@ -64,12 +60,6 @@ fn start_server(
 
 @external(erlang, "real_server_ffi", "api_key")
 fn api_key(name: String) -> Result(String, Nil)
-
-@external(erlang, "real_server_ffi", "claude_version")
-fn claude_version() -> String
-
-@external(erlang, "real_server_ffi", "expand_home")
-fn expand_home(path: String) -> String
 
 @external(erlang, "crushling_ffi", "file_exists")
 fn file_exists(path: String) -> Bool
@@ -123,8 +113,7 @@ pub fn real_server_test_() -> Dynamic {
   case enabled() {
     False -> to_dynamic([])
     True -> {
-      let backend = backend()
-      let wiring = Wiring(backend, start_credentials(backend))
+      let wiring = start_wiring()
       to_dynamic([
         with_timeout(600, fn() { queued_prompts_and_bash_diff(wiring) }),
         with_timeout(600, fn() { survives_server_restart(wiring) }),
@@ -136,92 +125,83 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { failed_code_channel_keeps_the_diff(wiring) }),
         with_timeout(600, fn() { agent_uses_slack_tools(wiring) }),
         with_timeout(600, fn() { prompts_carry_images(wiring) }),
-        ..case env("CRUSHLING_TEST_EXTRA", "") {
-          "claude" -> [
-            with_timeout(600, fn() { subagents_use_extra_providers(wiring) }),
-          ]
-          _ -> []
-        }
       ])
     }
   }
 }
 
-fn backend() -> provider.Backend {
-  let large = fn(default) { env("CRUSHLING_TEST_LARGE", default) }
-  let small = fn(default) { env("CRUSHLING_TEST_SMALL", default) }
-  case env("CRUSHLING_TEST_BACKEND", "hyper") {
-    "claude" ->
-      provider.Claude(
-        login: login_path("CRUSHLING_CLAUDE_LOGIN", "claude"),
-        version: claude_version(),
-        large: large("claude-haiku-4-5-20251001"),
-        small: small("claude-haiku-4-5-20251001"),
-      )
-    "hyper-login" ->
-      provider.Hyper(
-        login: login_path("CRUSHLING_HYPER_LOGIN", "hyper"),
-        large: large("deepseek-v4.1-flash"),
-        small: small("prism-flash"),
-      )
-    _ -> {
-      let assert Ok(key) = api_key("CRUSH_HYPER_API_KEY")
-        as "set CRUSH_HYPER_API_KEY in the environment or .env"
-      provider.HyperKey(
-        key:,
-        large: large("deepseek-v4.1-flash"),
-        small: small("prism-flash"),
-      )
-    }
-  }
-}
-
-fn login_path(variable: String, name: String) -> String {
-  let path =
-    expand_home(env(
-      variable,
-      "~/.local/state/crushling/" <> name <> "/crush.json",
-    ))
-  case file_exists(path) {
-    True -> path
-    False ->
-      panic as {
-        "no crushling "
-        <> name
-        <> " login at "
-        <> path
-        <> "; seed one with CRUSH_GLOBAL_DATA=<its dir> crush login "
-        <> name
-      }
-  }
-}
-
-type Wiring {
-  Wiring(
-    backend: provider.Backend,
-    credentials: option.Option(process.Subject(credentials.Message)),
+fn models() -> provider.Models {
+  provider.Models(
+    large: env("CRUSHLING_TEST_LARGE", provider.default_large),
+    small: env("CRUSHLING_TEST_SMALL", provider.default_small),
   )
 }
 
-/// One credentials actor for every test, as for every thread in production.
-/// Started unlinked, because EUnit runs the generator in a process that
-/// exits before the tests do.
-fn start_credentials(
-  backend: provider.Backend,
-) -> option.Option(process.Subject(credentials.Message)) {
-  case provider.login(backend) {
-    None -> None
-    Some(login) -> {
-      let started = process.new_subject()
-      process.spawn_unlinked(fn() {
-        let assert Ok(creds) = credentials.start(login)
-        process.send(started, creds)
-        process.sleep_forever()
-      })
-      let assert Ok(creds) = process.receive(started, 10_000)
-      Some(creds)
+const secret = "real-test-secret"
+
+type Wiring {
+  Wiring(
+    models: provider.Models,
+    /// The bridge every test's agents use: the proxy and the tunnels,
+    /// served on one port as in production.
+    bridge: launcher.Bridge,
+    proxy: proxy.Proxy,
+  )
+}
+
+/// One proxy and one set of tunnels for every test, as for every thread in
+/// production. Started unlinked, because EUnit runs the generator in a
+/// process that exits before the tests do.
+fn start_wiring() -> Wiring {
+  let org_key = case api_key("CRUSHLING_HYPER_KEY") {
+    Ok(key) -> key
+    Error(Nil) -> {
+      let assert Ok(key) = api_key("CRUSH_HYPER_API_KEY")
+        as "set CRUSHLING_HYPER_KEY or CRUSH_HYPER_API_KEY in the environment or .env"
+      key
     }
   }
+  let n = int.absolute_value(unique()) % 1_000_000
+  let port = 30_000 + n % 2000
+  let url = "http://127.0.0.1:" <> int.to_string(port)
+  let started = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let assert Ok(p) =
+      proxy.start(proxy.Config(
+        secret:,
+        org_key:,
+        upstream: env("CRUSHLING_PROXY_UPSTREAM", proxy.default_upstream),
+        thread_cap: meter.unlimited,
+        instance_cap: meter.unlimited,
+        max_per_thread: proxy.default_max_per_thread,
+        max_uploads: proxy.default_max_uploads,
+        upload_timeout_ms: proxy.default_upload_timeout_ms,
+      ))
+    let assert Ok(tunnels) =
+      tunnel.start(tunnel.config(
+        secret,
+        "/tmp/crushling-real-tunnels-" <> int.to_string(n),
+      ))
+    let assert Ok(Nil) =
+      sandbox_http.start("127.0.0.1", port, [
+        tunnel.route(tunnels),
+        proxy.route(p),
+      ])
+    process.send(started, #(p, tunnels))
+    process.sleep_forever()
+  })
+  let assert Ok(#(p, tunnels)) = process.receive(started, 10_000)
+  Wiring(
+    models: models(),
+    bridge: launcher.bridge(
+      url:,
+      secret:,
+      tunnels:,
+      proxy: p,
+      hello_timeout_ms: launcher.default_hello_timeout_ms,
+    ),
+    proxy: p,
+  )
 }
 
 type Env {
@@ -237,20 +217,12 @@ type Env {
 }
 
 fn setup(name: String, wiring: Wiring) -> Env {
-  setup_with(name, wiring, launcher.no_bridge())
+  setup_with(name, wiring, wiring.bridge)
 }
 
+/// A server on a unix socket, using `bridge` for its Slack tools and
+/// inference.
 fn setup_with(name: String, wiring: Wiring, bridge: launcher.Bridge) -> Env {
-  setup_full(name, wiring, bridge, [], [])
-}
-
-fn setup_full(
-  name: String,
-  wiring: Wiring,
-  bridge: launcher.Bridge,
-  extras: List(provider.Backend),
-  extra_creds: List(process.Subject(credentials.Message)),
-) -> Env {
   let dir =
     "/tmp/crushling-real-"
     <> name
@@ -264,26 +236,12 @@ fn setup_full(
       "git init -q && printf 'first line\\n' > notes.txt && git add . && git -c user.email=t@t -c user.name=t commit -qm init",
     )
   let home = dir <> "/home"
-  let Wiring(backend:, credentials: creds) = wiring
   let assert Ok(Nil) = mkdir_p(home <> "/config")
   let assert Ok(Nil) = mkdir_p(home <> "/data")
   let config = home <> "/data/crush.json"
   let assert Ok(Nil) =
-    write_private(config, provider.config_for(backend, extras, bridge.url))
-  list.each([creds, ..list.map(extra_creds, Some)], fn(creds) {
-    case creds {
-      Some(creds) -> {
-        let assert Ok(Nil) = credentials.watch(creds, config)
-        Nil
-      }
-      None -> Nil
-    }
-  })
-  let server_env =
-    list.append(
-      provider.env_for(backend, extras),
-      bridge.env(string.inspect(unique())),
-    )
+    write_private(config, provider.config(wiring.models, bridge.url))
+  let server_env = bridge.env(int.to_string(int.absolute_value(unique())))
   let socket = dir <> "/crush.sock"
   let log = dir <> "/server.log"
   let server = start_server(socket, log, home, server_env)
@@ -570,14 +528,8 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-registry-"
     <> int.to_string(int.absolute_value(unique()))
-  let local =
-    launcher.local(
-      root,
-      wiring.backend,
-      [],
-      option.values([wiring.credentials]),
-      launcher.no_bridge(),
-    )
+  let key = registry.key("C1", "10.1")
+  let local = launcher.local(root, "", wiring.models, wiring.bridge)
   let launches = process.new_subject()
   let watched =
     launcher.Launcher(
@@ -587,8 +539,9 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
         result
       },
       stop: fn(key) {
-        local.stop(key)
+        let result = local.stop(key)
         process.send(launches, Stopped(key))
+        result
       },
       exists: local.exists,
       meta_path: local.meta_path,
@@ -598,8 +551,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
     )
   use <-
     guarded(_, fn() {
-      let _ =
-        sh("/tmp", "pkill -9 -f 'crush server --host unix://" <> root <> "'")
+      let _ = sh("/tmp", "pkill -9 -f '" <> dialing(key) <> "'")
       let _ = sh("/tmp", "rm -rf '" <> root <> "'")
       Nil
     })
@@ -618,6 +570,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       flush_ms: 250,
       mode: client.Sysadmin,
       tailnet: None,
+      stop_backoff_ms: registry.default_stop_backoff_ms,
     ))
   process.send(
     r,
@@ -633,13 +586,26 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       ),
     ),
   )
-  let assert Ok(Launched(key)) = process.receive(launches, 60_000)
-  let assert True = key == registry.key("C1", "10.1")
+  let assert Ok(Launched(launched)) = process.receive(launches, 60_000)
+  let assert True = launched == key
   let assert Ok(Stopped(stopped)) = process.receive(launches, 240_000)
   let assert True = stopped == key
   // The session survives: its messages are still in the workspace.
   let assert True = file_exists(root <> "/" <> key <> "/work/.crush/crush.db")
+  // The turn's inference went through the proxy, metered as the thread's.
+  let used = proxy.totals(wiring.proxy, key)
+  let assert True = used.requests >= 1
+  let assert True = used.input_tokens > 0
+  let assert True = used.output_tokens > 0
+  // Stopped, its crush has gone.
+  let assert "" = string.trim(sh("/tmp", "pgrep -f '" <> dialing(key) <> "'"))
   Nil
+}
+
+/// A pattern for `pgrep -f` that matches the local crush dialing in for
+/// `key`, and no other.
+fn dialing(key: String) -> String {
+  "crush server --dial .*/tunnel/" <> string.replace(key, ".", "\\.") <> "$"
 }
 
 /// Shutdown mid-run: the turn gets its grace period, is then cancelled, and
@@ -648,14 +614,8 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-shutdown-"
     <> int.to_string(int.absolute_value(unique()))
-  let local =
-    launcher.local(
-      root,
-      wiring.backend,
-      [],
-      option.values([wiring.credentials]),
-      launcher.no_bridge(),
-    )
+  let key = registry.key("C1", "20.1")
+  let local = launcher.local(root, "", wiring.models, wiring.bridge)
   let launches = process.new_subject()
   let watched =
     launcher.Launcher(
@@ -665,8 +625,9 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
         result
       },
       stop: fn(key) {
-        local.stop(key)
+        let result = local.stop(key)
         process.send(launches, Stopped(key))
+        result
       },
       exists: local.exists,
       meta_path: local.meta_path,
@@ -676,8 +637,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
     )
   use <-
     guarded(_, fn() {
-      let _ =
-        sh("/tmp", "pkill -9 -f 'crush server --host unix://" <> root <> "'")
+      let _ = sh("/tmp", "pkill -9 -f '" <> dialing(key) <> "'")
       let _ = sh("/tmp", "rm -rf '" <> root <> "'")
       Nil
     })
@@ -696,6 +656,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       flush_ms: 250,
       mode: client.Sysadmin,
       tailnet: None,
+      stop_backoff_ms: registry.default_stop_backoff_ms,
     ))
   process.send(
     r,
@@ -711,19 +672,16 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       ),
     ),
   )
-  let assert Ok(Launched(key)) = process.receive(launches, 60_000)
+  let assert Ok(Launched(launched)) = process.receive(launches, 60_000)
+  let assert True = launched == key
   // Give the turn time to start its command.
   process.sleep(15_000)
   let done = process.new_subject()
   process.send(r, registry.Shutdown(2000, done))
   let assert Ok(Stopped(stopped)) = process.receive(launches, 60_000)
   let assert True = stopped == key
-  let assert Ok(Nil) = process.receive(done, 60_000)
-  let assert "" =
-    string.trim(sh(
-      "/tmp",
-      "pgrep -f 'crush server --host unix://" <> root <> "'",
-    ))
+  let assert Ok(registry.Clean) = process.receive(done, 60_000)
+  let assert "" = string.trim(sh("/tmp", "pgrep -f '" <> dialing(key) <> "'"))
   Nil
 }
 
@@ -1017,9 +975,9 @@ fn failed_code_channel_keeps_the_diff(wiring: Wiring) -> Nil {
 fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
   let port = 17_000 + int.absolute_value(unique()) % 2000
   let calls = process.new_subject()
-  let secret = "test-secret"
   let assert Ok(Nil) =
     sandbox_http.start("127.0.0.1", port, [
+      proxy.route(wiring.proxy),
       mcp.route(
         secret,
         slack_tools.tools(tailnet: False),
@@ -1030,14 +988,12 @@ fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
       ),
     ])
   let keys = process.new_subject()
+  let url = "http://127.0.0.1:" <> int.to_string(port)
   let bridge =
-    launcher.Bridge(
-      url: "http://127.0.0.1:" <> int.to_string(port),
-      env: fn(key) {
-        process.send(keys, key)
-        mcp.env(secret, key)
-      },
-    )
+    launcher.Bridge(..wiring.bridge, url:, env: fn(key) {
+      process.send(keys, key)
+      list.append(mcp.env(secret, key), proxy.crush_env(url, secret, key))
+    })
   let env = setup_with("mcp", wiring, bridge)
   let assert Ok(key) = process.receive(keys, 1000)
   use <- guarded(_, fn() { teardown(env) })
@@ -1086,77 +1042,6 @@ fn prompts_carry_images(wiring: Wiring) -> Nil {
   let finished = await_finished(calls)
   let assert True = says(finished, "SEEN")
   process.send(t, thread.Stop)
-}
-
-/// With Claude as an extra backend, the agent can run a subagent on a
-/// Claude model while it runs on its own provider.
-fn subagents_use_extra_providers(wiring: Wiring) -> Nil {
-  let claude =
-    provider.Claude(
-      login: login_path("CRUSHLING_CLAUDE_LOGIN", "claude"),
-      version: claude_version(),
-      large: "claude-haiku-4-5-20251001",
-      small: "claude-haiku-4-5-20251001",
-    )
-  let assert Some(claude_creds) = start_credentials(claude)
-  let env =
-    setup_full("extra", wiring, launcher.no_bridge(), [claude], [
-      claude_creds,
-    ])
-  use <- guarded(_, fn() { teardown(env) })
-  let calls = process.new_subject()
-  let assert Ok(t) =
-    thread.start(
-      thread.Config(
-        socket: env.socket,
-        root: env.work,
-        title: "crushling extra provider test",
-        venue: venue.Thread,
-        sink: recording_sink(calls, False),
-        flush_ms: 250,
-        mode: client.Sysadmin,
-        notify: on_finished(fn(finished) {
-          process.send(calls, MainFinished(finished.solicited))
-        }),
-        on_connect: fn(_) { Nil },
-      ),
-    )
-  process.send(
-    t,
-    prompt(
-      "Start one subagent with agent_dispatch, label \"hello\", provider \"anthropic\", model \"claude-haiku-4-5-20251001\", and the prompt \"Reply with the word HI.\". Then reply with the word OK.",
-    ),
-  )
-  await_report(calls, False, False)
-  process.send(t, thread.Stop)
-  let providers =
-    sh(
-      env.work,
-      "for db in $(find .. -name crush.db); do sqlite3 \"$db\" \"select distinct provider from messages where role='assistant' and provider != ''\"; done",
-    )
-  let assert True = string.contains(providers, "anthropic")
-  let assert True = string.contains(providers, "hyper")
-  Nil
-}
-
-/// Wait until the subagent has reported back and the prompt's run is done,
-/// in either order.
-fn await_report(calls: Subject(SubCall), reported: Bool, done: Bool) -> Nil {
-  case reported && done {
-    True -> Nil
-    False ->
-      case process.receive(calls, 240_000) {
-        Ok(InMain(text)) ->
-          await_report(
-            calls,
-            reported || string.contains(text, "* finished _"),
-            done,
-          )
-        Ok(MainFinished(True)) -> await_report(calls, reported, True)
-        Ok(_) -> await_report(calls, reported, done)
-        Error(Nil) -> panic as "the subagent never reported back"
-      }
-  }
 }
 
 /// A reply that posts its last text, and its closing line, when it

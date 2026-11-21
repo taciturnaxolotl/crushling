@@ -1,16 +1,18 @@
 //// One gVisor container per Slack thread, managed with the docker CLI the
 //// way kloe does it on prattle, with three differences:
 ////
-//// - the container runs `crush server` on a unix socket in a bind-mounted
-////   directory, so the runtime must allow host sockets (`--host-uds=create`);
-//// - it runs as the service's own uid, so the host can connect to that
-////   socket and owns the workspace files;
-//// - it joins a network whose egress is filtered on the host.
+//// - the container runs `crush server --dial`, which connects out to the
+////   bridge's tunnel (`crushling/tunnel`) instead of listening, so nothing
+////   is mounted for it and plain `runsc` will do;
+//// - it runs as the service's own uid, so the host owns the workspace
+////   files;
+//// - it joins a network whose egress is filtered on the host, which lets
+////   it reach the bridge's one sandbox port.
 ////
 //// The argument building and the adopt/start/recreate decision are pure and
 //// tested; `ensure`, `stop` and `remove` shell out to docker.
 
-import gleam/erlang/process
+import crushling/tunnel
 import gleam/int
 import gleam/list
 import gleam/result
@@ -20,7 +22,7 @@ pub type Policy {
   Policy(
     docker: String,
     image: String,
-    /// A runtime registered with `--host-uds=create`, such as `runsc-uds`.
+    /// The gVisor runtime, such as `runsc`.
     runtime: String,
     network: String,
     cpus: String,
@@ -40,6 +42,9 @@ pub type Policy {
     /// Nameservers for the container's own resolv.conf, or [] for docker's.
     /// Docker's embedded DNS doesn't answer gVisor on a custom network.
     dns: List(String),
+    /// How the container reaches the bridge's sandbox server, e.g.
+    /// `http://172.30.0.1:7469`; crush dials its tunnel there.
+    bridge_url: String,
   )
 }
 
@@ -49,10 +54,6 @@ pub const mounted_crush = "/opt/crushling/crush"
 pub const label = "crushling-sandbox"
 
 pub const workspace = "/workspace"
-
-pub const socket_dir = "/run/crushling"
-
-const socket_name = "crush.sock"
 
 const docker_timeout_ms = 60_000
 
@@ -87,19 +88,14 @@ pub fn host_workspace(policy: Policy, key: String) -> String {
   policy.root <> "/" <> key <> "/work"
 }
 
-pub fn host_socket_dir(policy: Policy, key: String) -> String {
-  policy.root <> "/" <> key <> "/sock"
-}
-
-/// The socket path the bridge connects to on the host.
-pub fn host_socket(policy: Policy, key: String) -> String {
-  host_socket_dir(policy, key) <> "/" <> socket_name
-}
-
 /// Everything that should force a rebuild when it changes. Stored on the
 /// container as a label, as kloe does.
 pub fn fingerprint(policy: Policy) -> String {
   [
+    // How crush is reached. Containers from before the tunnel listened on
+    // a socket, and must be recreated with the new command.
+    "dial",
+    policy.bridge_url,
     policy.image,
     policy.runtime,
     policy.network,
@@ -133,9 +129,9 @@ fn file_stamp(path: String) -> Result(String, Nil)
 @external(erlang, "crushling_ffi", "sha256_hex")
 fn sha256_hex(data: String) -> String
 
-/// `key_env` is the thread's own environment, such as its token for
-/// crushling's Slack tools: derived from the key, so it needn't be part of
-/// the fingerprint.
+/// `key_env` is the thread's own environment: its tokens for the Slack
+/// tools, the tunnel and the proxy. They are derived from the key, so they
+/// needn't be part of the fingerprint.
 pub fn run_args(
   policy: Policy,
   key: String,
@@ -154,7 +150,6 @@ pub fn run_args(
     ["--pids-limit", int.to_string(policy.pids)],
     ["--workdir", workspace],
     ["--volume", host_workspace(policy, key) <> ":" <> workspace],
-    ["--volume", host_socket_dir(policy, key) <> ":" <> socket_dir],
     ["--env", "HOME=" <> workspace <> "/.home"],
     ["--env", "XDG_DATA_HOME=" <> workspace <> "/.home/.local/share"],
     ["--env", "XDG_CACHE_HOME=" <> workspace <> "/.home/.cache"],
@@ -177,8 +172,7 @@ pub fn run_args(
         mounted_crush,
       ]
     },
-    ["server", "--host"],
-    ["unix://" <> socket_dir <> "/" <> socket_name],
+    ["server", "--dial", tunnel.dial_url(policy.bridge_url, key)],
   ])
 }
 
@@ -238,8 +232,53 @@ pub type Error {
 fn docker(policy: Policy, args: List(String)) -> Result(String, Error) {
   case exec(policy.docker, args, docker_timeout_ms) {
     Ok(#(0, output)) -> Ok(output)
-    Ok(#(status, output)) -> Error(DockerFailed(args, status, output))
+    Ok(#(status, output)) ->
+      Error(DockerFailed(redact(args), status, redact_output(args, output)))
     Error(reason) -> Error(DockerUnavailable(reason))
+  }
+}
+
+/// `output` with every `--env` value from `args` hidden, so a docker that
+/// echoes its arguments back can't leak a token either. Values shorter
+/// than 4 bytes (`1`, `on`) are left alone: hiding them would hide most of
+/// the output and they are never secrets.
+pub fn redact_output(args: List(String), output: String) -> String {
+  env_values(args)
+  |> list.filter(fn(value) { string.byte_size(value) >= 4 })
+  // Longest first, so a value containing another is hidden whole.
+  |> list.sort(fn(a, b) {
+    int.compare(string.byte_size(b), string.byte_size(a))
+  })
+  |> list.fold(output, fn(output, value) {
+    string.replace(output, value, "<redacted>")
+  })
+}
+
+fn env_values(args: List(String)) -> List(String) {
+  case args {
+    ["--env", pair, ..rest] ->
+      case string.split_once(pair, "=") {
+        Ok(#(_, value)) -> [value, ..env_values(rest)]
+        Error(Nil) -> env_values(rest)
+      }
+    [_, ..rest] -> env_values(rest)
+    [] -> []
+  }
+}
+
+/// The arguments with every `--env NAME=value` value hidden, so an error
+/// that is logged or posted in Slack carries no token.
+pub fn redact(args: List(String)) -> List(String) {
+  case args {
+    ["--env", pair, ..rest] -> {
+      let name = case string.split_once(pair, "=") {
+        Ok(#(name, _)) -> name
+        Error(Nil) -> pair
+      }
+      ["--env", name <> "=<redacted>", ..redact(rest)]
+    }
+    [arg, ..rest] -> [arg, ..redact(rest)]
+    [] -> []
   }
 }
 
@@ -257,24 +296,17 @@ pub fn observe(policy: Policy, key: String) -> Result(Observed, Error) {
   }
 }
 
-/// Make sure the thread's container is running under the current policy and
-/// return the host path of its socket.
-///
-/// `before_start` runs once the container's crush.json is written and
-/// before crush starts, which is when a managed token has to be added: crush
-/// only adopts newer tokens from disk for a provider that had one when it
-/// loaded.
+/// Make sure the thread's container is running under the current policy.
+/// Its crush then dials the bridge; waiting for that is the launcher's job.
 pub fn ensure(
   policy: Policy,
   key: String,
   key_env: List(String),
-  before_start: fn() -> Result(Nil, String),
-) -> Result(String, Error) {
+) -> Result(Nil, Error) {
   use _ <- result.try(prepare(policy, key))
-  use _ <- result.try(before_start() |> result.map_error(Filesystem))
   use observed <- result.try(observe(policy, key))
   let name = container_name(key)
-  use _ <- result.try(case decide(observed, policy) {
+  case decide(observed, policy) {
     Adopt -> Ok("")
     Start -> docker(policy, ["start", name])
     Recreate -> {
@@ -282,30 +314,8 @@ pub fn ensure(
       docker(policy, run_args(policy, key, key_env))
     }
     Create -> docker(policy, run_args(policy, key, key_env))
-  })
-  // gVisor and crush take a few seconds to boot. Wait here, rather than
-  // have the thread spend its reconnect attempts on a socket not there yet.
-  // A sandbox that never answers is stopped, or nothing would ever stop it.
-  case wait_for_socket(host_socket(policy, key), socket_wait_ms / 100) {
-    Ok(path) -> Ok(path)
-    Error(error) -> {
-      let _ = stop(policy, key)
-      Error(error)
-    }
   }
-}
-
-const socket_wait_ms = 30_000
-
-fn wait_for_socket(path: String, tries: Int) -> Result(String, Error) {
-  case socket_ready(path), tries {
-    True, _ -> Ok(path)
-    False, 0 -> Error(DockerUnavailable("crush never opened " <> path))
-    False, _ -> {
-      process.sleep(100)
-      wait_for_socket(path, tries - 1)
-    }
-  }
+  |> result.replace(Nil)
 }
 
 /// Warm tier: stop the container but keep it, so installed state survives.
@@ -363,13 +373,10 @@ pub fn host_resolv_conf(policy: Policy) -> String {
 
 /// Create the thread's host directories as the bridge's own user. Left to
 /// docker, missing mount sources are created owned by root, and the
-/// container's uid could then not write its workspace or socket.
+/// container's uid could then not write its workspace.
 pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
   use _ <- result.try(
     mkdir_p(host_workspace(policy, key)) |> result.map_error(Filesystem),
-  )
-  use _ <- result.try(
-    mkdir_p(host_socket_dir(policy, key)) |> result.map_error(Filesystem),
   )
   let data = host_crush_data(policy, key)
   use _ <- result.try(mkdir_p(data) |> result.map_error(Filesystem))
@@ -384,6 +391,3 @@ pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
   write_private(data <> "/crush.json", policy.crush_config)
   |> result.map_error(Filesystem)
 }
-
-@external(erlang, "crushling_ffi", "is_socket")
-pub fn socket_ready(path: String) -> Bool

@@ -3,7 +3,7 @@
 -export([line_at/2, uuid_v4/0, monotonic_ms/0, system_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
          hmac_sha256_hex/2, equal_constant_time/2,
          file_exists/1, is_socket/1, file_stamp/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
-         claude_version/0, read_file/1, write_bytes/2]).
+         read_file/1, write_bytes/2]).
 
 line_at(Lines, Index) ->
     element(Index + 1, Lines).
@@ -142,18 +142,6 @@ expand_home(<<"~/", Rest/binary>>) ->
     unicode:characters_to_binary([os:getenv("HOME"), "/", Rest]);
 expand_home(Path) ->
     Path.
-
-%% The installed Claude Code's version, or crush's floor without one.
-claude_version() ->
-    case os:find_executable("claude") of
-        false -> <<"2.1.282">>;
-        Claude ->
-            Out = os:cmd(Claude ++ " --version 2>/dev/null"),
-            case re:run(Out, "[0-9]+\\.[0-9]+\\.[0-9]+", [{capture, first, binary}]) of
-                {match, [V]} -> V;
-                nomatch -> <<"2.1.282">>
-            end
-    end.
 
 read_file(Path) ->
     case file:read_file(Path) of

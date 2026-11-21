@@ -8,14 +8,17 @@ Source: read-only survey of ~/code/personal/kloe and ~/dots. Citations are file:
    tailnet (SNAT'd as prattle), campus 10.40/16 and 163.11/16 via gp-gateway, the LAN, and
    prattle's own open ports via 172.17.0.1. Nothing on prattle filters container egress.
 2. Secrets: kloe passes no env into containers. crush server needs provider keys, which is
-   a new trust decision.
-3. Unix socket: gVisor blocks host UDS through mounts by default. Needs a runtime entry with
-   `--host-uds=create` (or `all`). kloe never does this. Verify against packaged gvisor.
+   a new trust decision. (Settled: inference goes through the bridge's proxy and the
+   sandbox only holds a per-thread token; see `docs/sandbox.md`.)
+3. Unix socket: gVisor blocks host UDS through mounts by default, and needs a runtime
+   entry with `--host-uds=create`. (No longer needed: crush now dials out to the bridge
+   with `crush server --dial`, so plain `runsc` and no socket mount; see
+   `docs/sandbox.md`.)
 
 ## Launch (kloe/src/executor.ts:631-646)
 
 Docker (not podman), driven over `DOCKER_HOST=ssh://kloe@prattle` from terebithia.
-crushling should run on prattle directly so the socket is local.
+crushling runs on prattle directly, next to the docker it drives.
 
 ```
 docker run -d --name kloe-sbx-<key> --label kloe-sandbox=1 --label kloe-policy=<hash> \
@@ -27,7 +30,7 @@ docker run -d --name kloe-sbx-<key> --label kloe-sandbox=1 --label kloe-policy=<
 ```
 
 - runsc registered at dots/machines/prattle/default.nix:679-689 (time-namespaces = false).
-- Container runs as root; no userns. Socket needs a chmod for the host user.
+- Container runs as root; no userns. (crushling runs it as the bridge's uid instead.)
 - Image is a Docker Hub tag (buildpack-deps:bookworm-scm), not a Nix derivation.
 - Policy label hash: mismatch forces rm and recreate (executor.ts:437-446).
 
@@ -68,15 +71,16 @@ embedded DNS 127.0.0.11 behavior, IPv6. kloe can adopt the same network via
 
 ## Secrets
 
-Preferred: host-side LLM proxy reached over a second mounted socket; crush gets a dummy key
-and a base_url. Keys never enter the sandbox. Fallback: `--env-file` with a spend-capped key.
+Done as a host-side LLM proxy on the bridge's sandbox port (`/proxy/<thread>`): crush gets
+`HYPER_URL` and a per-thread token as `HYPER_API_KEY`, and the org's key never enters the
+sandbox.
 
 ## dots wiring
 
 - mkService at dots/modules/lib/mkService.nix:24-41; example kloe.nix:42-89.
   Auto-imported by import-tree, so modules/nixos/services/crushling.nix is picked up.
-- ProtectSystem=strict: add ReadWritePaths for /storage/crushling and the socket dir;
-  docker-client on the unit path.
+- ProtectSystem=strict: add ReadWritePaths for /storage/crushling (the tunnels' sockets
+  live under it); docker-client on the unit path.
 - Pin uid/gid (prattle:222-232), add docker group (root-equivalent), caddy.enable = false
   (Socket Mode needs no vhost), RequiresMountsFor = /storage.
 - tmpfiles: `d /storage/crushling 0755 root root -`, `d /storage/crushling/workspaces 0711 root root -`.
@@ -85,14 +89,15 @@ and a base_url. Keys never enter the sandbox. Fallback: `--env-file` with a spen
 - Agenix: secrets.nix entry, age.secrets.crushling with owner, secretsFile.
 - Stale comment at prattle:214 says kata; it's gVisor.
 
-## crushling's Slack tools
+## crushling's sandbox port
 
-The bridge serves each agent's Slack tools over HTTP. To let sandboxes reach
-them and nothing else on the host, bind the bridge to the network's gateway
-and allow only that port, ahead of the refuse rule:
+The bridge serves everything a sandbox needs on one port: the tunnel its crush dials, the
+inference proxy, and the Slack tools. To let sandboxes reach it and nothing else on the
+host, bind the bridge to the network's gateway and allow only that port, ahead of the
+refuse rule:
 
     iptables -I nixos-fw 1 -i br-sbx -d 172.30.0.1 -p tcp --dport 7469 -j nixos-fw-accept
 
-with `CRUSHLING_MCP_BIND=172.30.0.1` and
-`CRUSHLING_MCP_URL=http://172.30.0.1:7469`. Each thread's endpoint needs that
-thread's token, so one sandbox can't act for another.
+with `CRUSHLING_BRIDGE_BIND=172.30.0.1` and
+`CRUSHLING_BRIDGE_URL=http://172.30.0.1:7469`. Each thread's endpoints need that
+thread's tokens, so one sandbox can't act for another.

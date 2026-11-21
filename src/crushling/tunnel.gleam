@@ -1,7 +1,7 @@
 //// Dial-out tunnels: each thread's `crush server` runs with
 //// `--dial ws://<bridge>/tunnel/<key>` and connects to the bridge instead
 //// of listening, and the bridge exposes it again as a unix socket (the
-//// shim, `<root>/<key>/shim.sock`), so the HTTP client is unchanged.
+//// shim, `<root>/s/<hash of key>.sock`), so the HTTP client is unchanged.
 ////
 //// crush keeps a control socket open at `/tunnel/<key>/control` (JSON
 //// text frames). When the shim accepts a connection the bridge sends
@@ -51,7 +51,7 @@ pub type Config {
   Config(
     /// The instance secret tokens are derived from.
     secret: String,
-    /// The threads' root; each shim is `<root>/<key>/shim.sock`.
+    /// The threads' root; each shim is `<root>/s/<hash of key>.sock`.
     root: String,
     /// How often every socket is pinged.
     ping_ms: Int,
@@ -110,9 +110,39 @@ pub fn dial_url(base: String, key: String) -> String {
   base <> "/tunnel/" <> key
 }
 
-/// Where a thread's shim listens.
+/// Where a thread's shim listens: a short name in one directory, so the
+/// path's length doesn't depend on the key's and a unix socket fits it.
 pub fn shim_path(root: String, key: String) -> String {
-  root <> "/" <> key <> "/shim.sock"
+  shim_dir(root) <> "/" <> string.slice(sha256_hex(key), 0, 16) <> ".sock"
+}
+
+fn shim_dir(root: String) -> String {
+  root <> "/s"
+}
+
+@external(erlang, "crushling_ffi", "sha256_hex")
+fn sha256_hex(data: String) -> String
+
+/// Whether shims under `root` fit a unix socket path. Check it at startup:
+/// `open` refuses every key otherwise.
+pub fn check_root(root: String) -> Result(Nil, String) {
+  let path = shim_path(root, "key")
+  let overhead = string.byte_size(path) - string.byte_size(root)
+  case string.byte_size(path) > max_socket_path {
+    True ->
+      Error(
+        "shim sockets under "
+        <> root
+        <> " would be "
+        <> int.to_string(string.byte_size(path))
+        <> " bytes, over the "
+        <> int.to_string(max_socket_path)
+        <> " a unix socket path allows; use a root of at most "
+        <> int.to_string(max_socket_path - overhead)
+        <> " bytes",
+      )
+    False -> Ok(Nil)
+  }
 }
 
 /// The longest unix socket path, in bytes, that fits a `sockaddr_un` on
@@ -321,7 +351,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
         found -> {
           let path = shim_path(config.root, key)
           let started = {
-            use _ <- result.try(mkdir_p(config.root <> "/" <> key))
+            use _ <- result.try(mkdir_p(shim_dir(config.root)))
             shim.start(path, config.write_timeout_ms, connection(
               state.self,
               config,

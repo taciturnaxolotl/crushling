@@ -4,7 +4,7 @@
 //// Every thread has its own endpoint, `/mcp/<key>`, guarded by a bearer
 //// token derived from a secret only the bridge knows (`token`). The agent gets its
 //// key and token through its environment (`env`), and its crush.json
-//// points at the endpoint (`provider.config_with`). Requests are answered
+//// points at the endpoint (`provider.config`). Requests are answered
 //// with plain JSON; there is no server-initiated stream.
 
 import crushling/sandbox_http

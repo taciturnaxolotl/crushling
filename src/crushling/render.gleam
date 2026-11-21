@@ -281,7 +281,6 @@ pub fn explain(reason: String) -> #(String, String) {
           "token is expired",
           "re-authenticate",
         ]),
-        has(["claude_code_version_too_old"]),
         has([
           "overloaded",
           "529",
@@ -301,39 +300,35 @@ pub fn explain(reason: String) -> #(String, String) {
         ]),
         has(["max_tokens", "invalid_request", "bad request", "400"])
       {
-        True, _, _, _, _, _, _, _ -> #(
+        True, _, _, _, _, _, _ -> #(
           "The conversation got too long for the model",
           "Start a new thread to carry on.",
         )
-        _, True, _, _, _, _, _, _ -> #(
+        _, True, _, _, _, _, _ -> #(
           "The model provider is out of credits",
           "Top up the account, then send a follow-up to carry on.",
         )
-        _, _, True, _, _, _, _, _ -> #(
+        _, _, True, _, _, _, _ -> #(
           "The model provider is rate limiting us",
           "Wait a minute, then send a follow-up to carry on.",
         )
-        _, _, _, True, _, _, _, _ -> #(
-          "The model provider rejected crushling's login",
-          "Someone needs to sign crushling in again.",
+        _, _, _, True, _, _, _ -> #(
+          "The bridge's Hyper key was rejected",
+          "Check CRUSHLING_HYPER_KEY on the bridge, then send a follow-up to carry on.",
         )
-        _, _, _, _, True, _, _, _ -> #(
-          "Anthropic now wants a newer Claude Code version",
-          "Raise CRUSHLING_CLAUDE_VERSION and restart crushling.",
-        )
-        _, _, _, _, _, True, _, _ -> #(
+        _, _, _, _, True, _, _ -> #(
           "The model provider is having trouble",
           "Try again in a bit.",
         )
-        _, _, _, _, _, _, True, _ -> #(
+        _, _, _, _, _, True, _ -> #(
           "The connection to the model provider dropped",
           "Send a follow-up to carry on.",
         )
-        _, _, _, _, _, _, _, True -> #(
+        _, _, _, _, _, _, True -> #(
           "The model provider refused the request",
           "This is likely a configuration problem; check the model settings.",
         )
-        _, _, _, _, _, _, _, _ -> #(
+        _, _, _, _, _, _, _ -> #(
           "Something went wrong",
           "Send a follow-up to try again.",
         )

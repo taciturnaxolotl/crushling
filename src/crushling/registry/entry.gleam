@@ -13,6 +13,10 @@ pub type Agent {
   /// The agent is launching.
   Starting
   Live(thread: Subject(thread.Message), monitor: process.Monitor)
+  /// The launcher is stopping the agent; `attempt` counts the retries so
+  /// far. Messages wait in the backlog; once the stop has finished, a
+  /// thread with any starts again.
+  Stopping(attempt: Int)
 }
 
 pub type Entry {
@@ -83,7 +87,7 @@ pub fn tailnet_view(entry: Entry) -> tailnet.Thread {
   tailnet.Thread(
     running: case entry.agent {
       Live(..) -> True
-      Starting -> False
+      Starting | Stopping(..) -> False
     },
     grant: entry.meta.tailnet,
     home: #(entry.channel, entry.thread_ts),

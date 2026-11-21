@@ -137,7 +137,10 @@ fn start_registry_with(
         process.send(launches, Launched(key))
         Error("no agents in this test")
       },
-      stop: fn(key) { process.send(launches, Stopped(key)) },
+      stop: fn(key) {
+        process.send(launches, Stopped(key))
+        Ok(Nil)
+      },
       exists: fn(key) {
         key == registry.key("C9", "1.0") || key == registry.key("C7", "1.0")
       },
@@ -160,6 +163,7 @@ fn start_registry_with(
       flush_ms: 50,
       mode: client.Sysadmin,
       tailnet:,
+      stop_backoff_ms: registry.default_stop_backoff_ms,
     ))
   r
 }
@@ -222,7 +226,7 @@ pub fn shutdown_with_nothing_running_stops_at_once_test() {
   let r = start_registry(launches)
   let done = process.new_subject()
   process.send(r, registry.Shutdown(60_000, done))
-  let assert Ok(Nil) = process.receive(done, 1000)
+  let assert Ok(registry.Clean) = process.receive(done, 1000)
 }
 
 pub fn native_stop_reaches_the_registry_test() {

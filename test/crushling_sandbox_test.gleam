@@ -1,4 +1,5 @@
 import crushling/sandbox
+import gleam/int
 import gleam/list
 import gleam/string
 
@@ -6,7 +7,7 @@ fn policy() -> sandbox.Policy {
   sandbox.Policy(
     docker: "docker",
     image: "crushling-sandbox:latest",
-    runtime: "runsc-uds",
+    runtime: "runsc",
     network: "sbx-egress",
     cpus: "2",
     memory: "2g",
@@ -18,6 +19,7 @@ fn policy() -> sandbox.Policy {
     crush_config: "{}",
     crush: "",
     dns: [],
+    bridge_url: "http://172.30.0.1:7469",
   )
 }
 
@@ -28,26 +30,26 @@ pub fn key_sanitizes_test() {
   let assert 64 = string.length(sandbox.key(string.repeat("x", 100), "1"))
 }
 
-pub fn paths_test() {
-  let assert "/storage/crushling/workspaces/k/sock/crush.sock" =
-    sandbox.host_socket(policy(), "k")
-}
-
 pub fn run_args_test() {
   let args = sandbox.run_args(policy(), "k", [])
   let pairs = list.window_by_2(args)
   let has = fn(a, b) { list.contains(pairs, #(a, b)) }
   let assert True = has("--name", "crushling-k")
-  let assert True = has("--runtime", "runsc-uds")
+  let assert True = has("--runtime", "runsc")
   let assert True = has("--network", "sbx-egress")
   let assert True = has("--user", "970:970")
   let assert True = has("--cap-drop", "ALL")
   let assert True = has("--env", "EXTRA=1")
   let assert True =
     has("--volume", "/storage/crushling/workspaces/k/work:/workspace")
-  let assert True =
-    has("--volume", "/storage/crushling/workspaces/k/sock:/run/crushling")
-  let assert Ok("unix:///run/crushling/crush.sock") = list.last(args)
+  // crush dials the bridge's tunnel: no socket is mounted, so plain runsc
+  // will do.
+  let assert False =
+    list.any(args, fn(arg) {
+      string.contains(arg, "/sock") || string.contains(arg, "unix://")
+    })
+  let assert ["server", "--dial", "ws://172.30.0.1:7469/tunnel/k"] =
+    list.drop(args, list.length(args) - 3)
   let assert ["run", "--detach", ..] = args
 }
 
@@ -57,7 +59,42 @@ pub fn fingerprint_tracks_policy_test() {
   let assert True = base == sandbox.fingerprint(policy())
   let assert False =
     base == sandbox.fingerprint(sandbox.Policy(..policy(), memory: "4g"))
+  let assert False =
+    base
+    == sandbox.fingerprint(
+      sandbox.Policy(..policy(), bridge_url: "http://10.0.0.1:7469"),
+    )
 }
+
+/// The fingerprint of the same policy before crush dialed out: containers
+/// made then listen on a socket nobody connects to now, and are recreated.
+pub fn sockets_era_containers_are_recreated_test() {
+  let p = policy()
+  let old =
+    [
+      p.image,
+      p.runtime,
+      p.network,
+      p.cpus,
+      p.memory,
+      "1024",
+      "970",
+      "970",
+      p.root,
+      p.crush_config,
+      "",
+      "",
+      ..p.env
+    ]
+    |> string.join("\u{0}")
+    |> sha256_hex
+    |> string.slice(0, 16)
+  let assert False = old == sandbox.fingerprint(p)
+  let assert sandbox.Recreate = sandbox.decide(sandbox.Present(True, old), p)
+}
+
+@external(erlang, "crushling_ffi", "sha256_hex")
+fn sha256_hex(data: String) -> String
 
 pub fn decide_test() {
   let p = policy()
@@ -82,10 +119,15 @@ pub fn docker_missing_is_unavailable_test() {
 }
 
 pub fn prepare_creates_dirs_test() {
-  let p = sandbox.Policy(..policy(), root: "/tmp/crushling-sandbox-test")
+  let p =
+    sandbox.Policy(
+      ..policy(),
+      root: "/tmp/crushling-sandbox-test-"
+        <> int.to_string(int.absolute_value(unique())),
+    )
   let assert Ok(Nil) = sandbox.prepare(p, "k")
   let assert True = file_exists(sandbox.host_workspace(p, "k"))
-  let assert True = file_exists(sandbox.host_socket_dir(p, "k"))
+  let assert False = file_exists(p.root <> "/k/sock")
   let assert True =
     file_exists(sandbox.host_crush_data(p, "k") <> "/crush.json")
 }
@@ -98,8 +140,6 @@ pub fn exec_runs_without_a_shell_test() {
 }
 
 pub fn a_mounted_crush_runs_from_the_mount_test() {
-  let assert Ok("unix:///run/crushling/crush.sock") =
-    list.last(sandbox.run_args(policy(), "k", []))
   let plain = sandbox.run_args(policy(), "k", [])
   let assert True =
     list.contains(list.window_by_2(plain), #(
@@ -145,17 +185,8 @@ pub fn sandboxes_get_their_own_nameservers_test() {
     sandbox.fingerprint(policy()) == sandbox.fingerprint(with_dns)
 }
 
-pub fn a_socket_counts_as_ready_test() {
-  let path = "/tmp/crushling-ready-test.sock"
-  let assert Ok(Nil) = listen_unix(path)
-  let assert True = sandbox.socket_ready(path)
-  // Missing, or a plain file, is not ready.
-  let assert False = sandbox.socket_ready("/tmp/crushling-no-such.sock")
-  let assert False = sandbox.socket_ready("/etc/hosts")
-}
-
-@external(erlang, "crushling_test_ffi", "listen_unix")
-fn listen_unix(path: String) -> Result(Nil, String)
-
 @external(erlang, "crushling_ffi", "file_exists")
 fn file_exists(path: String) -> Bool
+
+@external(erlang, "erlang", "unique_integer")
+fn unique() -> Int

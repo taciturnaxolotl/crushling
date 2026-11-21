@@ -4,6 +4,9 @@ Source: ~/code/charm/crush at 67a5524fdf. Live spec: GET /v1/docs/openapi.json.
 
 ## Start
 - `crush server -H unix:///run/crush.sock` (plus `-D <data-dir>`). No auth; socket perms only.
+- crushling runs `crush server --dial ws://<bridge>/tunnel/<thread>` with
+  `CRUSH_SERVER_DIAL_TOKEN` instead: crush connects out and the bridge exposes it as a unix
+  socket shim (`crushling/tunnel`). The API over it is the same.
 - Self-shuts down when idle: set `CRUSH_SERVER_IDLE_TIMEOUT` high (or rely on container lifecycle).
 - Claims: open SSE within 30 s of workspace create; claim survives 10 s after stream drop
   (`CRUSH_SERVER_DETACH_GRACE`). Keep one SSE open per workspace, reconnect fast.

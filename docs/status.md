@@ -6,12 +6,17 @@ What exists, what it assumes, and what is left.
 `crush server` and a real model, wired as in production, and are skipped
 unless enabled:
 
-    CRUSHLING_REAL=1 gleam test                                     # hyper key from .env
-    CRUSHLING_REAL=1 CRUSHLING_TEST_BACKEND=claude gleam test       # Claude login
-    CRUSHLING_REAL=1 CRUSHLING_TEST_BACKEND=hyper-login gleam test  # Hyper login
+    PATH=~/.local/state/crushling-dev:$PATH CRUSHLING_REAL=1 gleam test
+
+The `crush` on `PATH` must have `--dial` and resumable event streams (see
+"Sandbox image" below). Inference goes through a real inference proxy with
+the org's Hyper key from `CRUSHLING_HYPER_KEY`, else `CRUSH_HYPER_API_KEY`
+(environment or `.env`).
 
 They cover queued prompt order, diffs of `bash` edits, history staying
-clean, and the bridge surviving a server killed mid-run.
+clean, the bridge surviving a server killed mid-run, and the local launcher
+end to end: crush dials in through the tunnel and its turn is metered by the
+proxy.
 
 The Slack side runs on slackline over Socket Mode. It hasn't been run against
 a real workspace yet.
@@ -26,8 +31,13 @@ Configuration is from the environment or `.env`; see the table at the top of
     SLACK_BOT_TOKEN=xoxb-...
     SLACK_APP_TOKEN=xapp-...
     CRUSHLING_ALLOWED_USERS=U012345
-    CRUSHLING_BACKEND=hyper-key        # or claude / hyper with a seeded login
+    CRUSHLING_HYPER_KEY=...            # the org's Hyper key; agents never see it
     CRUSHLING_LAUNCHER=local           # unsandboxed: agents run as you
+
+`local` runs `crush server --dial` against the bridge on
+`http://127.0.0.1:7469`, the same way a sandbox does, so that `crush` must
+have `--dial` (put `~/.local/state/crushling-dev` first on `PATH`, or set
+`CRUSHLING_CRUSH`).
 
 The Slack app needs Socket Mode, the `app_mention` and `message.channels`,
 `message.groups`, `message.im` events, and the scopes `app_mentions:read`,
@@ -74,13 +84,57 @@ Each agent gets a `slack` MCP server from the bridge (`crushling/mcp`,
 itself, with a task name for the title. Reading reaches any channel the bot
 is in; posting and sharing only reach the conversation the agent is in.
 
-The tools are served over HTTP on `CRUSHLING_MCP_BIND`:`CRUSHLING_MCP_PORT`
-(default `127.0.0.1:7469`), one endpoint per thread, with a bearer token
-derived from a secret in `$CRUSHLING_ROOT/mcp-secret`. The `local` launcher
-uses them by default. A `docker` sandbox can't reach the host through the
-egress filter, so they are off until `CRUSHLING_MCP_URL` names an address it
-can, such as the `sbx-egress` gateway with the bridge bound there and the
-port let through (see `docs/kloe-sandbox.md`).
+The tools are served on the sandbox server (below), one endpoint per thread
+at `/mcp/<thread>`, with a bearer token derived from a secret in
+`$CRUSHLING_ROOT/mcp-secret`.
+
+## The sandbox server
+
+Agents reach the bridge on one port, `CRUSHLING_BRIDGE_BIND`:
+`CRUSHLING_BRIDGE_PORT` (default `127.0.0.1:7469`; the old names
+`CRUSHLING_MCP_BIND` and `CRUSHLING_MCP_PORT` still work), at
+`CRUSHLING_BRIDGE_URL` (old name `CRUSHLING_MCP_URL`). It always runs, and
+serves three things, each with its own per-thread token:
+
+- `/tunnel/<thread>`: the thread's `crush server --dial` connects here
+  (`crushling/tunnel`). The bridge reaches that server through a unix
+  socket shim at `$CRUSHLING_ROOT/s/<hash of thread>.sock`, so the thread's
+  HTTP client is the same as for a listening server.
+- `/proxy/<thread>`: the inference proxy (`crushling/proxy`), which swaps
+  the thread's token for the org's Hyper key, meters usage and enforces the
+  caps.
+- `/mcp/<thread>`: the Slack tools.
+
+For `local` the URL defaults to `http://127.0.0.1:<port>`. For `docker` it
+is required: an address of this machine the sandbox network may reach on
+that port, such as its gateway with the bridge bound there (see
+`docs/sandbox.md`).
+
+A launch opens the thread's tunnel, restores its proxy token, starts the
+sandbox, and waits up to `CRUSHLING_HELLO_TIMEOUT_SECONDS` (default 30) for
+crush to dial in. Any failure along the way undoes every step so far,
+including stopping the container. A stop tells crush to exit, stops the
+sandbox, closes the tunnel and revokes the proxy token. The token is the
+same on every launch, since it's derived from the thread's key, and it
+only ever lives in that thread's own sandbox and workspace. So restoring
+it on resume is fine. The `local` launcher stops its servers by the pid it
+recorded in `<root>/<thread>/server.pid`.
+
+A thread's launch and stop never overlap. While an agent is stopping, its
+thread is `Stopping`, and new messages wait until the stop finishes, then
+start the agent again. A stop that fails is retried after 1, 5 and 15
+seconds, with messages still waiting; if every try fails the registry logs
+an error, posts one notice in the thread and gives up on that agent.
+Shutdown waits for launches in flight, stops what they started, and only
+then exits. It has one deadline, `registry.shutdown_budget_ms`: the grace
+period, 10s for cancelled turns, 120s for launches and stops, and a 5s
+margin. The bridge exits 0 when every agent stopped and 1 (with a log
+line) when shutdown timed out or a stop failed.
+
+The `local` launcher records each server's pid, start time and dial URL
+(which names the thread) in `<root>/<thread>/server.pid`, and only signals a
+process that still matches all three, checked before TERM, before KILL and
+at every poll.
 
 ## Tailnet access
 
@@ -128,38 +182,23 @@ To set it up:
 The `local` launcher can't do this. Its agents already share your machine's
 network.
 
-## Providers
+## Provider
 
-Agents use a Claude subscription or Charm Hyper (`crushling/provider`), from
-a login or, for Hyper, a plain key.
+Agents use Charm Hyper, and only through the bridge's inference proxy. The
+org's key is `CRUSHLING_HYPER_KEY`, which the bridge requires; it never
+leaves the bridge. Each agent's crush gets `HYPER_URL` (the proxy's
+`/proxy/<thread>`) and `HYPER_API_KEY` (a token for that thread alone, which
+stops working when the thread's agent is stopped). crush.json names the
+Hyper models (`CRUSHLING_LARGE`, `CRUSHLING_SMALL`) and holds no key.
 
-A login is a crush.json that only crushling uses, seeded once:
+crush lets `CRUSH_<NAME>` override `<NAME>`, even when empty, so an agent
+must never get `CRUSH_HYPER_API_KEY` or `CRUSH_HYPER_URL`. The local
+launcher clears the bridge's environment for the same reason, and the
+sandbox image must not define any `CRUSH_HYPER_*` variable.
 
-    CRUSH_GLOBAL_DATA=~/.local/state/crushling/claude crush login claude
-    CRUSH_GLOBAL_DATA=~/.local/state/crushling/hyper crush login hyper
-
-`crushling/credentials` is the only process that refreshes it. Each
-container's crush.json gets a managed copy: the access token with an empty
-refresh token. crush adopts a newer token from disk before every turn and
-on a 401, so `credentials` renews at half the token's life and rewrites
-every container's file, and crush never refreshes on its own. No crush
-changes and no proxy: containers talk to the provider directly, with crush's
-own Claude Code fingerprinting (`CRUSH_CLAUDE_VERSION` is set, so no
-`claude` binary is needed).
-
-What a container can leak is an access token (hours), never the refresh
-token. With a Hyper key, the key itself sits in the container.
-
-`CRUSHLING_EXTRA_BACKENDS` adds more providers to every agent's crush.json,
-so it can run subagents on their models while it runs on its own:
-`CRUSHLING_BACKEND=hyper-key CRUSHLING_EXTRA_BACKENDS=claude` gives a Hyper
-agent Claude subagents. Each extra login gets its own `credentials` process,
-and they share the container's file under a lock.
-
-    CRUSHLING_REAL=1 CRUSHLING_TEST_EXTRA=claude gleam test   # also checks this
-
-Never give crushling the login your own crush uses: refresh tokens are
-single use, so the two would revoke each other.
+The Claude and Hyper login backends, and the token refresher they needed,
+are gone: `CRUSHLING_BACKEND`, `CRUSHLING_LOGIN`, `CRUSHLING_EXTRA_BACKENDS`
+and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 
 ## Modules
 
@@ -179,9 +218,11 @@ single use, so the two would revoke each other.
 | `crushling/sink` | The functions a thread uses to post in Slack. `crushling/slack` builds the real one. |
 | `crushling/meta` | What the bridge saves for each thread (follow, pause, cursor, venue) and each code channel (its thread). Files are replaced whole. |
 | `crushling/snapshot` | Shell commands that snapshot the workspace into a private bare repo under `.crush/` and diff two snapshots. |
-| `crushling/provider` | Claude, Hyper login, or Hyper key: the container's crush.json, env, and login. |
-| `crushling/credentials` | The one refresher of a login; keeps a managed token fresh in every watched container config. |
-| `crushling` | Entry point: reads the settings, starts credentials, the registry and Socket Mode. |
+| `crushling/provider` | The agent's crush.json: Hyper models and the Slack tools, no key. |
+| `crushling/tunnel` | Dial-out tunnels: each thread's `crush server --dial` connects to the bridge, which exposes it as a unix socket shim. |
+| `crushling/proxy` | The inference proxy: thread tokens in, the org's Hyper key out, usage metered and capped. |
+| `crushling/sandbox_http` | The one port agents reach the bridge on, with the tunnel, proxy and Slack tools routes. |
+| `crushling` | Entry point: reads the settings, starts the proxy, the tunnels, the registry, the sandbox server and Socket Mode. |
 | `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; turns events into `Incoming`. |
 | `crushling/registry` | Maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, and writes all thread meta. |
 | `crushling/tailscale` | The Tailscale API (auth keys) and the scripts that join and leave the tailnet inside a sandbox. |
@@ -189,7 +230,7 @@ single use, so the two would revoke each other.
 | `crushling/registry/entry`, `incoming`, `prompt` | A thread's entry in the registry, an incoming Slack message, and the prompt built from it. |
 | `crushling/registry/links` | Links code channels to their threads, in memory and on disk. |
 | `crushling/slack` | The `Sink` over chat.postMessage/update and slackline's `stream` for run replies, with markdown and plan blocks and file uploads; prompt text cleanup. |
-| `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). |
+| `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). Either way crush dials the tunnel and uses the proxy. |
 | `crushling/sandbox` | `docker run` arguments, a policy fingerprint label, adopt/start/recreate, stop (warm) and remove (cold). |
 
 ## Decisions worth knowing
@@ -201,7 +242,12 @@ single use, so the two would revoke each other.
   goroutine, so two sent together race and can run out of order, and
   messages carry no run id to tell their output apart.
 - The container runs as the service uid (`--user`), not root like kloe, so
-  the host can connect to the socket and owns the workspace files.
+  the host owns the workspace files.
+- crush dials out to the bridge (`--dial`) instead of listening on a socket
+  in a bind mount: no mount, no `--host-uds`, plain `runsc`, and the bridge
+  needn't share a filesystem with the sandbox. The old unix socket transport
+  is gone rather than kept behind a setting: it needed its own runtime,
+  mount and readiness check, and nothing still depends on it.
 - `CRUSH_SERVER_IDLE_TIMEOUT` is set to a year inside the container: the
   bridge, not the server, decides when a sandbox sleeps.
 - Diffs come from workspace snapshots: a tree written into a private bare
@@ -215,26 +261,20 @@ single use, so the two would revoke each other.
 ## Assumptions to check against the real thing
 
 - Slack's `markdown` block takes about 12,000 characters (`render.message_limit`).
-- A runtime entry with `--host-uds=create` lets a gVisor container listen on
-  a socket in a bind mount that the host can connect to.
+- crush redials a bridge that restarted soon enough for an adopted
+  container to say hello within the launch's wait; otherwise the launch
+  stops it and the next one starts it fresh.
 - Two sessions in one workspace stream in parallel (irrelevant with one
   workspace per container, which is the plan).
 
 ## Left
 
 1. Try it in a real workspace, with `CRUSHLING_LAUNCHER=local` first.
-2. The sandbox image and the `~/dots` module. The image needs `tailscale`
-   and `tailscaled` (the real binary, not nixpkgs' wrapper script), but not
-   `crush`: a static build from the megamerge is mounted from the host with
-   `CRUSHLING_CRUSH`, so updating it means renaming a new binary over the
-   old one. Then:
-   `runsc-uds` runtime, `sbx-egress` network and firewall rules, prune
-   filter, service user with a pinned uid. A socket in a bind mount works under
-   gVisor only with `--host-uds=create`, and `tailscaled` started by
-   `docker exec` outlives the exec (both checked by hand on prattle).
-3. Run the Claude and Hyper-login end-to-end tests once crushling logins are
-   seeded.
-4. Try a real tailnet join from a sandbox, once the OAuth client exists.
-5. Smaller things: a cold tier that removes long-idle containers; a prompt
+2. Move prattle to the dial-out sandboxes: the `~/dots` changes and the
+   crush build in `docs/sandbox.md`, then run the docker path for real.
+   `tailscaled` started by `docker exec` outlives the exec (checked by hand
+   on prattle).
+3. Try a real tailnet join from a sandbox, once the OAuth client exists.
+4. Smaller things: a cold tier that removes long-idle containers; a prompt
    the thread actor fails to send never counts as finished, so that thread
    never idles; a Cancel button in addition to replying `stop`.

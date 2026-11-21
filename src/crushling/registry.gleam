@@ -11,13 +11,18 @@
 //// A thread with nothing running for `idle_ms` has its agent stopped; its
 //// workspace, session and `meta` stay, so the next message, even after a
 //// restart, picks the conversation up again.
+////
+//// A thread's launch and stop never overlap: while its agent is stopping
+//// the entry stays, `Stopping`, and messages wait in its backlog until the
+//// stop has finished and the agent can start again. Shutdown waits for
+//// launches in flight and stops what they started.
 
 import crushling/crush/client
 import crushling/launcher.{type Launcher}
 import crushling/meta.{type Link, type Meta, Link, Meta}
 import crushling/registry/entry.{
-  type Entry, Entry, Live, Starting, already_read, is_quiet, new as new_entry,
-  tailnet_view,
+  type Entry, Entry, Live, Starting, Stopping, already_read, is_quiet,
+  new as new_entry, tailnet_view,
 }
 import crushling/registry/incoming.{type Incoming, Incoming, is_dm}
 import crushling/registry/links.{type Links}
@@ -56,7 +61,23 @@ pub type Config {
     mode: client.PermissionMode,
     /// How to put sandboxes on the tailnet, if anyone may.
     tailnet: Option(tailnet.Setup),
+    /// How long to wait before each retry of a stop that failed; once they
+    /// are used up the registry gives up on that agent.
+    stop_backoff_ms: List(Int),
   )
+}
+
+/// Retries of a failed stop: after 1, 5 and 15 seconds.
+pub const default_stop_backoff_ms = [1000, 5000, 15_000]
+
+/// How shutdown went.
+pub type ShutdownOutcome {
+  /// Every agent was stopped.
+  Clean
+  /// Launches or stops were still in flight when the time ran out.
+  TimedOut
+  /// The launcher couldn't stop these threads' agents.
+  Incomplete(failed: List(String))
 }
 
 pub type Message {
@@ -72,17 +93,24 @@ pub type Message {
     generation: Int,
     result: Result(Subject(thread.Message), String),
   )
+  /// The launcher has finished stopping the agent for `key`.
+  Stopped(key: String, result: Result(Nil, String))
+  /// Try a failed stop again.
+  RetryStop(key: String)
   /// A prompt is ready to send: `ts` is the message it came from.
   Prepared(key: String, ts: String, prompt: thread.Message)
   /// A notice from the thread actor for `key`.
   FromThread(key: String, notice: thread.Notice)
   /// Stop taking messages, let running turns finish for up to `grace_ms`,
   /// cancel what is left, stop every agent, then reply.
-  Shutdown(grace_ms: Int, reply: Subject(Nil))
+  /// The whole of it takes at most `shutdown_budget_ms(grace_ms)`.
+  Shutdown(grace_ms: Int, reply: Subject(ShutdownOutcome))
   /// The grace period is over.
   ShutdownDeadline
   /// Cancelled turns have had their chance to wind down.
   ShutdownFinal
+  /// Launches and stops in flight at shutdown took too long.
+  ShutdownGiveUp
   IdleCheck(key: String, generation: Int)
   ThreadDown(process.Down)
   /// Something about tailnet access for the thread `key`.
@@ -107,7 +135,12 @@ type State {
     seen: List(String),
     generation: Int,
     /// Set once shutdown begins: who to tell when it is done.
-    stopping: Option(Subject(Nil)),
+    stopping: Option(Subject(ShutdownOutcome)),
+    /// Set once shutdown is stopping agents: it ends when no thread is
+    /// left starting, running or stopping.
+    finishing: Bool,
+    /// Threads whose agent the launcher couldn't stop, even with retries.
+    failed_stops: List(String),
     tailnets: tailnet.Tailnets,
   )
 }
@@ -141,6 +174,8 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       seen: [],
       generation: 0,
       stopping: None,
+      finishing: False,
+      failed_stops: [],
       tailnets: tailnet.new(
         config.tailnet,
         config.client,
@@ -181,7 +216,16 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
         None -> actor.continue(received(state, incoming, attempts))
       }
     Started(key, generation, result) ->
-      actor.continue(started(state, key, generation, result))
+      started(state, key, generation, result) |> continue_or_finish
+    Stopped(key, result) -> stopped(state, key, result) |> continue_or_finish
+    RetryStop(key) ->
+      case dict.get(state.threads, key) {
+        Ok(Entry(agent: Stopping(..), ..)) -> {
+          run_stop(state, key)
+          actor.continue(state)
+        }
+        _ -> actor.continue(state)
+      }
     Prepared(key, ts, prompt) ->
       actor.continue(prepared(state, key, ts, prompt))
     StopRequested(channel, thread_ts, user) ->
@@ -216,6 +260,14 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(state)
     }
     ShutdownFinal -> finish_shutdown(state)
+    ShutdownGiveUp -> {
+      sys.warn(
+        "crushling: shutting down with "
+        <> int.to_string(dict.size(state.threads))
+        <> " agents still starting or stopping",
+      )
+      done_shutting_down(state, TimedOut)
+    }
     IdleCheck(key, generation) ->
       actor.continue(idle_check(state, key, generation))
     ThreadDown(down) -> actor.continue(thread_down(state, down))
@@ -508,8 +560,10 @@ fn launch(state: State, key: String, entry: Entry) -> State {
   let meta = entry.meta
   let state = set_meta(state, key, entry, meta)
   process.spawn_unlinked(fn() {
+    // If the thread actor can't start, the agent is stopped again, since
+    // nothing would drive it.
     let result = {
-      use launched <- result.try(config.launcher.launch(key))
+      use launched <- launcher.launch_then(config.launcher, key)
       let sink = case meta.venue {
         venue.CodeChannel(channel: code, ..) ->
           slack.sink(config.client, config.team, code, slack.InCodeChannel)
@@ -565,6 +619,15 @@ fn started(
             )
           })
           State(..state, threads: dict.delete(state.threads, key))
+        }
+        Ok(thread) if state.finishing -> {
+          // Shutdown already stopped everything else; this one started
+          // after, so stop it too.
+          let assert Ok(pid) = process.subject_owner(thread)
+          let monitor = process.monitor(pid)
+          let entry = Entry(..entry, agent: Live(thread:, monitor:))
+          State(..state, threads: dict.insert(state.threads, key, entry))
+          |> stop_agent(key)
         }
         Ok(thread) -> {
           let assert Ok(pid) = process.subject_owner(thread)
@@ -637,7 +700,7 @@ fn prepare_next(
       let entry = Entry(..entry, backlog: rest, preparing: True)
       State(..state, threads: dict.insert(state.threads, key, entry))
     }
-    Starting -> state
+    Starting | Stopping(..) -> state
   }
 }
 
@@ -710,41 +773,135 @@ fn busy(state: State) -> Bool {
   |> list.any(fn(entry) { entry.in_flight > 0 })
 }
 
-/// Stop every thread and its agent, then let the caller know.
+/// Stop every thread and its agent, then let the caller know. Launches in
+/// flight are waited for, and what they start is stopped too, so no
+/// sandbox outlives shutdown.
 fn finish_shutdown(state: State) -> actor.Next(State, Message) {
-  let stop = state.config.launcher.stop
-  let stoppers =
-    dict.to_list(state.threads)
-    |> list.map(fn(pair) {
-      let #(key, entry) = pair
-      case entry.agent {
-        Live(thread:, monitor:) -> {
-          process.demonitor_process(monitor)
-          process.send(thread, thread.Stop)
-        }
-        Starting -> Nil
-      }
-      let done = process.new_subject()
-      process.spawn_unlinked(fn() {
-        stop(key)
-        process.send(done, Nil)
+  case state.finishing {
+    True -> continue_or_finish(state)
+    False -> {
+      process.send_after(state.self, give_up_ms, ShutdownGiveUp)
+      let state = State(..state, finishing: True)
+      // Agents stop in parallel. A stopped sandbox's ephemeral node leaves
+      // the tailnet with it.
+      dict.keys(state.threads)
+      |> list.fold(state, stop_agent)
+      |> continue_or_finish
+    }
+  }
+}
+
+/// How long shutdown waits for launches and stops in flight, retries
+/// included.
+const give_up_ms = 120_000
+
+/// Slack for the caller on top of the registry's own timers.
+const shutdown_margin_ms = 5000
+
+/// The longest a `Shutdown` with `grace_ms` takes to reply: the grace
+/// period, the wait after cancelling, the wait for launches and stops, and
+/// a margin. The caller waits this long and no longer.
+pub fn shutdown_budget_ms(grace_ms: Int) -> Int {
+  grace_ms + cancel_wait_ms + give_up_ms + shutdown_margin_ms
+}
+
+/// While shutdown is stopping agents, end once nothing is left.
+fn continue_or_finish(state: State) -> actor.Next(State, Message) {
+  case state.finishing && dict.is_empty(state.threads) {
+    True ->
+      done_shutting_down(state, case state.failed_stops {
+        [] -> Clean
+        failed -> Incomplete(list.unique(failed))
       })
-      done
-    })
-  // Agents stop in parallel. A stopped sandbox's ephemeral node leaves
-  // the tailnet with it.
-  list.each(stoppers, fn(done) {
-    let _ = process.receive(done, 30_000)
-    Nil
-  })
-  sys.info(
-    "crushling: stopped " <> int.to_string(list.length(stoppers)) <> " agents",
-  )
+    False -> actor.continue(state)
+  }
+}
+
+fn done_shutting_down(
+  state: State,
+  outcome: ShutdownOutcome,
+) -> actor.Next(State, Message) {
+  case outcome {
+    Clean -> sys.info("crushling: stopped every agent")
+    _ -> sys.warn("crushling: shutdown incomplete: " <> string.inspect(outcome))
+  }
   case state.stopping {
-    Some(reply) -> process.send(reply, Nil)
+    Some(reply) -> process.send(reply, outcome)
     None -> Nil
   }
   actor.stop()
+}
+
+/// The launcher has stopped the thread's agent, or failed to. Messages
+/// that came in meanwhile start it again, unless the bridge is shutting
+/// down. A failed stop is retried after each of `stop_backoff_ms`, with the
+/// entry left `Stopping` so messages keep waiting; when the retries are
+/// used up the registry gives up on the agent, says so in the thread, and
+/// shutdown reports it.
+fn stopped(state: State, key: String, result: Result(Nil, String)) -> State {
+  case dict.get(state.threads, key), result {
+    Ok(Entry(agent: Stopping(..), ..) as entry), Ok(Nil) ->
+      case entry.backlog, state.finishing {
+        [_, ..], False ->
+          launch(
+            state,
+            key,
+            Entry(..entry, in_flight: 0, preparing: False, working: False),
+          )
+        _, _ -> State(..state, threads: dict.delete(state.threads, key))
+      }
+    Ok(Entry(agent: Stopping(attempt:), ..) as entry), Error(reason) ->
+      case list.drop(state.config.stop_backoff_ms, attempt) {
+        [delay, ..] -> {
+          sys.warn(
+            "crushling: stopping "
+            <> key
+            <> " failed, retrying in "
+            <> int.to_string(delay)
+            <> "ms: "
+            <> reason,
+          )
+          process.send_after(state.self, delay, RetryStop(key))
+          let entry = Entry(..entry, agent: Stopping(attempt + 1))
+          State(..state, threads: dict.insert(state.threads, key, entry))
+        }
+        [] -> {
+          sys.warn(
+            "crushling: error: giving up stopping "
+            <> key
+            <> " after "
+            <> int.to_string(attempt + 1)
+            <> " tries: "
+            <> reason,
+          )
+          let client = state.config.client
+          let #(channel, thread_ts) = entry.conversation(entry)
+          process.spawn_unlinked(fn() {
+            slack.say(
+              client,
+              channel,
+              thread_ts,
+              "_couldn't stop this thread's agent, so its sandbox may still be running. Send a follow-up to start it again._",
+            )
+          })
+          State(
+            ..state,
+            threads: dict.delete(state.threads, key),
+            failed_stops: [key, ..state.failed_stops],
+          )
+        }
+      }
+    _, _ -> state
+  }
+}
+
+/// Run the launcher's stop for `key` on its own process, which reports
+/// back with `Stopped`.
+fn run_stop(state: State, key: String) -> Nil {
+  let stop = state.config.launcher.stop
+  let self = state.self
+  process.spawn_unlinked(fn() { process.send(self, Stopped(key, stop(key))) })
+  Nil
 }
 
 fn from_thread(state: State, key: String, notice: thread.Notice) -> State {
@@ -929,16 +1086,34 @@ fn thread_down(state: State, down: process.Down) -> State {
   dict.fold(gone, state, fn(state, key, _) { stop_agent(state, key) })
 }
 
-/// Stop a running agent and its container, keeping its workspace.
+/// Stop a running agent and its container, keeping its workspace. The
+/// entry stays, `Stopping`, until the launcher has finished; a thread still
+/// starting is left to `started`, which stops it during shutdown.
 fn stop_agent(state: State, key: String) -> State {
   case dict.get(state.threads, key) {
-    Ok(Entry(agent: Live(thread:, monitor:), ..)) -> {
+    Ok(Entry(agent: Live(thread:, monitor:), ..) as entry) -> {
       process.demonitor_process(monitor)
       process.send(thread, thread.Stop)
-      let stop = state.config.launcher.stop
-      process.spawn_unlinked(fn() { stop(key) })
+      run_stop(state, key)
       let tailnets = tailnet.stopped(state.tailnets, key)
-      State(..state, threads: dict.delete(state.threads, key), tailnets:)
+      // A new generation cancels the old agent's idle timer.
+      let generation = state.generation + 1
+      // Nothing runs while it stops; turns it had are over.
+      let entry =
+        Entry(
+          ..entry,
+          agent: Stopping(0),
+          generation:,
+          in_flight: 0,
+          preparing: False,
+          working: False,
+        )
+      State(
+        ..state,
+        threads: dict.insert(state.threads, key, entry),
+        tailnets:,
+        generation:,
+      )
     }
     _ -> state
   }
