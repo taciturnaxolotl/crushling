@@ -38,13 +38,8 @@ pub type Launcher {
     stop: fn(String) -> Result(Nil, String),
     /// Whether the thread has a workspace, so it was started before.
     exists: fn(String) -> Bool,
-    /// The thread's workspace on this machine.
-    workspace: fn(String) -> String,
     /// Where the bridge keeps the thread's `meta`, outside the workspace.
     meta_path: fn(String) -> String,
-    /// Where Slack attachments are saved: the host directory, and the same
-    /// directory relative to the agent's workspace.
-    attachments: fn(String) -> #(String, String),
     /// Run a script in a thread's sandbox, with extra `NAME=value` pairs.
     /// The local launcher has no sandbox.
     run_in_sandbox: Option(
@@ -97,6 +92,8 @@ pub fn bridge(
     url:,
     env: fn(key) {
       list.flatten([
+        // For the sandbox's file helpers, crushling-fetch and -share.
+        ["CRUSHLING_BRIDGE_URL=" <> url],
         mcp.env(secret, key),
         tunnel.env(secret, key),
         proxy.crush_env(url, secret, key),
@@ -223,14 +220,7 @@ pub fn docker(policy: sandbox.Policy, bridge: Bridge) -> Launcher {
       stop_result(key, docker_cleanup(policy, bridge, key))
     },
     exists: fn(key) { file_exists(sandbox.host_workspace(policy, key)) },
-    workspace: fn(key) { sandbox.host_workspace(policy, key) },
     meta_path: fn(key) { policy.root <> "/" <> key <> "/crushling.json" },
-    attachments: fn(key) {
-      #(
-        sandbox.host_workspace(policy, key) <> "/" <> attachments_dir,
-        attachments_dir,
-      )
-    },
     run_in_sandbox: Some(fn(key, env, script) {
       sandbox.run_in(policy, key, env, script)
       |> result.map_error(string.inspect)
@@ -340,11 +330,7 @@ pub fn local(
       stop_result(key, cleanup(key))
     },
     exists: fn(key) { file_exists(dir(key) <> "/work") },
-    workspace: fn(key) { dir(key) <> "/work" },
     meta_path: fn(key) { dir(key) <> "/crushling.json" },
-    attachments: fn(key) {
-      #(dir(key) <> "/work/" <> attachments_dir, attachments_dir)
-    },
     run_in_sandbox: None,
   )
 }

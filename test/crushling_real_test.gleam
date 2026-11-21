@@ -545,8 +545,6 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       },
       exists: local.exists,
       meta_path: local.meta_path,
-      attachments: local.attachments,
-      workspace: local.workspace,
       run_in_sandbox: local.run_in_sandbox,
     )
   use <-
@@ -571,6 +569,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       mode: client.Sysadmin,
       tailnet: None,
       stop_backoff_ms: registry.default_stop_backoff_ms,
+      root:,
     ))
   process.send(
     r,
@@ -631,8 +630,6 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       },
       exists: local.exists,
       meta_path: local.meta_path,
-      attachments: local.attachments,
-      workspace: local.workspace,
       run_in_sandbox: local.run_in_sandbox,
     )
   use <-
@@ -657,6 +654,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       mode: client.Sysadmin,
       tailnet: None,
       stop_backoff_ms: registry.default_stop_backoff_ms,
+      root:,
     ))
   process.send(
     r,

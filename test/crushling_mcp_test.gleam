@@ -92,17 +92,6 @@ pub fn tokens_are_per_thread_test() {
   let assert True = t == token
 }
 
-pub fn workspace_paths_stay_inside_test() {
-  let assert Ok("shot.png") =
-    slack_tools.workspace_path("/workspace", "shot.png")
-  let assert Ok("a/b.txt") =
-    slack_tools.workspace_path("/workspace", "/workspace/a/./b.txt")
-  let assert Error(Nil) =
-    slack_tools.workspace_path("/workspace", "/etc/passwd")
-  let assert Error(Nil) = slack_tools.workspace_path("/workspace", "a/../../x")
-  let assert Error(Nil) = slack_tools.workspace_path("/workspace", "")
-}
-
 fn assistant(id: String, text: String) -> event.Event {
   let assert Ok(e) =
     json.parse(

@@ -3,7 +3,7 @@
 -export([line_at/2, uuid_v4/0, monotonic_ms/0, system_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
          hmac_sha256_hex/2, equal_constant_time/2,
          file_exists/1, is_socket/1, file_stamp/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
-         read_file/1, write_bytes/2]).
+         read_file/1, write_bytes/2, list_dir/1, delete_file/1, is_loopback/1]).
 
 line_at(Lines, Index) ->
     element(Index + 1, Lines).
@@ -146,6 +146,26 @@ expand_home(Path) ->
 read_file(Path) ->
     case file:read_file(Path) of
         {ok, Bin} -> {ok, Bin};
+        {error, _} -> {error, nil}
+    end.
+
+%% Whether Host is a loopback IP address, written as one (no name lookup).
+is_loopback(Host) ->
+    Bare = string:trim(unicode:characters_to_list(Host), both, "[]"),
+    case inet:parse_strict_address(Bare) of
+        {ok, {127, _, _, _}} -> true;
+        {ok, {0, 0, 0, 0, 0, 0, 0, 1}} -> true;
+        {ok, {0, 0, 0, 0, 0, 16#ffff, A, _}} -> A bsr 8 =:= 127;
+        _ -> false
+    end.
+
+delete_file(Path) ->
+    _ = file:delete(Path),
+    nil.
+
+list_dir(Path) ->
+    case file:list_dir(Path) of
+        {ok, Names} -> {ok, [unicode:characters_to_binary(N) || N <- Names]};
         {error, _} -> {error, nil}
     end.
 

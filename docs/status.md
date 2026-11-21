@@ -79,7 +79,7 @@ only its final answer.
 
 Each agent gets a `slack` MCP server from the bridge (`crushling/mcp`,
 `crushling/slack_tools`): `read_conversation`, `read_channel`,
-`list_channels`, `user_info`, `post_message`, `share_file`, and
+`list_channels`, `user_info`, `post_message`, and
 `open_code_channel`, which lets the agent move its work to a code channel
 itself, with a task name for the title. Reading reaches any channel the bot
 is in; posting and sharing only reach the conversation the agent is in.
@@ -94,7 +94,7 @@ Agents reach the bridge on one port, `CRUSHLING_BRIDGE_BIND`:
 `CRUSHLING_BRIDGE_PORT` (default `127.0.0.1:7469`; the old names
 `CRUSHLING_MCP_BIND` and `CRUSHLING_MCP_PORT` still work), at
 `CRUSHLING_BRIDGE_URL` (old name `CRUSHLING_MCP_URL`). It always runs, and
-serves three things, each with its own per-thread token:
+serves four things, each with its own per-thread token:
 
 - `/tunnel/<thread>`: the thread's `crush server --dial` connects here
   (`crushling/tunnel`). The bridge reaches that server through a unix
@@ -104,6 +104,8 @@ serves three things, each with its own per-thread token:
   the thread's token for the org's Hyper key, meters usage and enforces the
   caps.
 - `/mcp/<thread>`: the Slack tools.
+- `/files/<thread>`: Slack attachments and shared files (`crushling/files`,
+  see Files below), with the Slack tools' token.
 
 For `local` the URL defaults to `http://127.0.0.1:<port>`. For `docker` it
 is required: an address of this machine the sandbox network may reach on
@@ -135,6 +137,91 @@ The `local` launcher records each server's pid, start time and dial URL
 (which names the thread) in `<root>/<thread>/server.pid`, and only signals a
 process that still matches all three, checked before TERM, before KILL and
 at every poll.
+
+### Files
+
+The bridge and a sandbox share no filesystem, so files cross over HTTP on
+the same port (`crushling/files`). Every Slack attachment is kept on the
+bridge at `$CRUSHLING_ROOT/<thread>/files/<file_id>-<name>`. Downloads from
+Slack are capped at 64 MiB as they are read, whatever size Slack claims; a
+bigger file is named in the prompt as "too large to fetch" and not kept.
+Images up to 5 MiB (by type, or by their first bytes when the type is
+generic) are also sent with the prompt for the model to see, and text up to
+64 KiB (`text/*`, JSON, YAML, and source code by name when the type is
+generic) is pasted into it, unless it has NUL bytes or isn't UTF-8. The
+prompt names every file with the command that fetches it. The agent shares
+a file into its conversation with `crushling-share`; the bot posts it in
+the thread, as `share_file` used to.
+
+- `GET /files/<thread>/<file_id>` serves a kept file;
+- `POST /files/<thread>?name=<name>&comment=<text>` needs a Content-Length
+  of at most 64 MiB (411 when chunked or missing, 413 when too long), keeps
+  the file, posts it in the thread's conversation, and answers
+  `{"id": ..., "message": ...}`. At most 2 uploads per thread and 8 in all
+  run at once; more get 429. A file Slack wouldn't take isn't kept.
+
+Both take the thread's MCP token. A file id only resolves inside its own
+thread's directory. Kept files stay with the thread's directory, as saved
+attachments stayed in its workspace before; nothing deletes a thread's
+directory yet.
+
+#### The sandbox helpers
+
+The `share_file` tool is gone, so an agent can only share files, and only
+fetch attachments that aren't inline, with the two helpers in `sandbox/bin`.
+**They must ship in the same rollout as this bridge**, on the sandbox's
+`PATH`, along with `curl` (7.55 or later, for `-H @-`), `od`, `sed`,
+`mktemp` and a POSIX `sh`:
+
+- `crushling-fetch <file_id> [dest]` downloads into `.slack/<name>` by
+  default, or into a directory given with a trailing `/`, or to a file path.
+  It refuses a symlinked `.slack` or target, and a target that is a
+  directory.
+- `crushling-share <path> [comment]` uploads into the conversation.
+
+They read `CRUSHLING_BRIDGE_URL`, `CRUSHLING_THREAD` and
+`CRUSHLING_MCP_TOKEN`, which the bridge sets in every sandbox's
+environment (`CRUSHLING_BRIDGE_URL` is the bridge's own setting of that
+name); the token reaches curl on stdin, not in its arguments.
+
+The docker image (`crushling-sandbox` in `~/dots`,
+`modules/nixos/services/crushling.nix`): its base, `buildpack-deps`, already
+has curl. Fetch this repo at the deployed revision and copy the helpers in
+with the other tools in `extraCommands`:
+
+```nix
+crushlingSrc = pkgs.fetchgit {
+  url = "https://tangled.org/dunkirk.sh/crushling";
+  rev = "<the deployed commit>";
+  hash = "<its hash>";
+};
+# in image.extraCommands, next to the gh and rg links:
+install -m 0755 ${crushlingSrc}/sandbox/bin/crushling-fetch usr/local/bin/
+install -m 0755 ${crushlingSrc}/sandbox/bin/crushling-share usr/local/bin/
+```
+
+Bump `rev` with each bridge deploy that changes `sandbox/bin`; the image tag
+changes with it, so new sandboxes get the new helpers.
+
+The Daytona snapshot: build it from a Dockerfile whose context is a
+checkout of this repo at the deployed revision:
+
+```dockerfile
+RUN command -v curl || (apt-get update && apt-get install -y --no-install-recommends curl ca-certificates)
+COPY --chmod=0755 sandbox/bin/crushling-fetch sandbox/bin/crushling-share /usr/local/bin/
+```
+
+Check either image before rolling the bridge out, and whenever a sandbox
+starts misbehaving with files:
+
+```sh
+docker run --rm --entrypoint sh crushling-sandbox:<tag> -c \
+  'command -v crushling-share && command -v crushling-fetch && command -v curl'
+```
+
+and in a running sandbox (`docker exec crushling-<key> sh -c '...'`, or
+Daytona's exec), the same `command -v crushling-share` plus
+`test -n "$CRUSHLING_BRIDGE_URL"`.
 
 ## Tailnet access
 

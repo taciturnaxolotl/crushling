@@ -1,0 +1,62 @@
+#!/bin/sh
+# crushling-fetch <file_id> [dest]
+# Download a file someone attached in Slack from the crushling bridge.
+# With no dest it lands in .slack/<name>. A dest ending in / is a directory
+# that gets <name> inside; any other dest is the file's path.
+set -eu
+usage() { echo "usage: crushling-fetch <file_id> [dest]" >&2; exit 2; }
+fail() { echo "crushling-fetch: $*" >&2; exit 1; }
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+id=$1
+case $id in '' | *[!A-Za-z0-9]*) echo "crushling-fetch: bad file id: $id" >&2; exit 2 ;; esac
+base=${CRUSHLING_BRIDGE_URL:-${CRUSHLING_MCP_URL:-}}
+[ -n "$base" ] || fail "CRUSHLING_BRIDGE_URL is not set"
+: "${CRUSHLING_THREAD:?crushling-fetch: CRUSHLING_THREAD is not set}"
+: "${CRUSHLING_MCP_TOKEN:?crushling-fetch: CRUSHLING_MCP_TOKEN is not set}"
+
+dest=${2:-}
+case $dest in -*) dest=./$dest ;; esac
+case $dest in
+  '')
+    # The default: .slack/<name>, never through a symlink.
+    [ -L .slack ] && fail ".slack is a symlink; refusing"
+    mkdir -p .slack
+    dir=.slack
+    into=yes
+    ;;
+  */)
+    dir=${dest%/}
+    [ -n "$dir" ] || dir=/
+    mkdir -p -- "$dir"
+    into=yes
+    ;;
+  *)
+    dir=$(dirname -- "$dest")
+    mkdir -p -- "$dir"
+    into=no
+    ;;
+esac
+
+# A private temp file beside the destination, moved into place at the end.
+tmp=$(mktemp "$dir/.crushling-fetch.XXXXXX")
+headers=$(mktemp "$dir/.crushling-fetch.XXXXXX")
+trap 'rm -f "$tmp" "$headers"' EXIT
+# The token goes to curl on stdin, not in its arguments.
+code=$(printf 'Authorization: Bearer %s\n' "$CRUSHLING_MCP_TOKEN" |
+  curl -sS --globoff -H @- -o "$tmp" -D "$headers" -w '%{http_code}' \
+    -- "${base%/}/files/$CRUSHLING_THREAD/$id") || exit 1
+[ "$code" = 200 ] || fail "$id: HTTP $code: $(cat "$tmp")"
+
+# The bridge names the file with characters safe in a path.
+name=$(sed -n 's/^[Xx]-[Ff]ile-[Nn]ame: *//p' "$headers" | tr -d '\r' | tr -cd 'A-Za-z0-9._-')
+case $name in '' | . | ..) name=$id ;; esac
+case $name in -*) name=_$name ;; esac
+if [ "$into" = yes ]; then
+  target=$dir/$name
+else
+  target=$dest
+fi
+[ -L "$target" ] && fail "$target is a symlink; refusing"
+[ -d "$target" ] && fail "$target is a directory; give a file path, or a directory ending in /"
+mv -f -- "$tmp" "$target"
+echo "$target"

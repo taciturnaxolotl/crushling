@@ -3,6 +3,7 @@
 //// message back into a prompt.
 
 import crushling/crush/client
+import crushling/files
 import crushling/gun
 import crushling/render
 import crushling/sink.{type Sink} as thread_sink
@@ -606,203 +607,242 @@ pub fn command(prompt: String) -> Command {
 pub const help =
   "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
-/// A file attached to a Slack message.
+/// A file attached to a Slack message. `size` is what Slack says, if it
+/// says.
 pub type Attachment {
-  Attachment(name: String, mimetype: String, size: Int, url: String)
+  Attachment(
+    id: String,
+    name: String,
+    mimetype: String,
+    size: Option(Int),
+    url: String,
+  )
 }
 
 pub fn attachments(files: Option(List(file.File))) -> List(Attachment) {
   option.unwrap(files, [])
   |> list.filter_map(fn(file) {
-    case file.url_private, file.name {
-      Some(url), Some(name) ->
+    case file.id, file.url_private, file.name {
+      Some(id), Some(url), Some(name) ->
         Ok(Attachment(
+          id:,
           name:,
           mimetype: option.unwrap(file.mimetype, "application/octet-stream"),
-          size: option.unwrap(file.size, 0),
+          size: file.size,
           url:,
         ))
-      _, _ -> Error(Nil)
+      _, _, _ -> Error(Nil)
     }
   })
 }
 
-/// Files bigger than this are named in the prompt but not fetched.
-const max_attachment_bytes = 25_000_000
+/// Files bigger than this are named in the prompt but not kept.
+const max_attachment_bytes = files.max_upload_bytes
 
-@external(erlang, "crushling_ffi", "write_bytes")
-fn write_bytes(path: String, bytes: BitArray) -> Result(Nil, String)
+/// Why a Slack file couldn't be fetched.
+pub type FetchError {
+  TooLarge
+  FetchFailed(String)
+}
 
-/// Fetch a Slack file with the bot token, following one redirect.
-fn download(token: String, url: String, hops: Int) -> Result(BitArray, String) {
-  use parsed <- result.try(uri.parse(url) |> result.replace_error("bad url"))
-  use host <- result.try(option.to_result(parsed.host, "bad url"))
-  let path = case parsed.query {
-    Some(query) -> parsed.path <> "?" <> query
-    None -> parsed.path
-  }
-  use conn <- result.try(gun.connect_tcp(host, 443, True, 10_000))
-  let response =
-    gun.request(
-      conn,
-      http.Get,
-      path,
-      [#("host", host), #("authorization", "Bearer " <> token)],
-      <<>>,
-      120_000,
-    )
-  gun.close(conn)
-  use response <- result.try(response)
-  case response.status {
-    200 -> Ok(response.body)
-    301 | 302 | 303 | 307 | 308 if hops > 0 ->
-      case list.key_find(response.headers, "location") {
-        Ok(location) -> download(token, location, hops - 1)
-        Error(Nil) -> Error("redirect without a location")
+/// Fetch a Slack file with the bot token, following up to `hops`
+/// redirects, reading at most `max` bytes of it. Only https is fetched,
+/// except from loopback addresses (for tests). A redirect keeps the token
+/// only while it stays on a Slack file host.
+pub fn fetch_file(
+  token: String,
+  url: String,
+  max: Int,
+  hops: Int,
+) -> Result(BitArray, FetchError) {
+  fetch_from(Some(token), url, max, hops)
+}
+
+@external(erlang, "crushling_ffi", "is_loopback")
+fn is_loopback(host: String) -> Bool
+
+/// Whether the bot token may follow a redirect to `host`.
+pub fn is_slack_file_host(host: String) -> Bool {
+  let host = string.lowercase(host)
+  host == "files.slack.com"
+  || string.ends_with(host, ".slack.com")
+  || string.ends_with(host, ".slack-edge.com")
+}
+
+fn fetch_from(
+  token: Option(String),
+  url: String,
+  max: Int,
+  hops: Int,
+) -> Result(BitArray, FetchError) {
+  let failed = fn(why) { Error(FetchFailed(why)) }
+  case uri.parse(url) {
+    Error(Nil) -> failed("bad url")
+    Ok(parsed) ->
+      case parsed.host, parsed.scheme {
+        None, _ | Some(""), _ -> failed("bad url")
+        Some(host), scheme -> {
+          let tls = scheme == Some("https")
+          let allowed = tls || scheme == Some("http") && is_loopback(host)
+          use <- bool.guard(!allowed, failed("only https is fetched"))
+          let port =
+            option.unwrap(parsed.port, case tls {
+              True -> 443
+              False -> 80
+            })
+          let path = case parsed.query {
+            Some(query) -> parsed.path <> "?" <> query
+            None -> parsed.path
+          }
+          let headers = case token {
+            Some(token) -> [
+              #("host", host),
+              #("authorization", "Bearer " <> token),
+            ]
+            None -> [#("host", host)]
+          }
+          case gun.connect_tcp(host, port, tls, 10_000) {
+            Error(reason) -> failed(reason)
+            Ok(conn) -> {
+              let response =
+                gun.request_capped(conn, http.Get, path, headers, max, 120_000)
+              gun.close_and_flush(conn)
+              case response {
+                Error(gun.TooLarge) -> Error(TooLarge)
+                Error(gun.Failed(reason)) -> failed(reason)
+                Ok(response) ->
+                  case response.status {
+                    200 -> Ok(response.body)
+                    301 | 302 | 303 | 307 | 308 if hops > 0 ->
+                      case list.key_find(response.headers, "location") {
+                        Ok(location) ->
+                          redirect(token, url, location, max, hops)
+                        Error(Nil) -> failed("redirect without a location")
+                      }
+                    status -> failed("status " <> int.to_string(status))
+                  }
+              }
+            }
+          }
+        }
       }
-    status -> Error("status " <> int.to_string(status))
   }
 }
 
-/// Keep only characters that are safe in a file name.
-fn safe_name(name: String) -> String {
-  let cleaned =
-    string.to_graphemes(name)
-    |> list.map(fn(g) {
-      case
-        string.contains(
-          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-",
-          g,
-        )
-      {
-        True -> g
-        False -> "_"
+/// Follow a redirect from `from` to `location`, which may be relative.
+fn redirect(
+  token: Option(String),
+  from: String,
+  location: String,
+  max: Int,
+  hops: Int,
+) -> Result(BitArray, FetchError) {
+  let target = {
+    use base <- result.try(uri.parse(from))
+    use relative <- result.try(uri.parse(location))
+    uri.merge(base, relative)
+  }
+  case target {
+    Error(Nil) -> Error(FetchFailed("bad redirect"))
+    Ok(target) -> {
+      let token = case target.host {
+        Some(host) ->
+          case is_slack_file_host(host) {
+            True -> token
+            False -> None
+          }
+        None -> None
       }
-    })
-    |> string.concat
-  case cleaned {
-    "" | "." | ".." -> "file"
-    cleaned -> cleaned
+      fetch_from(token, uri.to_string(target), max, hops - 1)
+    }
   }
 }
 
-fn human_size(bytes: Int) -> String {
-  case bytes {
-    b if b < 1024 -> int.to_string(b) <> " B"
-    b if b < 1_048_576 -> int.to_string(b / 1024) <> " KB"
-    b -> int.to_string(b / 1_048_576) <> " MB"
-  }
+/// Where a thread's attachments are kept on the bridge: the instance root
+/// and the thread's key.
+pub type Keep {
+  Keep(root: String, key: String)
 }
 
-/// Save a message's attachments into the workspace and describe them for
-/// the prompt. `dirs` is the host directory and the same directory as the
-/// agent sees it, relative to its workspace.
-pub fn save_attachments(
+/// Keep a message's attachments on the bridge and describe them for the
+/// prompt; small images and text go along as attachments too.
+pub fn keep_attachments(
   token: String,
   files: List(Attachment),
-  ts: String,
-  dirs: #(String, String),
+  keep: Keep,
 ) -> #(String, List(client.Attachment)) {
-  save_attachments_as(
-    token,
-    files,
-    ts,
-    dirs,
-    "Attached to this message, saved in the workspace:\n",
-  )
+  keep_attachments_as(token, files, keep, "Attached to this message:\n")
 }
 
-/// Save the files of messages the prompt only caught up on, so the agent
-/// can open those too.
-pub fn save_earlier_attachments(
+/// Keep the files of messages the prompt only caught up on, so the agent
+/// can fetch those too.
+pub fn keep_earlier_attachments(
   token: String,
   earlier: List(Earlier),
-  dirs: #(String, String),
+  keep: Keep,
 ) -> #(String, List(client.Attachment)) {
-  let saved =
+  let kept =
     list.map(earlier, fn(message) {
       let Earlier(ts:, files:) = message
-      save_attachments_as(
+      keep_attachments_as(
         token,
         files,
-        ts,
-        dirs,
-        "Attached to the earlier message at "
-          <> ts
-          <> ", saved in the workspace:\n",
+        keep,
+        "Attached to the earlier message at " <> ts <> ":\n",
       )
     })
   #(
-    list.map(saved, fn(pair) { pair.0 })
+    list.map(kept, fn(pair) { pair.0 })
       |> list.filter(fn(text) { text != "" })
       |> string.join("\n\n"),
-    list.flat_map(saved, fn(pair) { pair.1 }),
+    list.flat_map(kept, fn(pair) { pair.1 }),
   )
 }
 
-/// Image types models take directly, and how big such an image can be.
-const seen_images = ["image/png", "image/jpeg", "image/gif", "image/webp"]
-
-const max_seen_image_bytes = 5_000_000
-
-/// Download `files` into the workspace. Returns a note for the prompt, and
-/// the images, which go along with the prompt for the model to see.
-fn save_attachments_as(
+/// Download `files` and keep them on the bridge. Returns a note for the
+/// prompt, and the files that go along with it.
+fn keep_attachments_as(
   token: String,
-  files: List(Attachment),
-  ts: String,
-  dirs: #(String, String),
+  attached: List(Attachment),
+  keep: Keep,
   heading: String,
 ) -> #(String, List(client.Attachment)) {
-  let #(host_dir, agent_dir) = dirs
-  let saved =
-    list.map(files, fn(file) {
-      let name = safe_name(file.name)
-      let relative = agent_dir <> "/" <> safe_name(ts) <> "/" <> name
-      let about = " (" <> file.mimetype <> ", " <> human_size(file.size) <> ")"
-      let failed = fn(why) { #("- " <> file.name <> about <> ": " <> why, []) }
-      use <- bool.lazy_guard(file.size > max_attachment_bytes, fn() {
-        failed("too large to fetch")
-      })
-      case download(token, file.url, 2) {
-        Error(reason) -> failed("couldn't fetch (" <> reason <> ")")
-        Ok(bytes) ->
-          case
-            write_bytes(host_dir <> "/" <> safe_name(ts) <> "/" <> name, bytes)
-          {
-            Error(reason) -> failed("couldn't save (" <> reason <> ")")
-            Ok(Nil) ->
-              case
-                list.contains(seen_images, file.mimetype)
-                && bit_array.byte_size(bytes) <= max_seen_image_bytes
-              {
-                False -> #("- `" <> relative <> "`" <> about, [])
-                True -> #(
-                  "- `"
-                    <> relative
-                    <> "`"
-                    <> about
-                    <> ", attached for you to see",
-                  [
-                    client.Attachment(
-                      path: relative,
-                      name: file.name,
-                      mime_type: file.mimetype,
-                      content: bytes,
-                    ),
-                  ],
-                )
-              }
-          }
-      }
-    })
-  case list.map(saved, fn(pair) { pair.0 }) {
-    [] -> #("", [])
-    lines -> #(
-      heading <> string.join(lines, "\n"),
-      list.flat_map(saved, fn(pair) { pair.1 }),
-    )
-  }
+  list.map(attached, fn(file) {
+    let size = case file.size {
+      Some(size) -> files.human_size(size)
+      None -> "size unknown"
+    }
+    let failed = fn(why) {
+      #(
+        "- "
+          <> file.name
+          <> " ("
+          <> file.mimetype
+          <> ", "
+          <> size
+          <> "): "
+          <> why,
+        [],
+      )
+    }
+    let too_large = "too large to fetch"
+    // Slack's size is only a hint: the download is capped as it is read.
+    case file.size {
+      Some(size) if size > max_attachment_bytes -> failed(too_large)
+      _ ->
+        case fetch_file(token, file.url, max_attachment_bytes, 2) {
+          Error(TooLarge) -> failed(too_large)
+          Error(FetchFailed(reason)) ->
+            failed("couldn't fetch (" <> reason <> ")")
+          Ok(bytes) ->
+            case files.store(keep.root, keep.key, file.id, file.name, bytes) {
+              Error(reason) -> failed("couldn't keep (" <> reason <> ")")
+              Ok(Nil) -> files.place(file.id, file.name, file.mimetype, bytes)
+            }
+        }
+    }
+  })
+  |> files.describe(heading, _)
 }
 
 /// A Slack ts as seconds.
@@ -862,7 +902,7 @@ pub fn files_note(files: List(Attachment)) -> String {
   }
 }
 
-/// An earlier message's files, to save with the prompt that catches up on
+/// An earlier message's files, to keep with the prompt that catches up on
 /// it.
 pub type Earlier {
   Earlier(ts: String, files: List(Attachment))

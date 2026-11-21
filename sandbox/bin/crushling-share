@@ -1,0 +1,30 @@
+#!/bin/sh
+# crushling-share <path> [comment]
+# Upload a file into the Slack conversation this agent works in, through
+# the crushling bridge (64 MiB at most). Prints the bridge's {"id": ...}.
+set -eu
+fail() { echo "crushling-share: $*" >&2; exit 1; }
+[ $# -ge 1 ] && [ $# -le 2 ] || { echo "usage: crushling-share <path> [comment]" >&2; exit 2; }
+path=$1
+comment=${2:-}
+case $path in -*) path=./$path ;; esac
+[ -f "$path" ] || fail "no such file: $path"
+base=${CRUSHLING_BRIDGE_URL:-${CRUSHLING_MCP_URL:-}}
+[ -n "$base" ] || fail "CRUSHLING_BRIDGE_URL is not set"
+: "${CRUSHLING_THREAD:?crushling-share: CRUSHLING_THREAD is not set}"
+: "${CRUSHLING_MCP_TOKEN:?crushling-share: CRUSHLING_MCP_TOKEN is not set}"
+# Percent-encode every byte, which needs nothing beyond POSIX od.
+encode() { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'; }
+query="name=$(encode "$(basename -- "$path")")&comment=$(encode "$comment")"
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+# The token goes to curl on stdin, not in its arguments; -T sends the file
+# with its length, as the bridge requires.
+code=$(printf 'Authorization: Bearer %s\n' "$CRUSHLING_MCP_TOKEN" |
+  curl -sS --globoff -H @- -o "$out" -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/octet-stream' \
+    -T "$path" \
+    -- "${base%/}/files/$CRUSHLING_THREAD?$query") || exit 1
+[ "$code" = 200 ] || fail "HTTP $code: $(cat "$out")"
+cat "$out"
+echo

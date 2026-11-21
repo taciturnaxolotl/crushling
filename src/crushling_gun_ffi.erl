@@ -1,8 +1,11 @@
 -module(crushling_gun_ffi).
 
--export([connect_unix/2, connect_tcp/4, request/6, stream/3, stream/4,
+-export([connect_unix/2, connect_tcp/4, request/6, request_capped/6, stream/3, stream/4,
          stream_headers/2, await_stream/3,
-         cancel/2, close/1, decode_message/1]).
+         cancel/2, close/1, close_and_flush/1, decode_message/1]).
+
+%% How many chunks gun may send ahead in a capped request.
+-define(CAPPED_FLOW, 8).
 
 connect_unix(Path, TimeoutMs) ->
     Opts = #{
@@ -69,6 +72,65 @@ request(Pid, Method, Path, Headers, Body, TimeoutMs) ->
             {error, reason(Reason)}
     end.
 
+%% A request whose body is read only up to Max bytes: past that, or when the
+%% response declares more, the stream is cancelled and too_large returned.
+%% A redirect's body is not read.
+request_capped(Pid, Method, Path, Headers, Max, TimeoutMs) ->
+    %% With flow control gun sends at most ?CAPPED_FLOW chunks ahead of what
+    %% has been counted, so a fast server can't fill this mailbox.
+    Ref = gun:request(Pid, Method, Path, Headers, <<>>, #{flow => ?CAPPED_FLOW}),
+    case gun:await(Pid, Ref, TimeoutMs) of
+        {response, fin, Status, RespHeaders} ->
+            {ok, {Status, RespHeaders, <<>>}};
+        {response, nofin, Status, RespHeaders} when Status >= 300, Status < 400 ->
+            gun:cancel(Pid, Ref),
+            {ok, {Status, RespHeaders, <<>>}};
+        {response, nofin, Status, RespHeaders} ->
+            case declared_length(RespHeaders) of
+                N when is_integer(N), N > Max ->
+                    gun:cancel(Pid, Ref),
+                    {error, too_large};
+                _ ->
+                    case collect_capped(Pid, Ref, Max, TimeoutMs, 0, []) of
+                        {ok, Body} -> {ok, {Status, RespHeaders, Body}};
+                        Error -> Error
+                    end
+            end;
+        {error, Reason} ->
+            gun:cancel(Pid, Ref),
+            {error, {failed, reason(Reason)}}
+    end.
+
+declared_length(Headers) ->
+    case lists:keyfind(<<"content-length">>, 1, Headers) of
+        {_, Value} ->
+            try binary_to_integer(string:trim(Value)) catch _:_ -> unknown end;
+        false ->
+            unknown
+    end.
+
+collect_capped(Pid, Ref, Max, TimeoutMs, Size, Acc) ->
+    case gun:await(Pid, Ref, TimeoutMs) of
+        {data, IsFin, Data} ->
+            Total = Size + byte_size(Data),
+            if
+                Total > Max ->
+                    gun:cancel(Pid, Ref),
+                    {error, too_large};
+                IsFin =:= fin ->
+                    {ok, iolist_to_binary(lists:reverse([Data | Acc]))};
+                true ->
+                    %% Counted and kept: let gun send one more.
+                    gun:update_flow(Pid, Ref, 1),
+                    collect_capped(Pid, Ref, Max, TimeoutMs, Total, [Data | Acc])
+            end;
+        {trailers, _} ->
+            {ok, iolist_to_binary(lists:reverse(Acc))};
+        {error, Reason} ->
+            gun:cancel(Pid, Ref),
+            {error, {failed, reason(Reason)}}
+    end.
+
 stream(Pid, Path, Headers) ->
     stream(Pid, Path, Headers, none).
 
@@ -108,6 +170,12 @@ cancel(Pid, Ref) ->
 
 close(Pid) ->
     gun:close(Pid),
+    nil.
+
+%% Close, and drop any messages the connection left for this process.
+close_and_flush(Pid) ->
+    gun:close(Pid),
+    gun:flush(Pid),
     nil.
 
 decode_message({gun_sse, Pid, Ref, fin}) ->

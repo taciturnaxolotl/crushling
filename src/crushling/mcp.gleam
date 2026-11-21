@@ -44,7 +44,7 @@ pub fn env(secret: String, key: String) -> List(String) {
 const protocol_version = "2025-06-18"
 
 const instructions =
-  "These tools reach the Slack conversation you are working in. Read it, look around the workspace's channels, post an update, share a file, or move the work into a code channel when it involves changing a repository."
+  "These tools reach the Slack conversation you are working in. Read it, look around the workspace's channels, post an update, or move the work into a code channel when it involves changing a repository. Files go through shell commands instead: `crushling-share <path> [comment]` uploads a file from your workspace into the conversation (a screenshot, a log, a build artifact), and `crushling-fetch <file_id> [dest]` downloads a file someone attached, into .slack/ by default."
 
 /// Answer one JSON-RPC message. Notifications and responses get nothing
 /// back.

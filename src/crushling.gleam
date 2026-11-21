@@ -36,6 +36,7 @@
 
 import crushling/crush/client
 import crushling/events
+import crushling/files
 import crushling/launcher
 import crushling/mcp
 import crushling/provider
@@ -164,6 +165,7 @@ fn start() -> Result(Nil, String) {
       mode:,
       tailnet:,
       stop_backoff_ms: registry.default_stop_backoff_ms,
+      root:,
     ))
     |> result.map_error(fn(error) { "registry: " <> string.inspect(error) }),
   )
@@ -183,7 +185,6 @@ fn start() -> Result(Nil, String) {
     slack_tools.Context(
       client:,
       bot_user: me.user_id,
-      launcher:,
       lookup: fn(key) { process.call(registry, 5000, registry.Lookup(key, _)) },
       ask_tailnet: fn(key, reason) {
         process.call(registry, 5000, fn(reply) {
@@ -191,8 +192,8 @@ fn start() -> Result(Nil, String) {
         })
       },
     )
-  // Every agent reaches the bridge here: its tunnel, its inference and its
-  // Slack tools.
+  // Every agent reaches the bridge here: its tunnel, its inference, its
+  // Slack tools and its files.
   let bind =
     fallback("CRUSHLING_BRIDGE_BIND", "CRUSHLING_MCP_BIND", "127.0.0.1")
   use _ <- result.try(
@@ -206,6 +207,9 @@ fn start() -> Result(Nil, String) {
           slack_tools.call(context, key, name, arguments)
         },
       ),
+      files.route(secret, root, fn(key, name, contents, comment) {
+        slack_tools.share(context, key, name, contents, comment)
+      }),
     ]),
   )
   io.println(

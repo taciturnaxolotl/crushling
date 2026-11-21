@@ -5,8 +5,9 @@
 //// message (or in a DM) follows along, so every reply is a prompt; one
 //// joined partway through only answers when mentioned. Each prompt is
 //// prepared in order before it reaches the agent: what was said in the
-//// thread since the agent last looked, and any attached files, saved into
-//// the workspace. `!stop` (or Slack's Stop) cancels the current run.
+//// thread since the agent last looked, and any attached files, kept on
+//// the bridge for the agent to fetch. `!stop` (or Slack's Stop) cancels
+//// the current run.
 ////
 //// A thread with nothing running for `idle_ms` has its agent stopped; its
 //// workspace, session and `meta` stay, so the next message, even after a
@@ -64,6 +65,9 @@ pub type Config {
     /// How long to wait before each retry of a stop that failed; once they
     /// are used up the registry gives up on that agent.
     stop_backoff_ms: List(Int),
+    /// The instance root: each thread's attachments are kept under
+    /// `<root>/<key>/files`.
+    root: String,
   )
 }
 
@@ -692,7 +696,7 @@ fn prepare_next(
             config.client,
             config.token,
             config.bot_user,
-            config.launcher.attachments(key),
+            slack.Keep(config.root, key),
           )
         let prompt = prompt.build(source, next, cursor, catch_up)
         process.send(self, Prepared(key, next.ts, prompt))

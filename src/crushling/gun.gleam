@@ -93,6 +93,48 @@ fn do_request(
   timeout_ms: Int,
 ) -> Result(#(Int, List(#(String, String)), BitArray), String)
 
+/// Why a capped request failed.
+pub type CappedError {
+  /// The body was, or was declared, longer than the cap.
+  TooLarge
+  Failed(String)
+}
+
+/// A request whose body is read only up to `max` bytes; past that it is
+/// abandoned with `TooLarge`. A redirect's body is not read.
+pub fn request_capped(
+  conn: Conn,
+  method: Method,
+  path: String,
+  headers: List(#(String, String)),
+  max: Int,
+  timeout_ms: Int,
+) -> Result(Response, CappedError) {
+  case
+    do_request_capped(
+      conn,
+      http.method_to_string(method),
+      path,
+      headers,
+      max,
+      timeout_ms,
+    )
+  {
+    Ok(#(status, headers, body)) -> Ok(Response(status:, headers:, body:))
+    Error(reason) -> Error(reason)
+  }
+}
+
+@external(erlang, "crushling_gun_ffi", "request_capped")
+fn do_request_capped(
+  conn: Conn,
+  method: String,
+  path: String,
+  headers: List(#(String, String)),
+  max: Int,
+  timeout_ms: Int,
+) -> Result(#(Int, List(#(String, String)), BitArray), CappedError)
+
 /// Open a GET stream. The calling process receives its messages.
 @external(erlang, "crushling_gun_ffi", "stream")
 pub fn stream(
@@ -133,6 +175,11 @@ pub fn cancel(conn: Conn, stream: StreamRef) -> Nil
 
 @external(erlang, "crushling_gun_ffi", "close")
 pub fn close(conn: Conn) -> Nil
+
+/// Close, and drop any messages the connection left for the calling
+/// process, such as its going down.
+@external(erlang, "crushling_gun_ffi", "close_and_flush")
+pub fn close_and_flush(conn: Conn) -> Nil
 
 /// Add handlers for every gun message to a selector.
 pub fn select(selector: Selector(a), mapping: fn(Message) -> a) -> Selector(a) {

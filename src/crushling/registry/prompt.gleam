@@ -1,6 +1,7 @@
 //// Turning a Slack message into the agent's next prompt: what was said
 //// since the agent last looked, who is asking, and any attached files,
-//// saved into the workspace.
+//// kept on the bridge for the agent to fetch, with small images and text
+//// sent along.
 
 import crushling/registry/incoming.{type Incoming}
 import crushling/slack
@@ -13,13 +14,13 @@ import slackline
 const catch_up_limit = 10
 
 /// What building a prompt needs: the Slack client and bot token, the bot's
-/// user id, and where attachments go (on the host, and in the workspace).
+/// user id, and where the thread's attachments are kept.
 pub type Source {
   Source(
     client: slackline.Client,
     token: String,
     bot_user: String,
-    dirs: #(String, String),
+    keep: slack.Keep,
   )
 }
 
@@ -48,9 +49,9 @@ pub fn build(
       )
   }
   let #(earlier_files, earlier_seen) =
-    slack.save_earlier_attachments(source.token, earlier, source.dirs)
+    slack.keep_earlier_attachments(source.token, earlier, source.keep)
   let #(files, seen) =
-    slack.save_attachments(source.token, message.files, message.ts, source.dirs)
+    slack.keep_attachments(source.token, message.files, source.keep)
   let from = case incoming.is_dm(message.channel) {
     True -> ""
     False -> "From <@" <> message.user <> ">:\n"

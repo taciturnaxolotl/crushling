@@ -41,8 +41,6 @@ fn blocking_launcher(calls: Subject(Call)) -> launcher.Launcher {
     },
     exists: fn(_) { False },
     meta_path: fn(key) { dir <> "/" <> key <> ".json" },
-    workspace: fn(key) { dir <> "/" <> key },
-    attachments: fn(key) { #(dir <> "/" <> key, ".slack") },
     run_in_sandbox: None,
   )
 }
@@ -72,6 +70,7 @@ fn start_with(
       mode: client.Sysadmin,
       tailnet: None,
       stop_backoff_ms:,
+      root: dir,
     ))
   r
 }

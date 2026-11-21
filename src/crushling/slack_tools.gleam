@@ -1,18 +1,16 @@
 //// The Slack tools a thread's agent gets through `mcp`: read the
 //// conversation it is in and channels the bot belongs to, look people up,
-//// post an update, share a file from its workspace, and move its work into
-//// a code channel.
+//// post an update, and move its work into a code channel. Files are shared
+//// with the sandbox's `crushling-share` helper through `files`, which posts
+//// them with `share`.
 ////
 //// Reading reaches any channel the bot is a member of. Posting and sharing
 //// only reach the conversation the agent is working in, so an agent can't
 //// speak anywhere its people didn't put it.
 
-import crushling/launcher.{type Launcher}
 import crushling/mcp
 import crushling/slack
 import crushling/thread
-import gleam/bit_array
-import gleam/bool
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
@@ -35,7 +33,6 @@ pub type Context {
   Context(
     client: slackline.Client,
     bot_user: String,
-    launcher: Launcher,
     /// The thread actor for a key, if its agent is up.
     lookup: fn(String) -> Option(Subject(thread.Message)),
     /// Ask the people in a thread to put its sandbox on the tailnet, with
@@ -45,9 +42,6 @@ pub type Context {
 }
 
 const timeout_ms = 60_000
-
-/// Files larger than this aren't shared.
-const max_file_bytes = 20_000_000
 
 fn schema(
   properties: List(#(String, String, String)),
@@ -152,17 +146,6 @@ fn common_tools() -> List(mcp.Tool) {
       schema([#("text", "string", "The message.")], ["text"]),
     ),
     mcp.Tool(
-      "share_file",
-      "Upload a file from your workspace into the conversation you are working in, such as a screenshot, a log, or a build artifact.",
-      schema(
-        [
-          #("path", "string", "The file's path in your workspace."),
-          #("comment", "string", "A message to post with it."),
-        ],
-        ["path"],
-      ),
-    ),
-    mcp.Tool(
       "open_code_channel",
       "Move this work into a Slack code channel: its own channel for a task that changes a repository, where people can follow along and see the diff in a Code tab. Use it once the repository is cloned and the work will take more than one message. Your replies go to the channel from then on.",
       schema(
@@ -215,7 +198,7 @@ pub fn call(
     |> option.to_result("this thread's agent isn't running"),
   )
   use location <- result.try(ask(thread, thread.Where))
-  let thread.Location(conversation:, root:) = location
+  let thread.Location(conversation:, ..) = location
   let channel = conversation.channel
   let thread_ts = option.unwrap(conversation.thread_ts, "")
   case name {
@@ -247,16 +230,6 @@ pub fn call(
           })
         }
       }
-    "share_file" ->
-      share_file(
-        context,
-        key,
-        root,
-        channel,
-        thread_ts,
-        string_arg(arguments, "path"),
-        string_arg(arguments, "comment"),
-      )
     "request_tailnet" ->
       case string_arg(arguments, "reason") {
         "" -> Error("say which machines you need and why")
@@ -393,27 +366,6 @@ fn user_info(context: Context, user: String) -> Result(String, String) {
   }
 }
 
-@external(erlang, "crushling_ffi", "read_file")
-fn read_bytes(path: String) -> Result(BitArray, Nil)
-
-/// A path the agent gave, relative to its workspace, if it stays inside.
-pub fn workspace_path(root: String, path: String) -> Result(String, Nil) {
-  let relative = case string.starts_with(path, root <> "/") {
-    True -> string.drop_start(path, string.length(root) + 1)
-    False -> path
-  }
-  let parts =
-    string.split(relative, "/") |> list.filter(fn(p) { p != "" && p != "." })
-  case
-    string.starts_with(relative, "/")
-    || list.contains(parts, "..")
-    || parts == []
-  {
-    True -> Error(Nil)
-    False -> Ok(string.join(parts, "/"))
-  }
-}
-
 fn content_type(name: String) -> String {
   let extension =
     string.split(name, ".")
@@ -435,29 +387,24 @@ fn content_type(name: String) -> String {
   }
 }
 
-fn share_file(
+/// Upload a file the thread's agent sent through the bridge into the
+/// conversation it is working in, as the bot, with `comment` ("" for none).
+/// This is `files.Share`.
+pub fn share(
   context: Context,
   key: String,
-  root: String,
-  channel: String,
-  thread_ts: String,
-  path: String,
+  name: String,
+  contents: BitArray,
   comment: String,
 ) -> Result(String, String) {
-  use relative <- result.try(
-    workspace_path(root, path)
-    |> result.replace_error("give a path inside your workspace"),
+  use thread <- result.try(
+    context.lookup(key)
+    |> option.to_result("this thread's agent isn't running"),
   )
-  let host = context.launcher.workspace(key) <> "/" <> relative
-  use contents <- result.try(
-    read_bytes(host) |> result.replace_error("couldn't read " <> relative),
-  )
-  let size = bit_array.byte_size(contents)
-  use <- bool.guard(
-    size > max_file_bytes,
-    Error(relative <> " is too large to share"),
-  )
-  let name = list.last(string.split(relative, "/")) |> result.unwrap(relative)
+  use location <- result.try(ask(thread, thread.Where))
+  let thread.Location(conversation:, ..) = location
+  let channel = conversation.channel
+  let thread_ts = option.unwrap(conversation.thread_ts, "")
   let file =
     slackline.FileUpload(
       filename: name,
@@ -475,6 +422,6 @@ fn share_file(
       comment -> complete_upload_external.initial_comment(call, comment)
     }
   })
-  |> result.map(fn(_) { "shared " <> relative })
+  |> result.map(fn(_) { "shared " <> name })
   |> result.map_error(slack.describe)
 }

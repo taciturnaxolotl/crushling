@@ -145,10 +145,6 @@ fn start_registry_with(
         key == registry.key("C9", "1.0") || key == registry.key("C7", "1.0")
       },
       meta_path: fn(key) { "/tmp/crushling-registry-test/" <> key <> ".json" },
-      workspace: fn(key) { "/tmp/crushling-registry-test/" <> key },
-      attachments: fn(key) {
-        #("/tmp/crushling-registry-test/" <> key, ".slack")
-      },
       run_in_sandbox: None,
     )
   let assert Ok(r) =
@@ -164,6 +160,7 @@ fn start_registry_with(
       mode: client.Sysadmin,
       tailnet:,
       stop_backoff_ms: registry.default_stop_backoff_ms,
+      root: "/tmp/crushling-registry-test",
     ))
   r
 }

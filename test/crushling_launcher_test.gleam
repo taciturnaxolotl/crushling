@@ -161,6 +161,12 @@ pub fn bridge_env_has_tokens_and_no_crush_hyper_test() {
   let assert True = list.contains(env, "CRUSHLING_THREAD=C1-1.0")
   let assert True =
     list.any(env, fn(pair) { string.starts_with(pair, "CRUSHLING_MCP_TOKEN=") })
+  // The file helpers' bridge URL, exactly once.
+  let assert ["CRUSHLING_BRIDGE_URL=" <> bridge_url] =
+    list.filter(env, fn(pair) {
+      string.starts_with(pair, "CRUSHLING_BRIDGE_URL=")
+    })
+  let assert True = bridge_url == url
   let assert False =
     list.any(env, fn(pair) { string.starts_with(pair, "CRUSH_HYPER_") })
   // The org's key never reaches a sandbox.
@@ -354,9 +360,7 @@ fn launching(calls: Subject(String)) -> launcher.Launcher {
       Ok(Nil)
     },
     exists: fn(_) { False },
-    workspace: fn(key) { "/tmp/" <> key },
     meta_path: fn(key) { "/tmp/" <> key <> ".json" },
-    attachments: fn(key) { #("/tmp/" <> key, ".slack") },
     run_in_sandbox: None,
   )
 }
