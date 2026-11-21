@@ -31,6 +31,10 @@
 //// | `CRUSHLING_TAILSCALE_API_KEY` | an API access token, instead of the OAuth client |
 //// | `CRUSHLING_TAILSCALE_TAG` | the tag sandboxes join with; default `tag:crushling` |
 //// | `CRUSHLING_TAILSCALE_TAILNET` | the tailnet's name; default `-`, the credential's own |
+//// | `CRUSHLING_HYPER_KEY` | the org's Hyper API key for the inference proxy at `/proxy/<thread>` on the sandbox server; without it the proxy is off |
+//// | `CRUSHLING_PROXY_UPSTREAM` | where the proxy sends requests; default `https://hyper.charm.land` |
+//// | `CRUSHLING_PROXY_THREAD_CAP_USD`, `CRUSHLING_PROXY_THREAD_CAP_TOKENS` | what one thread may spend through the proxy, in US dollars and/or tokens; unset is unlimited |
+//// | `CRUSHLING_PROXY_INSTANCE_CAP_USD`, `CRUSHLING_PROXY_INSTANCE_CAP_TOKENS` | the same for all threads together |
 //// | `CRUSHLING_MCP_URL` | how an agent reaches them; default `http://127.0.0.1:<port>` for `local`, none for `docker` (set it to an address the sandbox network may reach, or `off`) |
 
 import crushling/credentials
@@ -39,6 +43,7 @@ import crushling/events
 import crushling/launcher
 import crushling/mcp
 import crushling/provider
+import crushling/proxy
 import crushling/registry
 import crushling/registry/tailnet
 import crushling/sandbox
@@ -181,14 +186,15 @@ fn start() -> Result(Nil, String) {
     <> int.to_string(set.size(allowed))
     <> " allowed users",
   )
-  use _ <- result.try(case mcp_url {
+  use proxy <- result.try(proxy_from_settings(secret))
+  let mcp_routes = case mcp_url {
     "" -> {
       io.println(
         "crushling: Slack tools off; set CRUSHLING_MCP_URL so agents can reach them",
       )
-      Ok(Nil)
+      []
     }
-    url -> {
+    _ -> {
       let context =
         slack_tools.Context(
           client:,
@@ -203,18 +209,41 @@ fn start() -> Result(Nil, String) {
             })
           },
         )
-      use _ <- result.map(
-        sandbox_http.start(setting("CRUSHLING_MCP_BIND", "127.0.0.1"), port, [
-          mcp.route(
-            secret,
-            slack_tools.tools(tailnet: tailnet != option.None),
-            fn(key, name, arguments) {
-              slack_tools.call(context, key, name, arguments)
-            },
-          ),
-        ]),
-      )
-      io.println("crushling: Slack tools at " <> url)
+      [
+        mcp.route(
+          secret,
+          slack_tools.tools(tailnet: tailnet != option.None),
+          fn(key, name, arguments) {
+            slack_tools.call(context, key, name, arguments)
+          },
+        ),
+      ]
+    }
+  }
+  let proxy_routes = case proxy {
+    option.Some(proxy) -> [proxy.route(proxy)]
+    option.None -> []
+  }
+  use _ <- result.try(case list.append(mcp_routes, proxy_routes) {
+    [] -> Ok(Nil)
+    routes -> {
+      let bind = setting("CRUSHLING_MCP_BIND", "127.0.0.1")
+      use _ <- result.map(sandbox_http.start(bind, port, routes))
+      case mcp_url {
+        "" -> Nil
+        url -> io.println("crushling: Slack tools at " <> url)
+      }
+      case proxy {
+        option.Some(_) ->
+          io.println(
+            "crushling: inference proxy at "
+            <> bind
+            <> ":"
+            <> int.to_string(port)
+            <> "/proxy/<thread>",
+          )
+        option.None -> Nil
+      }
     }
   })
 
@@ -505,4 +534,40 @@ fn honcho_env() -> List(String) {
   list.filter_map(honcho_settings, fn(name) {
     getenv(name) |> result.map(fn(value) { name <> "=" <> value })
   })
+}
+
+/// The inference proxy, when `CRUSHLING_HYPER_KEY` is set. Errors name the
+/// setting, never its value.
+fn proxy_from_settings(
+  secret: String,
+) -> Result(option.Option(proxy.Proxy), String) {
+  case getenv("CRUSHLING_HYPER_KEY") {
+    Error(Nil) | Ok("") -> Ok(option.None)
+    Ok(org_key) -> {
+      let cap = fn(scope) {
+        let name = fn(unit) { "CRUSHLING_PROXY_" <> scope <> "_CAP_" <> unit }
+        proxy.parse_cap(setting(name("TOKENS"), ""), setting(name("USD"), ""))
+        |> result.map_error(fn(error) {
+          case error {
+            proxy.BadTokens -> name("TOKENS") <> " is not a whole number"
+            proxy.BadUsd -> name("USD") <> " is not a dollar amount"
+          }
+        })
+      }
+      use thread_cap <- result.try(cap("THREAD"))
+      use instance_cap <- result.try(cap("INSTANCE"))
+      proxy.start(proxy.Config(
+        secret:,
+        org_key:,
+        upstream: setting("CRUSHLING_PROXY_UPSTREAM", proxy.default_upstream),
+        thread_cap:,
+        instance_cap:,
+        max_per_thread: proxy.default_max_per_thread,
+        max_uploads: proxy.default_max_uploads,
+        upload_timeout_ms: proxy.default_upload_timeout_ms,
+      ))
+      |> result.map(option.Some)
+      |> result.map_error(fn(reason) { "CRUSHLING_PROXY_UPSTREAM " <> reason })
+    }
+  }
 }

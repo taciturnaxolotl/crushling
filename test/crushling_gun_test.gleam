@@ -17,6 +17,7 @@ pub fn decodes_every_message_test() {
     next()
   let assert gun.Event(event: gun.SseEvent("done", Some("7"), "x"), ..) = next()
   let assert gun.StreamEnd(..) = next()
+  let assert gun.Trailers(headers: [#("x-a", "1")], ..) = next()
   let assert gun.StreamError(reason: "timeout", ..) = next()
   let assert gun.ConnDown(reason: "closed", ..) = next()
   let assert Error(Nil) = process.selector_receive(selector, 10)

@@ -32,6 +32,7 @@ send_all() ->
     Self ! {gun_sse, Self, Ref, #{event_type => <<"message">>, data => [<<"{\"a\":">>, <<"1}">>]}},
     Self ! {gun_sse, Self, Ref, #{id => <<"7">>, event_type => <<"done">>, data => <<"x">>}},
     Self ! {gun_sse, Self, Ref, fin},
+    Self ! {gun_trailers, Self, Ref, [{<<"x-a">>, <<"1">>}]},
     Self ! {gun_error, Self, Ref, timeout},
     Self ! {gun_down, Self, http, closed, []},
     nil.

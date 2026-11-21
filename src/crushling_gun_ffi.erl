@@ -127,6 +127,8 @@ decode_message({gun_response, Pid, Ref, nofin, Status, Headers}) ->
     {stream_response, Pid, Ref, Status, Headers, false};
 decode_message({gun_data, Pid, Ref, IsFin, Data}) ->
     {data, Pid, Ref, Data, IsFin =:= fin};
+decode_message({gun_trailers, Pid, Ref, Headers}) ->
+    {trailers, Pid, Ref, Headers};
 decode_message({gun_error, Pid, Ref, Reason}) ->
     {stream_error, Pid, Ref, reason(Reason)};
 decode_message({gun_error, Pid, Reason}) ->

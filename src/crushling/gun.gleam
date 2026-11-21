@@ -39,6 +39,8 @@ pub type Message {
     fin: Bool,
   )
   Data(conn: Conn, stream: StreamRef, data: BitArray, fin: Bool)
+  /// Trailing headers, which end the stream.
+  Trailers(conn: Conn, stream: StreamRef, headers: List(#(String, String)))
   StreamEnd(conn: Conn, stream: StreamRef)
   StreamError(conn: Conn, stream: StreamRef, reason: String)
   ConnDown(conn: Conn, reason: String)
@@ -139,6 +141,7 @@ pub fn select(selector: Selector(a), mapping: fn(Message) -> a) -> Selector(a) {
   |> process.select_record(atom.create("gun_sse"), 3, handle)
   |> process.select_record(atom.create("gun_response"), 5, handle)
   |> process.select_record(atom.create("gun_data"), 4, handle)
+  |> process.select_record(atom.create("gun_trailers"), 3, handle)
   |> process.select_record(atom.create("gun_error"), 3, handle)
   |> process.select_record(atom.create("gun_error"), 2, handle)
   |> process.select_record(atom.create("gun_down"), 4, handle)
