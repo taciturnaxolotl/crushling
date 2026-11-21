@@ -8,6 +8,7 @@ import crushling/provider
 import crushling/proxy
 import crushling/proxy/meter
 import crushling/sandbox
+import crushling/sys
 import crushling/tunnel
 import gleam/erlang/charlist
 import gleam/erlang/process.{type Subject}
@@ -140,11 +141,35 @@ fn policy(dir: String, docker: String) -> sandbox.Policy {
     gid: 970,
     root: dir,
     env: ["HONCHO_URL=https://honcho.example"],
+    own_team: "",
+    own_env: [],
     crush_config: provider.config(provider.Models("big", "small"), url),
     crush: "",
     dns: [],
     bridge_url: url,
   )
+}
+
+/// The operator's Honcho settings reach only the self-host workspace's
+/// sandboxes.
+pub fn honcho_settings_reach_only_the_own_workspace_test() {
+  let p =
+    sandbox.Policy(..policy("/tmp", "docker"), own_team: "T1", own_env: [
+      "HONCHO_API_KEY=hk-secret",
+    ])
+  let has = fn(key) {
+    sandbox.run_args(p, key, [])
+    |> list.contains("HONCHO_API_KEY=hk-secret")
+  }
+  let assert True = has("T1-C1-1.0")
+  let assert False = has("T2-C1-1.0")
+  let assert False = has("C1-1.0")
+  // Nobody's, without a workspace of its own.
+  let assert [] = sandbox.team_env(sandbox.Policy(..p, own_team: ""), "-C1-1.0")
+  // Changing them recreates containers.
+  let assert False =
+    sandbox.fingerprint(p)
+    == sandbox.fingerprint(sandbox.Policy(..p, own_env: []))
 }
 
 pub fn bridge_env_has_tokens_and_no_crush_hyper_test() {
@@ -360,7 +385,7 @@ fn launching(calls: Subject(String)) -> launcher.Launcher {
       Ok(Nil)
     },
     exists: fn(_) { False },
-    meta_path: fn(key) { "/tmp/" <> key <> ".json" },
+    rekey: fn(_, _) { Ok(Nil) },
     run_in_sandbox: None,
   )
 }
@@ -630,4 +655,36 @@ pub fn stop_checks_the_recorded_identity_test() {
   let assert Ok(Nil) = local_stop(pid_file)
   let assert False = local_alive(pid)
   let assert False = file_exists(pid_file)
+}
+
+/// A thread moving to a key with its workspace in it: the old container
+/// is removed, not left running, and the directory moves with it.
+pub fn docker_rekey_removes_the_old_container_and_moves_the_directory_test() {
+  let dir = tmp("rekey-" <> sys.uuid())
+  let #(docker, log) = fake_docker(dir)
+  let l = launcher.docker(policy(dir, docker), real_bridge(dir))
+  let assert Ok(Nil) = mkdir_p(dir <> "/C1-1.0/work")
+  let assert Ok(Nil) = write_private(dir <> "/C1-1.0/work/notes.txt", "kept")
+  let assert Ok(Nil) = l.rekey("C1-1.0", "T1-C1-1.0")
+  let assert Ok(ran) = read_file(log)
+  let assert True = string.contains(ran, "rm --force crushling-C1-1.0")
+  let assert True = l.exists("T1-C1-1.0")
+  let assert False = l.exists("C1-1.0")
+  let assert Ok("kept") = read_file(dir <> "/T1-C1-1.0/work/notes.txt")
+  // Nothing left to move is fine.
+  let assert Ok(Nil) = l.rekey("C1-1.0", "T1-C1-1.0")
+}
+
+pub fn local_rekey_moves_the_directory_test() {
+  let dir = tmp("rekey-local-" <> sys.uuid())
+  let l =
+    launcher.local(dir, "", provider.Models("big", "small"), real_bridge(dir))
+  let assert Ok(Nil) = mkdir_p(dir <> "/C2-1.0/work")
+  let assert Ok(Nil) = l.rekey("C2-1.0", "T1-C2-1.0")
+  let assert True = l.exists("T1-C2-1.0")
+  let assert False = l.exists("C2-1.0")
+  // A new key that already exists is never overwritten.
+  let assert Ok(Nil) = mkdir_p(dir <> "/C3-1.0/work")
+  let assert Ok(Nil) = mkdir_p(dir <> "/T1-C3-1.0/work")
+  let assert Error(_) = l.rekey("C3-1.0", "T1-C3-1.0")
 }

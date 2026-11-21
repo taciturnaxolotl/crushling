@@ -1,46 +1,43 @@
 //// Links from code channels to the threads they belong to. A message in a code
-//// channel uses its link to find its thread. Links are saved on disk, so they
-//// last through a restart.
+//// channel uses its link to find its thread. Links are kept in the store, per
+//// workspace, so they last through a restart.
 
 import crushling/meta.{type Link, Link}
-import crushling/sandbox
 import crushling/slack
+import crushling/store.{type Store}
 import crushling/sys
 import gleam/dict.{type Dict}
 import gleam/option.{type Option, None, Some}
 
 pub opaque type Links {
-  Links(meta_path: fn(String) -> String, by_channel: Dict(String, Link))
+  Links(store: Store, team: String, by_channel: Dict(String, Link))
 }
 
-/// An empty set of links. Each link is saved at `meta_path` of its channel's
-/// key.
-pub fn new(meta_path: fn(String) -> String) -> Links {
-  Links(meta_path:, by_channel: dict.new())
-}
-
-/// A code channel's link is saved under the key its thread would have, with
-/// "code" as the ts.
-fn path(links: Links, channel: String) -> String {
-  links.meta_path(sandbox.key(channel, "code"))
+/// An empty set of links for workspace `team`, backed by `store`.
+pub fn new(store: Store, team: String) -> Links {
+  Links(store:, team:, by_channel: dict.new())
 }
 
 /// Find the link for `channel`, if it is a code channel. This looks in memory
-/// first and then on disk.
+/// first and then in the store.
 pub fn find(links: Links, channel: String) -> #(Links, Option(Link)) {
   case dict.get(links.by_channel, channel) {
     Ok(link) -> #(links, Some(link))
     Error(Nil) ->
-      case meta.read_link(path(links, channel)) {
-        Ok(link) -> #(add_known(links, channel, link), Some(link))
-        Error(Nil) -> #(links, None)
+      case store.link(links.store, links.team, channel) {
+        Ok(Some(link)) -> #(add_known(links, channel, link), Some(link))
+        Ok(None) -> #(links, None)
+        Error(reason) -> {
+          sys.warn("crushling: reading link " <> channel <> ": " <> reason)
+          #(links, None)
+        }
       }
   }
 }
 
 /// Link a new code channel to its thread.
 pub fn add(links: Links, channel: String, link: Link) -> Links {
-  case meta.write_link(path(links, channel), link) {
+  case store.put_link(links.store, links.team, channel, link) {
     Ok(Nil) -> Nil
     Error(reason) ->
       sys.warn("crushling: saving " <> channel <> " failed: " <> reason)

@@ -8,6 +8,8 @@ import crushling/registry/tailnet
 import crushling/slack
 import crushling/snapshot
 import crushling/socket
+import crushling/store
+import crushling/sys
 import crushling/tailscale
 import crushling/thread
 import crushling/venue
@@ -118,19 +120,49 @@ type Launch {
   Stopped(String)
 }
 
+/// The test workspace's key for a thread.
+fn k(channel: String, ts: String) -> String {
+  registry.key("T1", channel, ts)
+}
+
+/// A store of its own for each test.
+fn fresh_store() -> store.Store {
+  // In memory: a file store holds three files open, and the suite runs
+  // close to the open-file limit.
+  let assert Ok(key) = store.parse_key(test_key)
+  let assert Ok(s) = store.start(":memory:", key)
+  s
+}
+
+const test_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
+fn put_meta(s: store.Store, channel: String, ts: String, meta: meta.Meta) {
+  let assert Ok(Nil) =
+    store.put_thread(s, store.Thread(k(channel, ts), "T1", channel, ts, meta))
+  Nil
+}
+
+fn get_meta(s: store.Store, key: String) -> meta.Meta {
+  let assert Ok(Some(thread)) = store.thread(s, key)
+  thread.meta
+}
+
+fn put_link(s: store.Store, channel: String, link: meta.Link) {
+  let assert Ok(Nil) = store.put_link(s, "T1", channel, link)
+  Nil
+}
+
 /// A registry whose launcher always fails, so no agent is ever needed,
 /// and whose Slack calls go nowhere.
 fn start_registry(launches: process.Subject(Launch)) {
-  start_registry_with(launches, None)
+  start_registry_in(launches, fresh_store(), None)
 }
 
-fn start_registry_with(
+fn start_registry_in(
   launches: process.Subject(Launch),
+  store: store.Store,
   tailnet: Option(tailnet.Setup),
 ) {
-  let assert Ok(client) =
-    slackline.new("xoxb-test")
-    |> slackline.with_base_url("http://127.0.0.1:1/api")
   let fake =
     launcher.Launcher(
       launch: fn(key) {
@@ -141,12 +173,32 @@ fn start_registry_with(
         process.send(launches, Stopped(key))
         Ok(Nil)
       },
-      exists: fn(key) {
-        key == registry.key("C9", "1.0") || key == registry.key("C7", "1.0")
-      },
-      meta_path: fn(key) { "/tmp/crushling-registry-test/" <> key <> ".json" },
+      exists: fn(key) { key == k("C9", "1.0") || key == k("C7", "1.0") },
+      rekey: fn(_, _) { Ok(Nil) },
       run_in_sandbox: None,
     )
+  start_registry_using(fake, store, tailnet)
+}
+
+fn start_registry_using(
+  fake: launcher.Launcher,
+  store: store.Store,
+  tailnet: Option(tailnet.Setup),
+) {
+  start_registry_as(fake, store, tailnet, True)
+}
+
+/// `migrate_legacy` says whether this is the workspace whose old threads
+/// may move to their new keys.
+fn start_registry_as(
+  fake: launcher.Launcher,
+  store: store.Store,
+  tailnet: Option(tailnet.Setup),
+  migrate_legacy: Bool,
+) {
+  let assert Ok(client) =
+    slackline.new("xoxb-test")
+    |> slackline.with_base_url("http://127.0.0.1:1/api")
   let assert Ok(r) =
     registry.start(registry.Config(
       launcher: fake,
@@ -155,6 +207,9 @@ fn start_registry_with(
       bot_user: "UBOT",
       team: "T1",
       allowed: set.from_list(["U1"]),
+      admins: set.new(),
+      store:,
+      migrate_legacy:,
       idle_ms: 50,
       flush_ms: 50,
       mode: client.Sysadmin,
@@ -172,7 +227,7 @@ fn message(user: String, ts: String, text: String, mention: Bool) {
 pub fn registry_routing_test() {
   let launches = process.new_subject()
   let r = start_registry(launches)
-  let expected = registry.key("C1", "10.1")
+  let expected = k("C1", "10.1")
 
   // Someone not on the allowlist can't start anything.
   process.send(r, message("U2", "10.1", "<@UBOT> hi", True))
@@ -208,7 +263,7 @@ pub fn replies_resume_threads_from_before_a_restart_test() {
     registry.Received(msg.Incoming("C9", "1.0", "5.0", "U1", "more", False, [])),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
-  let assert True = key == registry.key("C9", "1.0")
+  let assert True = key == k("C9", "1.0")
   // A reply in a thread with no workspace is still ignored.
   process.send(
     r,
@@ -228,7 +283,11 @@ pub fn shutdown_with_nothing_running_stops_at_once_test() {
 
 pub fn native_stop_reaches_the_registry_test() {
   let registry = process.new_subject()
-  let router = socket.router(app.unverified(), registry, "UBOT")
+  let router =
+    socket.router(
+      app.unverified(),
+      socket.only(socket.Target("T1", "UBOT", registry)),
+    )
   let frame =
     "{\"envelope_id\":\"e2\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev1\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"C1\",\"user\":\"U1\",\"thread_ts\":\"10.1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
   let assert app.Send(after:, ..) = app.handle_socket(router, frame)
@@ -245,14 +304,10 @@ fn write_file(path: String, content: String) -> Result(Nil, String)
 
 pub fn follow_mode_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let s = fresh_store()
   // C7's thread is on disk, joined partway through: not following.
-  let assert Ok(Nil) =
-    meta.write(
-      "/tmp/crushling-registry-test/" <> registry.key("C7", "1.0") <> ".json",
-      meta.Meta(..meta.new(False), cursor: "3.0"),
-    )
-  let r = start_registry(launches)
+  put_meta(s, "C7", "1.0", meta.Meta(..meta.new(False), cursor: "3.0"))
+  let r = start_registry_in(launches, s, None)
   let reply = fn(ts, text, mention) {
     registry.Received(msg.Incoming("C7", "1.0", ts, "U1", text, mention, []))
   }
@@ -271,8 +326,7 @@ pub fn follow_mode_test() {
     ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
-  let assert Ok(meta.Meta(follow: True, ..)) =
-    meta.read("/tmp/crushling-registry-test/" <> key <> ".json")
+  let assert meta.Meta(follow: True, ..) = get_meta(s, key)
   // Mentioned partway into a thread: answers mentions only.
   process.send(
     r,
@@ -281,23 +335,20 @@ pub fn follow_mode_test() {
     ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
-  let assert Ok(meta.Meta(follow: False, ..)) =
-    meta.read("/tmp/crushling-registry-test/" <> key <> ".json")
+  let assert meta.Meta(follow: False, ..) = get_meta(s, key)
   Nil
 }
 
 pub fn code_channel_messages_reach_their_thread_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let s = fresh_store()
   // CCODE holds the work of C9's thread, which is on disk.
-  let assert Ok(Nil) =
-    meta.write_link(
-      "/tmp/crushling-registry-test/"
-        <> registry.key("CCODE", "code")
-        <> ".json",
-      meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: ""),
-    )
-  let r = start_registry(launches)
+  put_link(
+    s,
+    "CCODE",
+    meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: ""),
+  )
+  let r = start_registry_in(launches, s, None)
   // Top-level chatter in another channel reaches nobody.
   process.send(
     r,
@@ -315,12 +366,16 @@ pub fn code_channel_messages_reach_their_thread_test() {
     ),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
-  let assert True = key == registry.key("C9", "1.0")
+  let assert True = key == k("C9", "1.0")
 }
 
 pub fn native_stop_in_a_code_channel_test() {
   let registry = process.new_subject()
-  let router = socket.router(app.unverified(), registry, "UBOT")
+  let router =
+    socket.router(
+      app.unverified(),
+      socket.only(socket.Target("T1", "UBOT", registry)),
+    )
   let frame =
     "{\"envelope_id\":\"e3\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev2\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"CCODE\",\"user\":\"U1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
   let assert app.Send(after:, ..) = app.handle_socket(router, frame)
@@ -356,11 +411,9 @@ pub fn repo_helpers_test() {
 
 pub fn pause_and_resume_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
-  let path =
-    "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json"
-  let assert Ok(Nil) = meta.write(path, meta.new(True))
-  let r = start_registry(launches)
+  let s = fresh_store()
+  put_meta(s, "C9", "1.0", meta.new(True))
+  let r = start_registry_in(launches, s, None)
   let say = fn(ts, text, mention) {
     registry.Received(msg.Incoming("C9", "1.0", ts, "U1", text, mention, []))
   }
@@ -368,7 +421,7 @@ pub fn pause_and_resume_test() {
   process.send(r, say("2.0", "!pause", False))
   process.sleep(50)
   let assert Error(Nil) = process.receive(launches, 50)
-  let assert Ok(meta.Meta(paused: True, ..)) = meta.read(path)
+  let assert meta.Meta(paused: True, ..) = get_meta(s, k("C9", "1.0"))
   // Paused, a plain reply is chatter...
   process.send(r, say("3.0", "keep going", False))
   let assert Error(Nil) = process.receive(launches, 100)
@@ -378,7 +431,8 @@ pub fn pause_and_resume_test() {
   // `!resume` needs no mention.
   process.send(r, say("5.0", "!resume", False))
   process.sleep(50)
-  let assert Ok(meta.Meta(paused: False, follow: True, ..)) = meta.read(path)
+  let assert meta.Meta(paused: False, follow: True, ..) =
+    get_meta(s, k("C9", "1.0"))
   process.send(r, say("6.0", "carry on", False))
   let assert Ok(Launched(_)) = process.receive(launches, 1000)
   Nil
@@ -386,24 +440,23 @@ pub fn pause_and_resume_test() {
 
 pub fn paused_code_channels_need_a_mention_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
-  let assert Ok(Nil) =
-    meta.write_link(
-      "/tmp/crushling-registry-test/"
-        <> registry.key("CPAUSE", "code")
-        <> ".json",
-      meta.Link(origin_channel: "C7", origin_ts: "1.0", opened_ts: ""),
-    )
-  let assert Ok(Nil) =
-    meta.write(
-      "/tmp/crushling-registry-test/" <> registry.key("C7", "1.0") <> ".json",
-      meta.Meta(
-        ..meta.new(True),
-        paused: True,
-        venue: venue.CodeChannel("CPAUSE", "./demo"),
-      ),
-    )
-  let r = start_registry(launches)
+  let s = fresh_store()
+  put_link(
+    s,
+    "CPAUSE",
+    meta.Link(origin_channel: "C7", origin_ts: "1.0", opened_ts: ""),
+  )
+  put_meta(
+    s,
+    "C7",
+    "1.0",
+    meta.Meta(
+      ..meta.new(True),
+      paused: True,
+      venue: venue.CodeChannel("CPAUSE", "./demo"),
+    ),
+  )
+  let r = start_registry_in(launches, s, None)
   process.send(
     r,
     registry.Received(
@@ -423,16 +476,14 @@ pub fn paused_code_channels_need_a_mention_test() {
 
 pub fn the_seeded_request_is_not_run_twice_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let s = fresh_store()
   // CSEED was opened at 100.0 for C9's thread.
-  let assert Ok(Nil) =
-    meta.write_link(
-      "/tmp/crushling-registry-test/"
-        <> registry.key("CSEED", "code")
-        <> ".json",
-      meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: "100.0"),
-    )
-  let r = start_registry(launches)
+  put_link(
+    s,
+    "CSEED",
+    meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: "100.0"),
+  )
+  let r = start_registry_in(launches, s, None)
   let say = fn(ts, text, mention) {
     registry.Received(msg.Incoming("CSEED", ts, ts, "U1", text, mention, []))
   }
@@ -441,7 +492,7 @@ pub fn the_seeded_request_is_not_run_twice_test() {
   let assert Error(Nil) = process.receive(launches, 100)
   process.send(r, say("130.0", "and the tests", False))
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
-  let assert True = key == registry.key("C9", "1.0")
+  let assert True = key == k("C9", "1.0")
 }
 
 pub fn shared_files_route_like_messages_test() {
@@ -468,22 +519,19 @@ pub fn shared_files_route_like_messages_test() {
 
 pub fn done_archives_the_code_channel_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
-  let thread_path =
-    "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json"
-  let assert Ok(Nil) =
-    meta.write_link(
-      "/tmp/crushling-registry-test/"
-        <> registry.key("CDONE", "code")
-        <> ".json",
-      meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: ""),
-    )
-  let assert Ok(Nil) =
-    meta.write(
-      thread_path,
-      meta.Meta(..meta.new(True), venue: venue.CodeChannel("CDONE", "./demo")),
-    )
-  let r = start_registry(launches)
+  let s = fresh_store()
+  put_link(
+    s,
+    "CDONE",
+    meta.Link(origin_channel: "C9", origin_ts: "1.0", opened_ts: ""),
+  )
+  put_meta(
+    s,
+    "C9",
+    "1.0",
+    meta.Meta(..meta.new(True), venue: venue.CodeChannel("CDONE", "./demo")),
+  )
+  let r = start_registry_in(launches, s, None)
   process.send(
     r,
     registry.Received(
@@ -492,21 +540,17 @@ pub fn done_archives_the_code_channel_test() {
   )
   process.sleep(100)
   let assert Error(Nil) = process.receive(launches, 50)
-  let assert Ok(meta.Meta(venue: venue.Archived("./demo"), ..)) =
-    meta.read(thread_path)
+  let assert meta.Meta(venue: venue.Archived("./demo"), ..) =
+    get_meta(s, k("C9", "1.0"))
   Nil
 }
 
 pub fn late_deliveries_are_not_run_again_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
+  let s = fresh_store()
   // The agent's last prompt was the message at 5.0, so it has read 4.0.
-  let assert Ok(Nil) =
-    meta.write(
-      "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json",
-      meta.Meta(..meta.new(True), cursor: "5.0"),
-    )
-  let r = start_registry(launches)
+  put_meta(s, "C9", "1.0", meta.Meta(..meta.new(True), cursor: "5.0"))
+  let r = start_registry_in(launches, s, None)
   let say = fn(ts) {
     registry.Received(
       msg.Incoming("C9", "1.0", ts, "U1", "<@UBOT> again?", True, []),
@@ -516,19 +560,13 @@ pub fn late_deliveries_are_not_run_again_test() {
   let assert Error(Nil) = process.receive(launches, 100)
   process.send(r, say("6.0"))
   let assert Ok(Launched(_)) = process.receive(launches, 1000)
-  // Other tests share C9's thread.
-  let assert Ok(Nil) =
-    meta.write(
-      "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json",
-      meta.new(True),
-    )
   Nil
 }
 
 pub fn messages_wait_while_a_code_channel_opens_test() {
   let launches = process.new_subject()
   let r = start_registry(launches)
-  let opener = registry.key("C3", "1.0")
+  let opener = k("C3", "1.0")
   process.send(r, registry.FromThread(opener, thread.Opening))
   // Possibly the new channel's seed: held until the thread says where it
   // went.
@@ -544,7 +582,7 @@ pub fn messages_wait_while_a_code_channel_opens_test() {
     registry.FromThread(opener, thread.Moved(venue.ThreadOnly("./demo"), "")),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
-  let assert True = key == registry.key("CNEW", "5.0")
+  let assert True = key == k("CNEW", "5.0")
 }
 
 pub fn meta_keeps_the_venue_test() {
@@ -624,36 +662,35 @@ pub fn the_sandbox_is_on_the_tailnet_only_while_wanted_test() {
 
 pub fn tailnet_access_follows_the_buttons_test() {
   let launches = process.new_subject()
-  let assert Ok(Nil) = mkdir_p("/tmp/crushling-registry-test")
-  let path =
-    "/tmp/crushling-registry-test/" <> registry.key("C9", "1.0") <> ".json"
-  let assert Ok(Nil) = meta.write(path, meta.new(True))
+  let s = fresh_store()
+  put_meta(s, "C9", "1.0", meta.new(True))
+  let read = fn() { get_meta(s, k("C9", "1.0")) }
   let setup =
     tailnet.Setup(
       api: tailscale.Config(tailscale.ApiKey("k"), "tag:crushling", "-"),
       run: fn(_, _, _) { Ok("") },
     )
-  let r = start_registry_with(launches, Some(setup))
+  let r = start_registry_in(launches, s, Some(setup))
   let card = meta.Card("C9", "2.0", "1.0")
   let press = fn(choice, user) {
     registry.Tailnet(
-      registry.key("C9", "1.0"),
+      k("C9", "1.0"),
       tailnet.Pressed(choice, "C9", "1.0", user, card),
     )
   }
   // Someone not on the allowlist can't allow it.
   process.send(r, press(tailnet.Allow(1), "U2"))
   process.sleep(50)
-  let assert Ok(meta.Meta(tailnet: None, ..)) = meta.read(path)
+  let assert meta.Meta(tailnet: None, ..) = read()
   process.send(r, press(tailnet.Allow(1), "U1"))
   process.sleep(50)
-  let assert Ok(meta.Meta(tailnet: Some(meta.Grant(until_ms:, card: saved)), ..)) =
-    meta.read(path)
+  let assert meta.Meta(tailnet: Some(meta.Grant(until_ms:, card: saved)), ..) =
+    read()
   let assert True = saved == card
   let assert True = until_ms > system_ms() + 3_500_000
   process.send(r, press(tailnet.TurnOff, "U1"))
   process.sleep(50)
-  let assert Ok(meta.Meta(tailnet: None, ..)) = meta.read(path)
+  let assert meta.Meta(tailnet: None, ..) = read()
 }
 
 @external(erlang, "crushling_ffi", "system_ms")
@@ -664,8 +701,9 @@ pub fn events_arrive_over_http_test() {
   let r = start_registry(launches)
   let secret = "test-signing-secret"
   let port = 18_000 + int.absolute_value(unique()) % 2000
-  let router = socket.router(app.new(secret), r, "UBOT")
-  let assert Ok(Nil) = events.start("127.0.0.1", port, router)
+  let router =
+    socket.router(app.new(secret), socket.only(socket.Target("T1", "UBOT", r)))
+  let assert Ok(Nil) = events.start("127.0.0.1", port, Some(router), None)
   let post = fn(body, signature) {
     let now = verify.now_seconds()
     let assert Ok(req) =
@@ -692,3 +730,214 @@ pub fn events_arrive_over_http_test() {
 
 @external(erlang, "erlang", "unique_integer")
 fn unique() -> Int
+
+@external(erlang, "crushling_ffi", "file_exists")
+fn file_exists(path: String) -> Bool
+
+/// A thread from before keys carried the workspace is found under its old
+/// key once, and moved: its row, its directory, and its container (which
+/// the launcher's `rekey` removes).
+pub fn threads_under_their_old_key_move_to_the_new_one_test() {
+  let root = "/tmp/crushling-registry-test/migrate-" <> sys.uuid()
+  let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
+  let s = fresh_store()
+  let assert Ok(Nil) =
+    store.put_thread(
+      s,
+      store.Thread(
+        "C9-1.0",
+        "T1",
+        "C9",
+        "1.0",
+        meta.Meta(..meta.new(True), cursor: "2.0"),
+      ),
+    )
+  let launches = process.new_subject()
+  let rekeys = process.new_subject()
+  let fake =
+    launcher.Launcher(
+      launch: fn(key) {
+        process.send(launches, Launched(key))
+        Error("no agents in this test")
+      },
+      stop: fn(_) { Ok(Nil) },
+      exists: fn(key) { file_exists(root <> "/" <> key <> "/work") },
+      rekey: fn(old, new) {
+        process.send(rekeys, #(old, new))
+        launcher.move_dir(root, old, new)
+      },
+      run_in_sandbox: None,
+    )
+  let r = start_registry_using(fake, s, None)
+  let new = k("C9", "1.0")
+  let assert "T1-C9-1.0" = new
+  // A plain reply: the thread follows along, as its old meta says.
+  process.send(
+    r,
+    registry.Received(msg.Incoming("C9", "1.0", "3.0", "U1", "more", False, [])),
+  )
+  let assert Ok(Launched(launched)) = process.receive(launches, 1000)
+  let assert True = launched == new
+  let assert Ok(#("C9-1.0", "T1-C9-1.0")) = process.receive(rekeys, 100)
+  let assert Ok(None) = store.thread(s, "C9-1.0")
+  let assert Ok(Some(store.Thread(team: "T1", ..))) = store.thread(s, new)
+  let assert True = file_exists(root <> "/T1-C9-1.0/work")
+  let assert False = file_exists(root <> "/C9-1.0")
+  // Only once.
+  process.send(
+    r,
+    registry.Received(
+      msg.Incoming("C9", "1.0", "4.0", "U1", "again", False, []),
+    ),
+  )
+  let assert Ok(Launched(_)) = process.receive(launches, 1000)
+  let assert Error(Nil) = process.receive(rekeys, 100)
+  // A thread nobody knew under either key stays unknown.
+  process.send(
+    r,
+    registry.Received(msg.Incoming("C8", "1.0", "5.0", "U1", "hm", False, [])),
+  )
+  let assert Error(Nil) = process.receive(launches, 100)
+  let assert Error(Nil) = process.receive(rekeys, 50)
+  // Another workspace's old thread isn't this one's to take.
+  let assert Ok(Nil) =
+    store.put_thread(
+      s,
+      store.Thread("C5-1.0", "T2", "C5", "1.0", meta.new(True)),
+    )
+  process.send(
+    r,
+    registry.Received(
+      msg.Incoming("C5", "1.0", "6.0", "U1", "mine?", False, []),
+    ),
+  )
+  let assert Error(Nil) = process.receive(launches, 100)
+  let assert Error(Nil) = process.receive(rekeys, 50)
+  let assert Ok(Some(_)) = store.thread(s, "C5-1.0")
+}
+
+/// A registry over `root`, whose launcher reports its launches and rekeys,
+/// and whose rekey fails when `rekey_fails`.
+fn migrating_registry(
+  root: String,
+  s: store.Store,
+  migrate: Bool,
+  rekey_fails: Bool,
+) {
+  let launches = process.new_subject()
+  let rekeys = process.new_subject()
+  let fake =
+    launcher.Launcher(
+      launch: fn(key) {
+        process.send(launches, Launched(key))
+        Error("no agents in this test")
+      },
+      stop: fn(_) { Ok(Nil) },
+      exists: fn(key) { file_exists(root <> "/" <> key <> "/work") },
+      rekey: fn(old, new) {
+        process.send(rekeys, #(old, new))
+        case rekey_fails {
+          True -> Error("docker rm: daemon down")
+          False -> launcher.move_dir(root, old, new)
+        }
+      },
+      run_in_sandbox: None,
+    )
+  #(start_registry_as(fake, s, None, migrate), launches, rekeys)
+}
+
+fn reply_in(channel: String, ts: String) {
+  registry.Received(msg.Incoming(channel, "1.0", ts, "U1", "more", False, []))
+}
+
+pub fn only_the_self_host_workspace_moves_old_threads_test() {
+  let root = "/tmp/crushling-registry-test/other-" <> sys.uuid()
+  let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
+  let #(r, launches, rekeys) =
+    migrating_registry(root, fresh_store(), False, False)
+  process.send(r, reply_in("C9", "3.0"))
+  let assert Error(Nil) = process.receive(launches, 150)
+  let assert Error(Nil) = process.receive(rekeys, 50)
+  let assert True = file_exists(root <> "/C9-1.0/work")
+}
+
+pub fn a_move_cut_short_after_the_directory_finishes_test() {
+  let root = "/tmp/crushling-registry-test/half-dir-" <> sys.uuid()
+  // The directory moved; the row didn't.
+  let assert Ok(Nil) = mkdir_p(root <> "/T1-C9-1.0/work")
+  let s = fresh_store()
+  let assert Ok(Nil) =
+    store.put_thread(
+      s,
+      store.Thread(
+        "C9-1.0",
+        "T1",
+        "C9",
+        "1.0",
+        meta.Meta(..meta.new(True), cursor: "2.0"),
+      ),
+    )
+  let #(r, launches, rekeys) = migrating_registry(root, s, True, False)
+  process.send(r, reply_in("C9", "3.0"))
+  let assert Ok(Launched("T1-C9-1.0")) = process.receive(launches, 1000)
+  // Nothing left to rename on disk.
+  let assert Error(Nil) = process.receive(rekeys, 50)
+  let assert Ok(None) = store.thread(s, "C9-1.0")
+  let assert Ok(Some(store.Thread(meta: meta.Meta(cursor: "2.0", ..), ..))) =
+    store.thread(s, "T1-C9-1.0")
+}
+
+pub fn a_move_cut_short_after_the_row_finishes_test() {
+  let root = "/tmp/crushling-registry-test/half-row-" <> sys.uuid()
+  // The row moved; the directory didn't.
+  let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
+  let s = fresh_store()
+  put_meta(s, "C9", "1.0", meta.new(True))
+  let #(r, launches, rekeys) = migrating_registry(root, s, True, False)
+  process.send(r, reply_in("C9", "3.0"))
+  let assert Ok(#("C9-1.0", "T1-C9-1.0")) = process.receive(rekeys, 1000)
+  let assert Ok(Launched("T1-C9-1.0")) = process.receive(launches, 1000)
+  let assert True = file_exists(root <> "/T1-C9-1.0/work")
+  let assert False = file_exists(root <> "/C9-1.0")
+}
+
+pub fn a_failed_move_starts_nothing_test() {
+  let root = "/tmp/crushling-registry-test/failed-" <> sys.uuid()
+  let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
+  let s = fresh_store()
+  let assert Ok(Nil) =
+    store.put_thread(
+      s,
+      store.Thread("C9-1.0", "T1", "C9", "1.0", meta.new(True)),
+    )
+  let #(r, launches, rekeys) = migrating_registry(root, s, True, True)
+  process.send(r, reply_in("C9", "3.0"))
+  let assert Ok(_) = process.receive(rekeys, 1000)
+  // No fresh thread under the new key; the old one stays as it was.
+  let assert Error(Nil) = process.receive(launches, 150)
+  let assert Ok(Some(_)) = store.thread(s, "C9-1.0")
+  let assert Ok(None) = store.thread(s, "T1-C9-1.0")
+  let assert True = file_exists(root <> "/C9-1.0/work")
+  // A later message tries again, and still starts nothing.
+  process.send(r, reply_in("C9", "4.0"))
+  let assert Ok(_) = process.receive(rekeys, 1000)
+  let assert Error(Nil) = process.receive(launches, 150)
+  Nil
+}
+
+pub fn events_route_to_the_installation_they_were_delivered_to_test() {
+  // In a Slack Connect channel, team_id is where it happened; the
+  // authorization is who received it.
+  let frame =
+    "{\"envelope_id\":\"e9\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"TOTHER\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev9\",\"event_time\":1,\"authorizations\":[{\"team_id\":\"T1\",\"user_id\":\"UBOT\",\"is_bot\":true,\"is_enterprise_install\":false}],\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"C1\",\"user\":\"U1\",\"thread_ts\":\"10.1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
+  let registry = process.new_subject()
+  let router =
+    socket.router(
+      app.unverified(),
+      socket.only(socket.Target("T1", "UBOT", registry)),
+    )
+  let assert app.Send(after:, ..) = app.handle_socket(router, frame)
+  after()
+  let assert Ok(registry.StopRequested("C1", "10.1", "U1")) =
+    process.receive(registry, 1000)
+}

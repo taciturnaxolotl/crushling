@@ -88,6 +88,145 @@ The tools are served on the sandbox server (below), one endpoint per thread
 at `/mcp/<thread>`, with a bearer token derived from a secret in
 `$CRUSHLING_ROOT/mcp-secret`.
 
+## Workspaces and the store
+
+One bridge serves any number of Slack workspaces. Each one has an
+instance (`crushling/instance`): its own registry, and a Slack client with
+its own bot token. The rest is shared, one per bridge: the launcher, the
+tunnels, the inference proxy, the sandbox server, the store and the
+instance secret (`$CRUSHLING_ROOT/mcp-secret`).
+
+Events arrive over Socket Mode (one app-level token serves every workspace
+the app is in) and/or HTTP, and both go through one slackline `app.App`.
+slackline hands each event handler the envelope's `team_id`,
+`enterprise_id` and `authorizations`, and each block action its payload's
+`team`, so routing stays in crushling: the router takes the workspace the
+event was delivered to from the first authorization (in a Slack Connect
+channel `team_id` is the workspace the message was posted in, which may
+not be ours), else `team_id`, and passes the event to that instance's
+registry. Slack Connect routing hasn't been tried against real shared
+channels yet. An event for a workspace the bridge doesn't serve is
+dropped with a log line. slackline has no per-workspace token lookup (like
+Bolt's `authorize`), so the Slack tools, files and tailnet flow find a
+thread's workspace from its key and use that instance's client; such a hook
+would let one client follow the event's workspace.
+
+Thread keys carry the workspace: `T…-C…-<ts>` (`sandbox.key`), at most 64
+characters of `[A-Za-z0-9_.-]`. Every thread's directory, container
+(`crushling-<key>`), tunnel, proxy and Slack tool tokens are named by it,
+so two workspaces never share any of them.
+
+Each registry is started by the teams actor without a link and monitored:
+a crash in one workspace leaves the others running, and its registry is
+started again a second later (from the store, so with its latest token),
+with a log line. Shutdown stops them for good.
+
+Honcho memory (`HONCHO_*`) is the operator's own, so only the self-host
+workspace's sandboxes get those settings; other workspaces get no memory
+until they have settings of their own (later, from `team_settings`). The
+`local` launcher passes no Honcho settings to any agent.
+
+### The store
+
+State is one SQLite file, `$CRUSHLING_ROOT/crushling.db`, in WAL mode with
+foreign keys on and a busy timeout, behind `crushling/store`: one actor
+owns the connection, so writes are serialized. The schema is versioned with
+`PRAGMA user_version` and migrated on start. Tables:
+
+- `teams`: `team_id` (key), `bot_token_enc`, `bot_user`, `enterprise_id`
+  (null unless on Enterprise Grid), `installed_by`, `installed_at` (unix
+  seconds), `active`;
+- `team_settings`: `team_id`, `name`, `value`, a plain key/value list.
+  `allowed_users` and `admins` (comma-separated user ids) are read today;
+- `threads`: `key` (key), `team_id`, `channel`, `thread_ts`, and the meta:
+  `follow`, `paused`, `cursor`, `venue` (JSON), `tailnet` (JSON or null),
+  `updated_at`;
+- `links`: `team_id`, `channel` (together the key), `origin_channel`,
+  `origin_ts`, `opened_ts`;
+- `bridge`: the bridge's own notes, such as that the old files were
+  imported.
+
+Bot tokens are encrypted with AES-256-GCM, a fresh nonce per value and the
+team id as associated data, under `CRUSHLING_STORE_KEY` (32 bytes, base64).
+Without it, the bridge makes `$CRUSHLING_ROOT/store-key` (mode 0600) on
+first start and says so; back it up, since stored tokens can't be read
+without it.
+
+A workspace's allowlist and admins come from its `team_settings`. The
+self-host workspace, the one of `SLACK_BOT_TOKEN`, falls back to
+`CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`; an installed one starts
+with whoever installed it. Admins approve tailnet access (everyone allowed
+does when there are none), and only the self-host workspace gets tailnet
+access at all, since the Tailscale credential is the operator's.
+
+On start, self-host puts the `SLACK_BOT_TOKEN` workspace in the store (from
+auth.test), starts its instance, then one for every other active workspace
+in the store.
+
+### Moving from files
+
+Before the store, meta was `<root>/<key>/crushling.json` and links
+`<root>/<channel>-code/crushling.json`. The first start with
+`SLACK_BOT_TOKEN` imports them all for that workspace, logs what it
+imported and each directory it skipped (and why), and never reads them
+again; the files stay where they are.
+
+Threads from before keys carried the workspace keep their old key,
+`C…-<ts>`, until they are next looked up. Only the self-host workspace
+moves such threads (another workspace never had them). When the new key is
+missing its row or its directory, the registry finishes the move from the
+old key, step by step, so a move cut short by a crash completes on the
+next lookup:
+
+- the directory, if the old one exists and the new one doesn't: the
+  launcher's `rekey` removes the old container (`docker rm --force`, "no
+  such container" is fine; the local launcher stops the old server by its
+  pid file) and renames `<root>/<old key>` to `<root>/<new key>`;
+- the row, if the old one exists (of this workspace, or imported without
+  one) and the new one doesn't, in one transaction.
+
+If a step fails, the registry doesn't start a fresh thread under the new
+key, which would hide the old work: it posts once in the thread that an
+admin should check the logs, drops the message, and tries again on the
+next one. Its tokens are derived
+from the key, so they change with it; nothing keeps the old ones, and the
+next launch makes a new container with the new key's environment.
+
+### Installing in a workspace
+
+With `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` and `CRUSHLING_PUBLIC_URL`
+all set, the events server (`CRUSHLING_EVENTS_BIND`:`PORT`, not the sandbox
+port) also serves:
+
+- `GET /slack/install`, which redirects to Slack's authorize page with the
+  manifest's bot scopes, the redirect URI
+  `<CRUSHLING_PUBLIC_URL>/slack/oauth/callback` and a state signed with the
+  instance secret, good for ten minutes;
+- `GET /slack/oauth/callback`, which checks the state, exchanges the code
+  with `oauth.v2.access`, stores the workspace with its token encrypted,
+  starts its instance and shows a plain page.
+
+A new workspace starts with its installer as its allowlist and admins. A
+reinstall stores the new token and keeps the workspace's settings and its
+first installer; installing into the self-host workspace never writes
+people, which come from the environment. If the new instance won't start,
+the workspace is marked inactive and the page says so. Org-wide
+(Enterprise Grid) installs are refused, since the app isn't set up for
+org deployment (`org_deploy_enabled: false`).
+
+The state is signed and expires, but isn't tied to the browser that
+started the install (no nonce cookie), so it doesn't stop login CSRF; that
+is a follow-up.
+
+Add the redirect URL under "OAuth & Permissions" in the app's settings.
+Until "public distribution" is turned on there ("Manage Distribution"),
+only the app's own workspace can complete the install, which is enough to
+try it. No Marketplace listing is needed either way: with public
+distribution on, any workspace can install from the link, still unlisted.
+
+With the install on, `SLACK_BOT_TOKEN` is optional. Events still need
+Socket Mode or HTTP delivery set up as above.
+
 ## The sandbox server
 
 Agents reach the bridge on one port, `CRUSHLING_BRIDGE_BIND`:
@@ -303,19 +442,23 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 | `crushling/thread/repo` | Finds a repository in the workspace, lists its changes, and updates a code channel's context bar and Code tab. |
 | `crushling/venue` | Where a thread's work is. That is the thread, a code channel, an archived channel, or the thread after Slack refused a code channel. |
 | `crushling/sink` | The functions a thread uses to post in Slack. `crushling/slack` builds the real one. |
-| `crushling/meta` | What the bridge saves for each thread (follow, pause, cursor, venue) and each code channel (its thread). Files are replaced whole. |
+| `crushling/meta` | What the bridge saves for each thread (follow, pause, cursor, venue) and each code channel (its thread), and the old files' format, for their one-time import. |
+| `crushling/store` | The SQLite store: workspaces (tokens encrypted), their settings, thread meta and code channel links; migrations and the import of the old files. |
+| `crushling/instance` | One instance (registry and Slack client) per workspace, kept by team id; the self-host seed, per-workspace settings, the event router's lookup and the Slack tools' workspace. |
+| `crushling/install` | The OAuth install: the authorize redirect with a signed state, and the callback that stores and starts a workspace. |
+| `crushling/events` | The HTTP server for `/slack/events` and the install routes. |
 | `crushling/snapshot` | Shell commands that snapshot the workspace into a private bare repo under `.crush/` and diff two snapshots. |
 | `crushling/provider` | The agent's crush.json: Hyper models and the Slack tools, no key. |
 | `crushling/tunnel` | Dial-out tunnels: each thread's `crush server --dial` connects to the bridge, which exposes it as a unix socket shim. |
 | `crushling/proxy` | The inference proxy: thread tokens in, the org's Hyper key out, usage metered and capped. |
 | `crushling/sandbox_http` | The one port agents reach the bridge on, with the tunnel, proxy and Slack tools routes. |
-| `crushling` | Entry point: reads the settings, starts the proxy, the tunnels, the registry, the sandbox server and Socket Mode. |
-| `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; turns events into `Incoming`. |
-| `crushling/registry` | Maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, and writes all thread meta. |
+| `crushling` | Entry point: reads the settings, opens the store, starts the proxy, the tunnels, an instance per workspace, the sandbox server, the events server and Socket Mode. |
+| `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; routes events by workspace and turns them into `Incoming`. |
+| `crushling/registry` | One workspace's threads: maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, writes all thread meta to the store, and moves threads from their old keys. |
 | `crushling/tailscale` | The Tailscale API (auth keys) and the scripts that join and leave the tailnet inside a sandbox. |
 | `crushling/registry/tailnet` | Tailnet access for each thread: one rule (on the tailnet while the agent runs and access lasts), the Slack card and its buttons. |
 | `crushling/registry/entry`, `incoming`, `prompt` | A thread's entry in the registry, an incoming Slack message, and the prompt built from it. |
-| `crushling/registry/links` | Links code channels to their threads, in memory and on disk. |
+| `crushling/registry/links` | Links code channels to their threads, in memory and in the store. |
 | `crushling/slack` | The `Sink` over chat.postMessage/update and slackline's `stream` for run replies, with markdown and plan blocks and file uploads; prompt text cleanup. |
 | `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). Either way crush dials the tunnel and uses the proxy. |
 | `crushling/sandbox` | `docker run` arguments, a policy fingerprint label, adopt/start/recreate, stop (warm) and remove (cold). |
@@ -362,6 +505,13 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
    `tailscaled` started by `docker exec` outlives the exec (checked by hand
    on prattle).
 3. Try a real tailnet join from a sandbox, once the OAuth client exists.
-4. Smaller things: a cold tier that removes long-idle containers; a prompt
+4. Hosted: a nonce cookie for the install's state; per-workspace Honcho
+   settings; an App Home tab where a workspace's admins set its settings
+   (today they are rows in `team_settings`); a reinstall's new token is
+   stored but the running instance keeps the old one until a restart;
+   uninstall events (`app_uninstalled`, `tokens_revoked`) don't mark a
+   workspace inactive yet; the proxy's caps are per bridge, not per
+   workspace.
+5. Smaller things: a cold tier that removes long-idle containers; a prompt
    the thread actor fails to send never counts as finished, so that thread
    never idles; a Cancel button in addition to replying `stop`.

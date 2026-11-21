@@ -31,14 +31,20 @@ import slackline/message
 
 pub type Context {
   Context(
-    client: slackline.Client,
-    bot_user: String,
+    /// The workspace a thread's key belongs to, for its Slack client.
+    workspace: fn(String) -> Result(Workspace, String),
     /// The thread actor for a key, if its agent is up.
     lookup: fn(String) -> Option(Subject(thread.Message)),
     /// Ask the people in a thread to put its sandbox on the tailnet, with
     /// the agent's reason.
     ask_tailnet: fn(String, String) -> Result(String, String),
   )
+}
+
+/// One Slack workspace, as the tools reach it: the client with its bot
+/// token, and the bot's own user id.
+pub type Workspace {
+  Workspace(client: slackline.Client, bot_user: String)
 }
 
 const timeout_ms = 60_000
@@ -193,6 +199,7 @@ pub fn call(
   name: String,
   arguments: Dynamic,
 ) -> Result(String, String) {
+  use workspace <- result.try(context.workspace(key))
   use thread <- result.try(
     context.lookup(key)
     |> option.to_result("this thread's agent isn't running"),
@@ -203,20 +210,20 @@ pub fn call(
   let thread_ts = option.unwrap(conversation.thread_ts, "")
   case name {
     "read_conversation" ->
-      read(context, channel, thread_ts, limit_arg(arguments))
+      read(workspace, channel, thread_ts, limit_arg(arguments))
     "read_channel" ->
       case string_arg(arguments, "channel") {
         "" -> Error("give the channel's id")
         channel ->
           read(
-            context,
+            workspace,
             channel,
             string_arg(arguments, "thread_ts"),
             limit_arg(arguments),
           )
       }
-    "list_channels" -> list_channels(context)
-    "user_info" -> user_info(context, string_arg(arguments, "user"))
+    "list_channels" -> list_channels(workspace)
+    "user_info" -> user_info(workspace, string_arg(arguments, "user"))
     "post_message" ->
       case string_arg(arguments, "text") {
         "" -> Error("there's nothing to post")
@@ -253,7 +260,7 @@ pub fn call(
 }
 
 fn read(
-  context: Context,
+  context: Workspace,
   channel: String,
   thread_ts: String,
   limit: Int,
@@ -272,7 +279,7 @@ fn read(
   }
 }
 
-fn line(context: Context, message: message.Message) -> Result(String, Nil) {
+fn line(context: Workspace, message: message.Message) -> Result(String, Nil) {
   use ts <- result.try(option.to_result(message.ts, Nil))
   let who = case message.user, message.bot_id {
     Some(user), _ if user == context.bot_user -> "you"
@@ -291,7 +298,7 @@ fn line(context: Context, message: message.Message) -> Result(String, Nil) {
   Ok("[" <> ts <> "] " <> who <> ": " <> text <> files <> thread)
 }
 
-fn list_channels(context: Context) -> Result(String, String) {
+fn list_channels(context: Workspace) -> Result(String, String) {
   // users.conversations lists only what the bot is in, unlike
   // conversations.list, whose `is_member` Slack doesn't always fill in.
   let first =
@@ -319,7 +326,7 @@ fn list_channels(context: Context) -> Result(String, String) {
 }
 
 fn all_channels(
-  context: Context,
+  context: Workspace,
   call: slackline.Call(users.Conversations, users.ConversationsResponse),
   found: List(conversation.Conversation),
   pages_left: Int,
@@ -334,7 +341,7 @@ fn all_channels(
   }
 }
 
-fn user_info(context: Context, user: String) -> Result(String, String) {
+fn user_info(context: Workspace, user: String) -> Result(String, String) {
   let id = case user {
     "<@" <> rest -> string.replace(rest, ">", "")
     id -> id
@@ -397,6 +404,7 @@ pub fn share(
   contents: BitArray,
   comment: String,
 ) -> Result(String, String) {
+  use workspace <- result.try(context.workspace(key))
   use thread <- result.try(
     context.lookup(key)
     |> option.to_result("this thread's agent isn't running"),
@@ -411,7 +419,7 @@ pub fn share(
       content_type: content_type(name),
       contents:,
     )
-  httpc.upload_files(context.client, [file], share: fn(call) {
+  httpc.upload_files(workspace.client, [file], share: fn(call) {
     let call = complete_upload_external.channel_id(call, channel)
     let call = case thread_ts {
       "" -> call

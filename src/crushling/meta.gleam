@@ -1,7 +1,11 @@
 //// What the bridge saves between restarts. For each thread, it saves whether
 //// the thread answers every reply, how far it has read, and where its work is.
-//// For each code channel, it saves the thread the channel belongs to. Each
-//// file is replaced whole, so a crash never leaves half a file.
+//// For each code channel, it saves the thread the channel belongs to.
+////
+//// This lives in the store (`crushling/store`). The files the bridge used to
+//// keep, `<root>/<key>/crushling.json`, are only read once, when the store
+//// imports them on its first start; `write` and `write_link` remain to make
+//// such files in tests.
 
 import crushling/venue.{type Venue}
 import gleam/dynamic/decode
@@ -88,13 +92,7 @@ pub fn read(path: String) -> Result(Meta, Nil) {
     use tailnet <- decode.optional_field(
       "tailnet",
       None,
-      decode.optional({
-        use until_ms <- decode.field("until_ms", decode.int)
-        use channel <- decode.field("card_channel", decode.string)
-        use ts <- decode.field("card_ts", decode.string)
-        use thread_ts <- decode.field("card_thread_ts", decode.string)
-        decode.success(Grant(until_ms:, card: Card(channel:, ts:, thread_ts:)))
-      }),
+      decode.optional(grant_decoder()),
     )
     decode.success(Meta(
       follow:,
@@ -107,6 +105,24 @@ pub fn read(path: String) -> Result(Meta, Nil) {
   |> result.replace_error(Nil)
 }
 
+/// A tailnet grant as JSON, as files and the store keep it.
+pub fn grant_to_json(grant: Grant) -> json.Json {
+  json.object([
+    #("until_ms", json.int(grant.until_ms)),
+    #("card_channel", json.string(grant.card.channel)),
+    #("card_ts", json.string(grant.card.ts)),
+    #("card_thread_ts", json.string(grant.card.thread_ts)),
+  ])
+}
+
+pub fn grant_decoder() -> decode.Decoder(Grant) {
+  use until_ms <- decode.field("until_ms", decode.int)
+  use channel <- decode.field("card_channel", decode.string)
+  use ts <- decode.field("card_ts", decode.string)
+  use thread_ts <- decode.field("card_thread_ts", decode.string)
+  decode.success(Grant(until_ms:, card: Card(channel:, ts:, thread_ts:)))
+}
+
 fn legacy_venue(stored: Option(Venue), channel: String, repo: String) -> Venue {
   case stored, channel, repo {
     Some(venue), _, _ -> venue
@@ -116,23 +132,14 @@ fn legacy_venue(stored: Option(Venue), channel: String, repo: String) -> Venue {
   }
 }
 
+/// Write a thread's meta as the bridge used to, for tests of the import.
 pub fn write(path: String, meta: Meta) -> Result(Nil, String) {
   json.object([
     #("follow", json.bool(meta.follow)),
     #("paused", json.bool(meta.paused)),
     #("cursor", json.string(meta.cursor)),
     #("venue", venue.to_json(meta.venue)),
-    #(
-      "tailnet",
-      json.nullable(meta.tailnet, fn(grant) {
-        json.object([
-          #("until_ms", json.int(grant.until_ms)),
-          #("card_channel", json.string(grant.card.channel)),
-          #("card_ts", json.string(grant.card.ts)),
-          #("card_thread_ts", json.string(grant.card.thread_ts)),
-        ])
-      }),
-    ),
+    #("tailnet", json.nullable(meta.tailnet, grant_to_json)),
   ])
   |> json.to_string
   |> write_private(path, _)
@@ -151,6 +158,8 @@ pub fn read_link(path: String) -> Result(Link, Nil) {
   |> result.replace_error(Nil)
 }
 
+/// Write a code channel's link as the bridge used to, for tests of the
+/// import.
 pub fn write_link(path: String, link: Link) -> Result(Nil, String) {
   json.object([
     #("origin_channel", json.string(link.origin_channel)),

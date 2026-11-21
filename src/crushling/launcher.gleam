@@ -38,8 +38,10 @@ pub type Launcher {
     stop: fn(String) -> Result(Nil, String),
     /// Whether the thread has a workspace, so it was started before.
     exists: fn(String) -> Bool,
-    /// Where the bridge keeps the thread's `meta`, outside the workspace.
-    meta_path: fn(String) -> String,
+    /// Move a thread from an old key to a new one (`rekey(old, new)`):
+    /// stop and remove whatever runs under the old key, and rename its
+    /// directory. The next launch starts it afresh under the new key.
+    rekey: fn(String, String) -> Result(Nil, String),
     /// Run a script in a thread's sandbox, with extra `NAME=value` pairs.
     /// The local launcher has no sandbox.
     run_in_sandbox: Option(
@@ -220,7 +222,20 @@ pub fn docker(policy: sandbox.Policy, bridge: Bridge) -> Launcher {
       stop_result(key, docker_cleanup(policy, bridge, key))
     },
     exists: fn(key) { file_exists(sandbox.host_workspace(policy, key)) },
-    meta_path: fn(key) { policy.root <> "/" <> key <> "/crushling.json" },
+    rekey: fn(old, new) {
+      // Its tokens came from the old key, so the old container can't be
+      // reused; remove it rather than leave it running unseen.
+      use _ <- result.try(case sandbox.remove(policy, old) {
+        Ok(Nil) -> Ok(Nil)
+        Error(sandbox.DockerFailed(output:, ..)) ->
+          case string.contains(string.lowercase(output), "no such container") {
+            True -> Ok(Nil)
+            False -> Error("docker rm: " <> string.trim(output))
+          }
+        Error(error) -> Error("docker rm: " <> string.inspect(error))
+      })
+      move_dir(policy.root, old, new)
+    },
     run_in_sandbox: Some(fn(key, env, script) {
       sandbox.run_in(policy, key, env, script)
       |> result.map_error(string.inspect)
@@ -246,6 +261,26 @@ fn alive(os_pid: Int) -> Bool
 
 @external(erlang, "crushling_ffi", "file_exists")
 fn file_exists(path: String) -> Bool
+
+@external(erlang, "crushling_store_ffi", "dir_exists")
+fn dir_exists(path: String) -> Bool
+
+@external(erlang, "crushling_store_ffi", "rename")
+fn rename(from: String, to: String) -> Result(Nil, String)
+
+/// Rename `root/old` to `root/new`, unless there's nothing to move or the
+/// new one already exists.
+pub fn move_dir(root: String, old: String, new: String) -> Result(Nil, String) {
+  let from = root <> "/" <> old
+  let to = root <> "/" <> new
+  case dir_exists(from), dir_exists(to) {
+    True, False ->
+      rename(from, to)
+      |> result.map_error(fn(reason) { "renaming " <> from <> ": " <> reason })
+    True, True -> Error(to <> " already exists")
+    False, _ -> Ok(Nil)
+  }
+}
 
 @external(erlang, "crushling_ffi", "mkdir_p")
 fn mkdir_p(path: String) -> Result(Nil, String)
@@ -330,7 +365,13 @@ pub fn local(
       stop_result(key, cleanup(key))
     },
     exists: fn(key) { file_exists(dir(key) <> "/work") },
-    meta_path: fn(key) { dir(key) <> "/crushling.json" },
+    rekey: fn(old, new) {
+      use _ <- result.try(
+        stop_server(pid_file(old))
+        |> result.map_error(fn(reason) { "crush server: " <> reason }),
+      )
+      move_dir(root, old, new)
+    },
     run_in_sandbox: None,
   )
 }

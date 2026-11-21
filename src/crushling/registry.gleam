@@ -10,8 +10,13 @@
 //// the current run.
 ////
 //// A thread with nothing running for `idle_ms` has its agent stopped; its
-//// workspace, session and `meta` stay, so the next message, even after a
-//// restart, picks the conversation up again.
+//// workspace, session and `meta` (in the store) stay, so the next message,
+//// even after a restart, picks the conversation up again.
+////
+//// One registry serves one Slack workspace (`Config.team`), and its thread
+//// keys carry the team (`sandbox.key`). A thread from before keys did,
+//// under its old `channel-ts` key, is moved to its new key the first time
+//// it is looked up (`migrate_legacy`).
 ////
 //// A thread's launch and stop never overlap: while its agent is stopping
 //// the entry stays, `Stopping`, and messages wait in its backlog until the
@@ -31,6 +36,7 @@ import crushling/registry/prompt
 import crushling/registry/tailnet
 import crushling/sandbox
 import crushling/slack
+import crushling/store.{type Store}
 import crushling/sys
 import crushling/thread
 import crushling/venue
@@ -57,6 +63,15 @@ pub type Config {
     team: String,
     /// Slack user ids allowed to drive agents.
     allowed: Set(String),
+    /// Slack user ids who may approve tailnet access; when empty, everyone
+    /// allowed may.
+    admins: Set(String),
+    /// Where thread meta and code-channel links are kept.
+    store: Store,
+    /// Whether threads from before keys carried the workspace may be
+    /// moved to their new key: only for the workspace the bridge served
+    /// then, the one of `SLACK_BOT_TOKEN`.
+    migrate_legacy: Bool,
     idle_ms: Int,
     flush_ms: Int,
     mode: client.PermissionMode,
@@ -145,6 +160,9 @@ type State {
     finishing: Bool,
     /// Threads whose agent the launcher couldn't stop, even with retries.
     failed_stops: List(String),
+    /// Threads under their old key that couldn't be moved, and were said
+    /// to be.
+    broken: Set(String),
     tailnets: tailnet.Tailnets,
   )
 }
@@ -173,17 +191,18 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       config:,
       self:,
       threads: dict.new(),
-      code_channels: links.new(config.launcher.meta_path),
+      code_channels: links.new(config.store, config.team),
       opening: set.new(),
       seen: [],
       generation: 0,
       stopping: None,
       finishing: False,
       failed_stops: [],
+      broken: set.new(),
       tailnets: tailnet.new(
         config.tailnet,
         config.client,
-        config.allowed,
+        approvers(config),
         fn(key, event, after_ms) {
           process.send_after(self, after_ms, Tailnet(key, event))
           Nil
@@ -200,8 +219,17 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
   |> result.map(fn(started) { started.data })
 }
 
-pub fn key(channel: String, thread_ts: String) -> String {
-  sandbox.key(channel, thread_ts)
+/// A thread's key in workspace `team`.
+pub fn key(team: String, channel: String, thread_ts: String) -> String {
+  sandbox.key(team, channel, thread_ts)
+}
+
+/// Who may approve tailnet access.
+fn approvers(config: Config) -> Set(String) {
+  case set.is_empty(config.admins) {
+    True -> config.allowed
+    False -> config.admins
+  }
 }
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
@@ -286,29 +314,129 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   }
 }
 
-/// The thread's entry: in memory, or rebuilt from its `meta` on disk for a
-/// thread the bot was in before a restart or an idle stop.
+/// The thread's entry: in memory, or rebuilt from its `meta` in the store
+/// for a thread the bot was in before a restart or an idle stop. An error
+/// says the thread lives under its old key and couldn't be moved.
 fn entry_for(
   state: State,
   key: String,
   channel: String,
   thread_ts: String,
-) -> Option(Entry) {
+) -> Result(Option(Entry), String) {
   case dict.get(state.threads, key) {
-    Ok(entry) -> Some(entry)
+    Ok(entry) -> Ok(Some(entry))
     Error(Nil) -> {
-      let launcher = state.config.launcher
-      case launcher.exists(key) {
+      let config = state.config
+      let launcher = config.launcher
+      let saved = saved_thread(config, key)
+      let exists = launcher.exists(key)
+      // Half of it may be under the new key already, from a move that
+      // stopped partway: finish it.
+      use #(saved, exists) <- result.map(case saved, exists {
+        Some(_), True -> Ok(#(saved, exists))
+        _, _ ->
+          case migrate_legacy(config, key, channel, thread_ts) {
+            Error(reason) -> Error(reason)
+            Ok(False) -> Ok(#(saved, exists))
+            Ok(True) -> Ok(#(saved_thread(config, key), launcher.exists(key)))
+          }
+      })
+      case exists {
         False -> None
         True ->
           Some(new_entry(
             channel,
             thread_ts,
-            meta.read(launcher.meta_path(key))
+            saved
+              |> option.map(fn(thread) { thread.meta })
               // A workspace without meta predates follow mode, when every
               // reply was a prompt.
-              |> result.unwrap(meta.new(True)),
+              |> option.unwrap(meta.new(True)),
           ))
+      }
+    }
+  }
+}
+
+fn saved_thread(config: Config, key: String) -> Option(store.Thread) {
+  case store.thread(config.store, key) {
+    Ok(found) -> found
+    Error(reason) -> {
+      sys.warn("crushling: reading " <> key <> " failed: " <> reason)
+      None
+    }
+  }
+}
+
+/// A thread from before keys carried the team lives under its old key,
+/// `channel-ts`: its row in the store, its directory under the root, and
+/// maybe its container. Only the workspace the bridge served before
+/// (`Config.migrate_legacy`) has such threads. Move what is still under the
+/// old key to `key`: the row, unless the new key has one; the directory
+/// (and the old container goes), unless the new key has one. Each step is
+/// safe to repeat, so a move cut short finishes on the next lookup. True
+/// when something moved; an error when a step failed.
+pub fn migrate_legacy(
+  config: Config,
+  key: String,
+  channel: String,
+  thread_ts: String,
+) -> Result(Bool, String) {
+  let old = sandbox.legacy_key(channel, thread_ts)
+  let launcher = config.launcher
+  case config.migrate_legacy && old != key {
+    False -> Ok(False)
+    True -> {
+      // An old row of another workspace (a channel shared with it) isn't
+      // this one's to take.
+      use old_row <- result.try(case store.thread(config.store, old) {
+        Ok(Some(thread)) -> Ok(thread.team == "" || thread.team == config.team)
+        Ok(None) -> Ok(False)
+        Error(reason) -> Error("reading " <> old <> ": " <> reason)
+      })
+      use new_row <- result.try(
+        store.thread(config.store, key)
+        |> result.map(option.is_some)
+        |> result.map_error(fn(reason) { "reading " <> key <> ": " <> reason }),
+      )
+      let move_row = old_row && !new_row
+      let move_dir = launcher.exists(old) && !launcher.exists(key)
+      case move_row || move_dir {
+        False -> Ok(False)
+        True -> {
+          sys.info("crushling: moving " <> old <> " to " <> key)
+          let moved = {
+            use _ <- result.try(case move_dir {
+              True -> launcher.rekey(old, key)
+              False -> Ok(Nil)
+            })
+            case move_row {
+              True ->
+                store.rename_thread(
+                  config.store,
+                  old:,
+                  new: key,
+                  team: config.team,
+                )
+                |> result.replace(Nil)
+              False -> Ok(Nil)
+            }
+          }
+          case moved {
+            Ok(Nil) -> Ok(True)
+            Error(reason) -> {
+              sys.warn(
+                "crushling: moving "
+                <> old
+                <> " to "
+                <> key
+                <> " failed: "
+                <> reason,
+              )
+              Error(reason)
+            }
+          }
+        }
       }
     }
   }
@@ -321,8 +449,44 @@ fn received(state: State, incoming: Incoming, attempts: Int) -> State {
   let origin = option.map(code, links.origin)
   let #(channel, thread_ts) =
     option.unwrap(origin, #(incoming.channel, incoming.thread_ts))
-  let key = key(channel, thread_ts)
-  let known = entry_for(state, key, channel, thread_ts)
+  let key = key(state.config.team, channel, thread_ts)
+  case entry_for(state, key, channel, thread_ts) {
+    Ok(known) ->
+      received_known(state, incoming, code, origin, key, known, attempts)
+    Error(_) -> broken(state, key, incoming)
+  }
+}
+
+/// The thread is under its old key and couldn't be moved: starting a fresh
+/// one under the new key would hide its old work, so say so once and drop
+/// the message.
+fn broken(state: State, key: String, incoming: Incoming) -> State {
+  case set.contains(state.broken, key) {
+    True -> state
+    False -> {
+      let client = state.config.client
+      process.spawn_unlinked(fn() {
+        slack.say(
+          client,
+          incoming.channel,
+          incoming.thread_ts,
+          "_couldn't move this thread's old workspace; an admin should check the logs._",
+        )
+      })
+      State(..state, broken: set.insert(state.broken, key))
+    }
+  }
+}
+
+fn received_known(
+  state: State,
+  incoming: Incoming,
+  code: Option(Link),
+  origin: Option(#(String, String)),
+  key: String,
+  known: Option(Entry),
+  attempts: Int,
+) -> State {
   // Slack can post the copy of the request in a new code channel before the
   // thread says which channel it opened. Hold new messages until it does.
   case known, set.is_empty(state.opening), attempts < defer_attempts {
@@ -502,7 +666,15 @@ fn queue(state: State, route: Route, known: Option(Entry)) -> State {
 /// Save a thread's meta, whether its agent is running or asleep. All thread
 /// meta is written here.
 fn set_meta(state: State, key: String, entry: Entry, meta: Meta) -> State {
-  case meta.write(state.config.launcher.meta_path(key), meta) {
+  let thread =
+    store.Thread(
+      key:,
+      team: state.config.team,
+      channel: entry.channel,
+      thread_ts: entry.thread_ts,
+      meta:,
+    )
+  case store.put_thread(state.config.store, thread) {
     Ok(Nil) -> Nil
     Error(reason) ->
       sys.warn("crushling: saving " <> key <> " failed: " <> reason)
@@ -747,8 +919,9 @@ fn stop_requested(
     _ -> #(state, None)
   }
   let key = case origin {
-    Some(#(origin_channel, origin_ts)) -> key(origin_channel, origin_ts)
-    None -> key(channel, thread_ts)
+    Some(#(origin_channel, origin_ts)) ->
+      key(config.team, origin_channel, origin_ts)
+    None -> key(config.team, channel, thread_ts)
   }
   case set.contains(config.allowed, user), dict.get(state.threads, key) {
     True, Ok(Entry(agent: Live(thread:, ..), ..) as entry)
@@ -1126,7 +1299,7 @@ fn stop_agent(state: State, key: String) -> State {
 fn on_tailnet(state: State, key: String, event: tailnet.Event) -> State {
   let entry = case event {
     tailnet.Pressed(channel:, thread_ts:, ..) ->
-      entry_for(state, key, channel, thread_ts)
+      entry_for(state, key, channel, thread_ts) |> result.unwrap(None)
     _ -> dict.get(state.threads, key) |> option.from_result
   }
   tailnet.handle(state.tailnets, key, option.map(entry, tailnet_view), event)

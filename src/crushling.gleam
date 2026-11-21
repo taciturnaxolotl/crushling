@@ -6,21 +6,24 @@
 ////
 //// | Variable | Meaning |
 //// |---|---|
-//// | `SLACK_BOT_TOKEN` | `xoxb-` token for the Web API |
+//// | `SLACK_BOT_TOKEN` | self-host: the `xoxb-` token of your workspace. On start it is put in the store as that workspace (from auth.test), and the meta and link files from before the store are imported once. Required unless the OAuth install is on |
 //// | `SLACK_SIGNING_SECRET` | the app's signing secret; set it to take events over HTTP at `/slack/events` |
-//// | `CRUSHLING_EVENTS_BIND`, `CRUSHLING_EVENTS_PORT` | where that endpoint listens; default `127.0.0.1:7470` |
-//// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode; with both set, events are taken both ways |
-//// | `CRUSHLING_ALLOWED_USERS` | comma-separated Slack user ids who may use it |
+//// | `CRUSHLING_EVENTS_BIND`, `CRUSHLING_EVENTS_PORT` | where that endpoint, and the OAuth install, listen; default `127.0.0.1:7470` |
+//// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode; with both set, events are taken both ways. One app-level token serves every workspace the app is installed in |
+//// | `CRUSHLING_ALLOWED_USERS` | comma-separated Slack user ids who may use it, in the `SLACK_BOT_TOKEN` workspace; required with that token. A workspace's `allowed_users` setting in the store wins |
+//// | `CRUSHLING_ADMINS` | comma-separated Slack user ids who may approve tailnet access in that workspace; default everyone allowed. A workspace's `admins` setting in the store wins |
+//// | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `CRUSHLING_PUBLIC_URL` | the OAuth install, on only when all three are set: `<public url>/slack/install` starts it and Slack returns to `<public url>/slack/oauth/callback` (add that redirect URL in the app's settings). Both are served on the events server. Until the app's public distribution is on, only its own workspace can install it |
+//// | `CRUSHLING_STORE_KEY` | 32 bytes, base64: the key bot tokens are encrypted with in the store, `<root>/crushling.db`. Unset, one is made at `<root>/store-key` (mode 0600), like `<root>/mcp-secret`; back it up, since stored tokens can't be read without it |
 //// | `CRUSHLING_HYPER_KEY` | required: the org's Charm Hyper API key. Agents use Hyper through the bridge's inference proxy at `/proxy/<thread>` and never see the key |
 //// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | Hyper models; default `deepseek-v4.1-flash` and `prism-flash` |
 //// | `CRUSHLING_MODE` | `sysadmin` (default: no permission prompts and no blocked commands) or `yolo` |
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
-//// | `CRUSHLING_ROOT` | where thread workspaces live; default `~/.local/state/crushling/threads`. The tunnels' unix sockets live under it too, so it must be at most 79 bytes |
+//// | `CRUSHLING_ROOT` | where thread workspaces live, one directory per thread key (`<team>-<channel>-<ts>`), beside the store `crushling.db`; default `~/.local/state/crushling/threads`. The tunnels' unix sockets live under it too, so it must be at most 79 bytes |
 //// | `CRUSHLING_IDLE_MINUTES` | idle time before a thread's agent is stopped; default 15 |
 //// | `CRUSHLING_SHUTDOWN_GRACE_SECONDS` | on SIGTERM, how long running turns get to finish before they are cancelled; default 60 |
 //// | `CRUSHLING_CRUSH` | a `crush` with `--dial` to run instead of the default. For `docker`, a static linux binary on this machine to mount into each sandbox instead of the image's own; replacing the file (rename over it) gives new sandboxes the new one. For `local`, a binary for this machine instead of the `crush` on `PATH` |
 //// | `CRUSHLING_DNS` | for `docker`, comma-separated nameservers for the sandboxes, since docker's DNS doesn't answer gVisor on a custom network; default `1.1.1.1,9.9.9.9`, or `off` for docker's own |
-//// | `HONCHO_API_KEY`, `HONCHO_URL`, `HONCHO_WORKSPACE`, `HONCHO_PEER_NAME`, `HONCHO_AI_PEER` | passed into every sandbox, so agents remember across threads with Honcho |
+//// | `HONCHO_API_KEY`, `HONCHO_URL`, `HONCHO_WORKSPACE`, `HONCHO_PEER_NAME`, `HONCHO_AI_PEER` | passed into the sandboxes of the `SLACK_BOT_TOKEN` workspace only, so its agents remember across threads with Honcho; other workspaces get no memory settings yet |
 //// | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc`, `sbx-egress` |
 //// | `CRUSHLING_BRIDGE_PORT`, `CRUSHLING_BRIDGE_BIND` | where the sandbox server listens: the one port agents reach the bridge on, for their tunnels, the inference proxy and their Slack tools; default `7469` on `127.0.0.1`. `CRUSHLING_MCP_PORT` and `CRUSHLING_MCP_BIND` are the old names, still read |
 //// | `CRUSHLING_BRIDGE_URL` | how an agent reaches that port; default `http://127.0.0.1:<port>` for `local`, required for `docker` (an address the sandbox network may reach, such as its gateway). `CRUSHLING_MCP_URL` is the old name, still read |
@@ -37,6 +40,8 @@
 import crushling/crush/client
 import crushling/events
 import crushling/files
+import crushling/install
+import crushling/instance
 import crushling/launcher
 import crushling/mcp
 import crushling/provider
@@ -47,6 +52,7 @@ import crushling/sandbox
 import crushling/sandbox_http
 import crushling/slack_tools
 import crushling/socket
+import crushling/store
 import crushling/sys
 import crushling/tailscale
 import crushling/tunnel
@@ -59,9 +65,7 @@ import gleam/result
 import gleam/set
 import gleam/string
 import slackline
-import slackline/api/auth
 import slackline/app
-import slackline/httpc
 
 @external(erlang, "crushling_ffi", "getenv")
 fn getenv(name: String) -> Result(String, Nil)
@@ -80,10 +84,6 @@ fn setting(name: String, default: String) -> String {
   getenv(name) |> result.unwrap(default)
 }
 
-fn required(name: String) -> Result(String, String) {
-  getenv(name) |> result.replace_error(name <> " is not set")
-}
-
 pub fn main() -> Nil {
   case start() {
     Ok(Nil) -> Nil
@@ -98,9 +98,7 @@ pub fn main() -> Nil {
 fn halt(code: Int) -> Nil
 
 fn start() -> Result(Nil, String) {
-  use bot_token <- result.try(required("SLACK_BOT_TOKEN"))
   use delivery <- result.try(delivery())
-  use allowed <- result.try(allowed_users())
   use mode <- result.try(case setting("CRUSHLING_MODE", "sysadmin") {
     "sysadmin" -> Ok(client.Sysadmin)
     "yolo" -> Ok(client.Yolo)
@@ -118,6 +116,7 @@ fn start() -> Result(Nil, String) {
     |> result.map_error(fn(reason) { "CRUSHLING_ROOT: " <> reason }),
   )
   use secret <- result.try(mcp_secret(root))
+  use store <- result.try(open_store(root))
   use proxy <- result.try(proxy_from_settings(secret))
   use tunnels <- result.try(tunnel.start(
     tunnel.Config(..tunnel.config(secret, root), on_event: log_tunnel_event),
@@ -140,58 +139,51 @@ fn start() -> Result(Nil, String) {
       proxy:,
       hello_timeout_ms: hello_s * 1000,
     )
-  use launcher <- result.try(launcher_for(root, models(), bridge))
+  // Self-host: the workspace of SLACK_BOT_TOKEN, seeded into the store.
+  use env_team <- result.try(seed_env_team(store, root))
+  let own_team = case env_team {
+    option.Some(seeded) -> seeded.team.id
+    option.None -> ""
+  }
+  use launcher <- result.try(launcher_for(root, models(), bridge, own_team))
   let tailnet = tailnet(launcher)
 
-  let client = slackline.new(bot_token)
-  use me <- result.try(
-    auth.test_()
-    |> httpc.send(client)
-    |> result.map_error(fn(error) {
-      "auth.test: " <> slackline.describe_error(error)
-    }),
-  )
+  use install_on <- result.try(install_settings())
+  use _ <- result.try(case env_team, install_on {
+    option.None, False ->
+      Error(
+        "SLACK_BOT_TOKEN is not set; set it, or SLACK_CLIENT_ID, SLACK_CLIENT_SECRET and CRUSHLING_PUBLIC_URL to install the app in workspaces",
+      )
+    _, _ -> Ok(Nil)
+  })
 
-  use registry <- result.try(
-    registry.start(registry.Config(
+  use teams <- result.try(
+    instance.start(instance.Shared(
       launcher:,
-      client:,
-      token: bot_token,
-      bot_user: me.user_id,
-      team: me.team_id,
-      allowed:,
+      store:,
+      root:,
+      mode:,
       idle_ms: idle_minutes * 60_000,
       flush_ms: 1000,
-      mode:,
+      env_team: option.map(env_team, fn(seeded) { seeded.env }),
       tailnet:,
-      stop_backoff_ms: registry.default_stop_backoff_ms,
-      root:,
-    ))
-    |> result.map_error(fn(error) { "registry: " <> string.inspect(error) }),
+      client: slackline.new,
+    )),
   )
-
-  io.println(
-    "crushling: connected as "
-    <> me.user
-    <> " ("
-    <> me.user_id
-    <> ") in "
-    <> me.team
-    <> ", "
-    <> int.to_string(set.size(allowed))
-    <> " allowed users",
-  )
-  let context =
-    slack_tools.Context(
-      client:,
-      bot_user: me.user_id,
-      lookup: fn(key) { process.call(registry, 5000, registry.Lookup(key, _)) },
-      ask_tailnet: fn(key, reason) {
-        process.call(registry, 5000, fn(reply) {
-          registry.Tailnet(key, tailnet.Asked(reason, reply))
-        })
-      },
+  use _ <- result.try(case env_team {
+    option.None -> Ok(Nil)
+    option.Some(seeded) ->
+      instance.start_team(teams, seeded.team) |> result.replace(Nil)
+  })
+  // Every other workspace that installed the app.
+  use failed <- result.try(instance.start_stored(teams, store))
+  list.each(failed, fn(failure) {
+    io.println_error(
+      "crushling: couldn't start workspace " <> failure.0 <> ": " <> failure.1,
     )
+  })
+
+  let context = instance.tools_context(teams, store)
   // Every agent reaches the bridge here: its tunnel, its inference, its
   // Slack tools and its files.
   let bind =
@@ -224,25 +216,61 @@ fn start() -> Result(Nil, String) {
   let grace_s =
     int.parse(setting("CRUSHLING_SHUTDOWN_GRACE_SECONDS", "60"))
     |> result.unwrap(60)
+  let find = instance.finder(teams)
+  let install = case install_on {
+    False -> option.None
+    True ->
+      option.Some(install.Config(
+        client_id: setting("SLACK_CLIENT_ID", ""),
+        client_secret: setting("SLACK_CLIENT_SECRET", ""),
+        public_url: setting("CRUSHLING_PUBLIC_URL", ""),
+        secret:,
+        store:,
+        slack: slackline.anonymous(),
+        on_installed: fn(team) {
+          instance.start_team(teams, team) |> result.replace(Nil)
+        },
+        env_team: option.map(env_team, fn(seeded) { seeded.team.id }),
+      ))
+  }
   // Slack sends each event one way, so taking both while the app moves
   // from Socket Mode to HTTP loses nothing, and the registry drops repeats.
-  use _ <- result.try(case delivery.http {
-    option.None -> Ok(Nil)
-    option.Some(Http(signing_secret:, bind:, port:)) -> {
-      let router = socket.router(app.new(signing_secret), registry, me.user_id)
-      use _ <- result.map(events.start(bind, port, router))
-      io.println(
-        "crushling: taking events at "
-        <> bind
-        <> ":"
-        <> int.to_string(port)
-        <> "/slack/events",
-      )
+  // The install is served on the same server.
+  use _ <- result.try(case delivery.http, install {
+    option.None, option.None -> Ok(Nil)
+    http, install -> {
+      let #(bind, port) = events_address(http)
+      let router =
+        option.map(http, fn(http: Http) {
+          socket.router(app.new(http.signing_secret), find)
+        })
+      use port <- result.try(port)
+      use _ <- result.map(events.start(bind, port, router, install))
+      case router {
+        option.Some(_) ->
+          io.println(
+            "crushling: taking events at "
+            <> bind
+            <> ":"
+            <> int.to_string(port)
+            <> "/slack/events",
+          )
+        option.None -> Nil
+      }
+      case install {
+        option.Some(config) ->
+          io.println(
+            "crushling: installs start at "
+            <> config.public_url
+            <> "/slack/install",
+          )
+        option.None -> Nil
+      }
     }
   })
   let socket =
     option.map(delivery.socket_mode, fn(app_token) {
-      let router = socket.router(app.unverified(), registry, me.user_id)
+      let router = socket.router(app.unverified(), find)
       io.println("crushling: taking events over Socket Mode")
       process.spawn_unlinked(fn() { socket.run(app_token, router) })
     })
@@ -254,29 +282,140 @@ fn start() -> Result(Nil, String) {
   // Take no new work, give running turns their grace period, then stop
   // every agent before exiting.
   io.println("crushling: shutting down")
-  // Over HTTP the registry ignores new messages once it is draining.
+  // Over HTTP the registries ignore new messages once they are draining.
   option.map(socket, process.kill)
-  let done = process.new_subject()
-  let grace_ms = grace_s * 1000
-  process.send(registry, registry.Shutdown(grace_ms, done))
-  // One deadline for all of it, from the registry's own timers.
-  case process.receive(done, registry.shutdown_budget_ms(grace_ms)) {
-    Ok(registry.Clean) -> {
+  // One deadline for all of it, from the registries' own timers.
+  case instance.shutdown(teams, grace_s * 1000) {
+    registry.Clean -> {
       io.println("crushling: stopped")
       halt(0)
     }
-    Ok(outcome) -> {
+    registry.TimedOut -> {
+      io.println_error("crushling: shutdown timed out")
+      halt(1)
+    }
+    outcome -> {
       io.println_error(
         "crushling: shutdown incomplete: " <> string.inspect(outcome),
       )
       halt(1)
     }
-    Error(Nil) -> {
-      io.println_error("crushling: shutdown timed out")
-      halt(1)
-    }
   }
   Ok(Nil)
+}
+
+/// The store, with its key from `CRUSHLING_STORE_KEY` or `<root>/store-key`.
+fn open_store(root: String) -> Result(store.Store, String) {
+  use #(key, made) <- result.try(store.load_key(
+    getenv("CRUSHLING_STORE_KEY"),
+    root,
+  ))
+  case made {
+    True ->
+      io.println(
+        "crushling: made a store key at "
+        <> root
+        <> "/store-key; back it up, or set CRUSHLING_STORE_KEY, since stored bot tokens can't be read without it",
+      )
+    False -> Nil
+  }
+  store.start(root <> "/crushling.db", key)
+}
+
+/// The workspace of `SLACK_BOT_TOKEN`, from auth.test.
+type Seeded {
+  Seeded(team: store.Team, env: instance.EnvTeam)
+}
+
+/// Self-host: put the workspace of `SLACK_BOT_TOKEN` in the store, with
+/// its settings from the environment, and import the files the bridge kept
+/// before the store, once.
+fn seed_env_team(
+  store: store.Store,
+  root: String,
+) -> Result(option.Option(Seeded), String) {
+  case getenv("SLACK_BOT_TOKEN") {
+    Error(Nil) -> Ok(option.None)
+    Ok(bot_token) -> {
+      use allowed <- result.try(allowed_users())
+      let admins = instance.parse_users(setting("CRUSHLING_ADMINS", ""))
+      use #(team, me) <- result.try(instance.seed(
+        store,
+        slackline.new(bot_token),
+        bot_token,
+      ))
+      io.println(
+        "crushling: connected as "
+        <> me.user
+        <> " ("
+        <> me.user_id
+        <> ") in "
+        <> me.team
+        <> " ("
+        <> me.team_id
+        <> ")",
+      )
+      use imported <- result.map(store.import_files(store, root, me.team_id))
+      case imported {
+        store.AlreadyImported -> Nil
+        store.Imported(threads:, links:, skipped:) -> {
+          list.each(skipped, fn(skip) {
+            io.println(
+              "crushling: not importing "
+              <> root
+              <> "/"
+              <> skip.0
+              <> ": "
+              <> skip.1,
+            )
+          })
+          io.println(
+            "crushling: imported "
+            <> int.to_string(list.length(threads))
+            <> " threads and "
+            <> int.to_string(list.length(links))
+            <> " code channel links into the store"
+            <> case threads, links {
+              [], [] -> ""
+              _, _ ->
+                " ("
+                <> string.join(list.append(threads, links), ", ")
+                <> "); their files are no longer read"
+            },
+          )
+        }
+      }
+      option.Some(Seeded(
+        team:,
+        env: instance.EnvTeam(id: me.team_id, allowed:, admins:),
+      ))
+    }
+  }
+}
+
+/// Whether OAuth install is on: all three of its settings are set.
+fn install_settings() -> Result(Bool, String) {
+  let names = ["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET", "CRUSHLING_PUBLIC_URL"]
+  let set = list.filter(names, fn(name) { getenv(name) |> result.is_ok })
+  case set {
+    [] -> Ok(False)
+    _ if set == names -> Ok(True)
+    _ ->
+      Error(
+        "set all of SLACK_CLIENT_ID, SLACK_CLIENT_SECRET and CRUSHLING_PUBLIC_URL to install the app, or none",
+      )
+  }
+}
+
+fn events_address(http: option.Option(Http)) -> #(String, Result(Int, String)) {
+  case http {
+    option.Some(Http(bind:, port:, ..)) -> #(bind, Ok(port))
+    option.None -> #(
+      setting("CRUSHLING_EVENTS_BIND", "127.0.0.1"),
+      int.parse(setting("CRUSHLING_EVENTS_PORT", "7470"))
+        |> result.replace_error("CRUSHLING_EVENTS_PORT is not a number"),
+    )
+  }
 }
 
 @external(erlang, "crushling_signal", "install")
@@ -373,6 +512,7 @@ fn launcher_for(
   root: String,
   models: provider.Models,
   bridge: launcher.Bridge,
+  own_team: String,
 ) -> Result(launcher.Launcher, String) {
   let crush = setting("CRUSHLING_CRUSH", "")
   case setting("CRUSHLING_LAUNCHER", "docker") {
@@ -397,7 +537,12 @@ fn launcher_for(
           uid:,
           gid:,
           root:,
-          env: honcho_env(),
+          env: [],
+          // The Honcho settings are the operator's own memory, so only the
+          // self-host workspace's sandboxes get them. Other workspaces get
+          // none until they have memory settings of their own.
+          own_team:,
+          own_env: honcho_env(),
           crush_config: provider.config(models, bridge.url),
           crush:,
           dns: case setting("CRUSHLING_DNS", "1.1.1.1,9.9.9.9") {

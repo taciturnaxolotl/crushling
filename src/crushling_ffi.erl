@@ -96,16 +96,23 @@ mkdir_p(Path) ->
         {error, Reason} -> {error, unicode:characters_to_binary(io_lib:format("~p", [Reason]))}
     end.
 
+%% Replace a file whole with a private one: the temporary file is made
+%% empty and set to 0600 before any content goes in, so a secret is never
+%% readable by others, even for a moment.
 write_private(Path, Content) ->
     Tmp = <<Path/binary, ".tmp">>,
-    case file:write_file(Tmp, Content) of
-        ok ->
-            _ = file:change_mode(Tmp, 8#600),
-            case file:rename(Tmp, Path) of
-                ok -> {ok, nil};
-                {error, R} -> {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
-            end;
-        {error, R} ->
+    _ = file:delete(Tmp),
+    Steps = fun() ->
+        ok = file:write_file(Tmp, <<>>, [write, exclusive]),
+        ok = file:change_mode(Tmp, 8#600),
+        ok = file:write_file(Tmp, Content),
+        ok = file:rename(Tmp, Path)
+    end,
+    try Steps() of
+        ok -> {ok, nil}
+    catch
+        error:{badmatch, {error, R}} ->
+            _ = file:delete(Tmp),
             {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
     end.
 

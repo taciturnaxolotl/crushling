@@ -6,6 +6,7 @@ import crushling/crush/client
 import crushling/launcher
 import crushling/registry
 import crushling/registry/incoming as msg
+import crushling/store
 import gleam/erlang/process.{type Subject}
 import gleam/option.{None, Some}
 import gleam/set
@@ -40,7 +41,7 @@ fn blocking_launcher(calls: Subject(Call)) -> launcher.Launcher {
       result
     },
     exists: fn(_) { False },
-    meta_path: fn(key) { dir <> "/" <> key <> ".json" },
+    rekey: fn(_, _) { Ok(Nil) },
     run_in_sandbox: None,
   )
 }
@@ -65,6 +66,9 @@ fn start_with(
       bot_user: "UBOT",
       team: "T1",
       allowed: set.from_list(["U1"]),
+      admins: set.new(),
+      store: race_store(),
+      migrate_legacy: False,
       idle_ms: 600_000,
       flush_ms: 50,
       mode: client.Sysadmin,
@@ -73,6 +77,14 @@ fn start_with(
       root: dir,
     ))
   r
+}
+
+fn race_store() -> store.Store {
+  let path = ":memory:"
+  let assert Ok(key) =
+    store.parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+  let assert Ok(s) = store.start(path, key)
+  s
 }
 
 fn message(thread_ts: String, ts: String, text: String, mention: Bool) {
@@ -94,7 +106,7 @@ fn nothing(calls: Subject(Call)) -> Nil {
 pub fn a_message_during_a_stop_waits_for_it_test() {
   let calls = process.new_subject()
   let r = start(calls)
-  let key = registry.key("C1", "30.1")
+  let key = registry.key("T1", "C1", "30.1")
   process.send(r, message("30.1", "30.1", "<@UBOT> hi", True))
   let assert Launch(launched, go) = next(calls)
   let assert True = launched == key
@@ -138,7 +150,7 @@ fn wait_live(
 pub fn shutdown_during_a_launch_stops_what_it_starts_test() {
   let calls = process.new_subject()
   let r = start(calls)
-  let key = registry.key("C1", "40.1")
+  let key = registry.key("T1", "C1", "40.1")
   process.send(r, message("40.1", "40.1", "<@UBOT> hi", True))
   let assert Launch(_, launch_go) = next(calls)
   let done = process.new_subject()
@@ -164,7 +176,7 @@ fn up_then_stopping(
   calls: Subject(Call),
   thread_ts: String,
 ) -> Call {
-  let key = registry.key("C1", thread_ts)
+  let key = registry.key("T1", "C1", thread_ts)
   process.send(r, message(thread_ts, thread_ts, "<@UBOT> hi", True))
   let assert Launch(_, go) = next(calls)
   process.send(go, Nil)
@@ -179,7 +191,7 @@ fn up_then_stopping(
 pub fn a_failed_stop_is_retried_test() {
   let calls = process.new_subject()
   let r = start_with(calls, [10, 20, 30])
-  let key = registry.key("C1", "50.1")
+  let key = registry.key("T1", "C1", "50.1")
   let assert Stop(_, go) = up_then_stopping(r, calls, "50.1")
   process.send(r, message("50.1", "50.2", "carry on", False))
   process.send(go, Error("docker daemon is down"))
@@ -202,7 +214,7 @@ pub fn a_failed_stop_is_retried_test() {
 pub fn a_stop_that_always_fails_is_reported_test() {
   let calls = process.new_subject()
   let r = start_with(calls, [10, 20])
-  let key = registry.key("C1", "60.1")
+  let key = registry.key("T1", "C1", "60.1")
   let assert Stop(_, go) = up_then_stopping(r, calls, "60.1")
   process.send(go, Error("no"))
   let assert Stop(_, go) = next(calls)

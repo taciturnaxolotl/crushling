@@ -29,6 +29,7 @@ import crushling/sandbox_http
 import crushling/sink
 import crushling/slack_tools
 import crushling/snapshot
+import crushling/store
 import crushling/sys
 import crushling/thread
 import crushling/tunnel
@@ -528,7 +529,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-registry-"
     <> int.to_string(int.absolute_value(unique()))
-  let key = registry.key("C1", "10.1")
+  let key = registry.key("T1", "C1", "10.1")
   let local = launcher.local(root, "", wiring.models, wiring.bridge)
   let launches = process.new_subject()
   let watched =
@@ -544,7 +545,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
         result
       },
       exists: local.exists,
-      meta_path: local.meta_path,
+      rekey: local.rekey,
       run_in_sandbox: local.run_in_sandbox,
     )
   use <-
@@ -564,6 +565,9 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       bot_user: "UBOT",
       team: "T1",
       allowed: set.from_list(["U1"]),
+      admins: set.new(),
+      store: real_store(root),
+      migrate_legacy: False,
       idle_ms: 500,
       flush_ms: 250,
       mode: client.Sysadmin,
@@ -601,6 +605,15 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
   Nil
 }
 
+/// A store for a test's root.
+fn real_store(root: String) -> store.Store {
+  let assert Ok(Nil) = mkdir_p(root)
+  let assert Ok(#(key, _)) = store.load_key(Error(Nil), root)
+  // In memory: the suite runs close to the open-file limit.
+  let assert Ok(s) = store.start(":memory:", key)
+  s
+}
+
 /// A pattern for `pgrep -f` that matches the local crush dialing in for
 /// `key`, and no other.
 fn dialing(key: String) -> String {
@@ -613,7 +626,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-shutdown-"
     <> int.to_string(int.absolute_value(unique()))
-  let key = registry.key("C1", "20.1")
+  let key = registry.key("T1", "C1", "20.1")
   let local = launcher.local(root, "", wiring.models, wiring.bridge)
   let launches = process.new_subject()
   let watched =
@@ -629,7 +642,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
         result
       },
       exists: local.exists,
-      meta_path: local.meta_path,
+      rekey: local.rekey,
       run_in_sandbox: local.run_in_sandbox,
     )
   use <-
@@ -649,6 +662,9 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       bot_user: "UBOT",
       team: "T1",
       allowed: set.from_list(["U1"]),
+      admins: set.new(),
+      store: real_store(root),
+      migrate_legacy: False,
       idle_ms: 600_000,
       flush_ms: 250,
       mode: client.Sysadmin,

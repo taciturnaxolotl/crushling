@@ -9,7 +9,7 @@ import crushling/sys
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import slackline
@@ -20,56 +20,131 @@ import slackline/httpc
 import slackline/interaction
 import stratus
 
-/// The router: Slack events in, `registry.Received` out. Over Socket Mode
-/// it is `router(app.unverified(), …)`; over HTTP, `app.new(signing_secret)`.
-pub fn router(
-  base: app.App,
-  registry: Subject(registry.Message),
-  bot_user: String,
-) -> app.App {
+/// The registry that serves one Slack workspace, with what routing needs
+/// to know about it.
+pub type Target {
+  Target(team: String, bot_user: String, registry: Subject(registry.Message))
+}
+
+/// How the router finds a workspace's registry, from an event's `team_id`
+/// and `enterprise_id`.
+pub type Find =
+  fn(Option(String), Option(String)) -> Result(Target, Nil)
+
+/// One workspace only: for tests and anything with a single registry.
+pub fn only(target: Target) -> Find {
+  fn(team, enterprise) {
+    case team, enterprise {
+      Some(team), _ if team == target.team -> Ok(target)
+      None, Some(enterprise) if enterprise == target.team -> Ok(target)
+      _, _ -> Error(Nil)
+    }
+  }
+}
+
+/// The router: Slack events in, `registry.Received` out to the registry of
+/// the workspace each event belongs to. One app serves every workspace the
+/// app is installed in: slackline hands each handler the event's
+/// `team_id` (and `enterprise_id`), and `find` picks the registry. An
+/// event for a workspace with none is dropped, with a log line. Over
+/// Socket Mode it is `router(app.unverified(), …)`; over HTTP,
+/// `app.new(signing_secret)`.
+pub fn router(base: app.App, find: Find) -> app.App {
   base
-  |> app.on_event(fn(event, _delivery) {
-    case event {
-      // Slack's own stop control, shown while a session is processing.
-      // A code channel's session has no thread.
-      event.AgentSessionStopped(channel:, user:, thread_ts:, ..) ->
-        process.send(
-          registry,
-          registry.StopRequested(
-            channel,
-            option.unwrap(thread_ts, ""),
-            option.unwrap(user, ""),
-          ),
-        )
-      _ ->
-        case incoming(event, bot_user) {
-          Ok(message) -> process.send(registry, registry.Received(message))
-          Error(Nil) -> Nil
+  |> app.on_event(fn(event, delivery: app.Delivery) {
+    let #(team, enterprise) = receiver(delivery)
+    case target(find, team, enterprise) {
+      Error(Nil) -> Nil
+      Ok(Target(bot_user:, registry:, ..)) ->
+        case event {
+          // Slack's own stop control, shown while a session is processing.
+          // A code channel's session has no thread.
+          event.AgentSessionStopped(channel:, user:, thread_ts:, ..) ->
+            process.send(
+              registry,
+              registry.StopRequested(
+                channel,
+                option.unwrap(thread_ts, ""),
+                option.unwrap(user, ""),
+              ),
+            )
+          _ ->
+            case incoming(event, bot_user) {
+              Ok(message) -> process.send(registry, registry.Received(message))
+              Error(Nil) -> Nil
+            }
         }
     }
   })
-  |> tailnet_buttons(registry)
+  |> tailnet_buttons(find)
+}
+
+/// The installation an event was delivered to: its `authorizations` name
+/// it, which matters in a Slack Connect channel, where `team_id` is the
+/// workspace the event happened in. Without them, `team_id`.
+pub fn receiver(delivery: app.Delivery) -> #(Option(String), Option(String)) {
+  case delivery.authorizations {
+    [
+      event.EnvelopeAuthorization(team_id: Some(_) as team, enterprise_id:, ..),
+      ..
+    ]
+    | [
+        event.EnvelopeAuthorization(
+          team_id: None as team,
+          enterprise_id: Some(_) as enterprise_id,
+          ..,
+        ),
+        ..
+      ] -> #(team, enterprise_id)
+    _ -> #(delivery.team_id, delivery.enterprise_id)
+  }
+}
+
+fn target(
+  find: Find,
+  team: Option(String),
+  enterprise: Option(String),
+) -> Result(Target, Nil) {
+  case find(team, enterprise) {
+    Ok(target) -> Ok(target)
+    Error(Nil) -> {
+      sys.warn(
+        "crushling: dropping an event for "
+        <> case team, enterprise {
+          Some(team), _ -> "unknown workspace " <> team
+          None, Some(enterprise) -> "unknown organization " <> enterprise
+          None, None -> "no workspace"
+        },
+      )
+      Error(Nil)
+    }
+  }
 }
 
 /// The buttons on a tailnet card. The registry decides what each press
 /// does; Slack only needs to hear that it arrived.
-fn tailnet_buttons(
-  app: app.App,
-  registry: Subject(registry.Message),
-) -> app.App {
+fn tailnet_buttons(app: app.App, find: Find) -> app.App {
   use app, action_id <- list.fold(tailnet.action_ids(), app)
   use action, payload <- app.action(app, action_id)
-  case pressed(action, payload) {
-    Ok(message) -> process.send(registry, message)
+  let team = option.map(payload.team, fn(team) { team.id })
+  let enterprise = option.map(payload.enterprise, fn(org) { org.id })
+  case target(find, team, enterprise) {
+    Ok(Target(team:, registry:, ..)) ->
+      case pressed(action, payload, team) {
+        Ok(message) -> process.send(registry, message)
+        Error(Nil) -> Nil
+      }
     Error(Nil) -> Nil
   }
   app.ack()
 }
 
-/// A button press on a tailnet card, as a registry message.
+/// A button press on a tailnet card in workspace `team`, as a registry
+/// message.
 pub fn pressed(
   action: interaction.BlockAction,
   payload: interaction.BlockActionsPayload,
+  team: String,
 ) -> Result(registry.Message, Nil) {
   use #(action_id, value) <- result.try(case action {
     interaction.ButtonAction(action_id:, value: Some(value), ..) ->
@@ -87,7 +162,7 @@ pub fn pressed(
   })
   let user = payload.user.id
   registry.Tailnet(
-    registry.key(channel, thread_ts),
+    registry.key(team, channel, thread_ts),
     tailnet.Pressed(choice:, channel:, thread_ts:, user:, card:),
   )
 }

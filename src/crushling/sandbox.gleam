@@ -32,8 +32,14 @@ pub type Policy {
     gid: Int,
     /// Host directory holding one directory per thread.
     root: String,
-    /// `KEY=value` pairs passed into the container.
+    /// `KEY=value` pairs passed into every container.
     env: List(String),
+    /// The workspace whose sandboxes also get `own_env` (the self-host one,
+    /// from `SLACK_BOT_TOKEN`), or "" for none.
+    own_team: String,
+    /// `KEY=value` pairs only for that workspace's sandboxes, such as the
+    /// operator's own Honcho memory settings.
+    own_env: List(String),
     /// The container's global crush.json, from `provider.config`.
     crush_config: String,
     /// A static `crush` binary on the host to mount into the container, or
@@ -57,10 +63,44 @@ pub const workspace = "/workspace"
 
 const docker_timeout_ms = 60_000
 
-/// A container and directory name for a thread, from the Slack channel and
-/// thread timestamp. Only `[a-zA-Z0-9_.-]` survive, as in kloe.
-pub fn key(channel: String, thread_ts: String) -> String {
-  { channel <> "-" <> thread_ts }
+/// What a thread's container gets beyond `policy.env`: `own_env`, when the
+/// thread is in `own_team`.
+pub fn team_env(policy: Policy, key: String) -> List(String) {
+  case team_of(key) {
+    Ok(team) if team == policy.own_team && team != "" -> policy.own_env
+    _ -> []
+  }
+}
+
+/// A container and directory name for a thread, from the Slack workspace,
+/// channel and thread timestamp: `T…-C…-<ts>`. Only `[a-zA-Z0-9_.-]`
+/// survive, as in kloe, and it is at most 64 characters (Slack's ids are
+/// about 11, so a real key is about 40).
+pub fn key(team: String, channel: String, thread_ts: String) -> String {
+  safe(team <> "-" <> channel <> "-" <> thread_ts)
+}
+
+/// The key a thread had before keys carried the workspace: `C…-<ts>`. Only
+/// for moving such threads to their new key.
+pub fn legacy_key(channel: String, thread_ts: String) -> String {
+  safe(channel <> "-" <> thread_ts)
+}
+
+/// The workspace in a key made by `key`: everything before the first `-`,
+/// when that is a workspace (`T…`) or organization (`E…`) id. A key from
+/// before keys carried the workspace (`C…-<ts>`) has none.
+pub fn team_of(key: String) -> Result(String, Nil) {
+  case string.split_once(key, "-") {
+    Ok(#("T" <> _ as team, _))
+      | Ok(#("E" <> _ as team, _))
+      if team != "T" && team != "E"
+    -> Ok(team)
+    _ -> Error(Nil)
+  }
+}
+
+fn safe(name: String) -> String {
+  name
   |> string.to_graphemes
   |> list.map(fn(g) {
     case is_safe(g) {
@@ -109,6 +149,8 @@ pub fn fingerprint(policy: Policy) -> String {
     // A new binary at the same path still means new containers.
     crush_stamp(policy.crush),
     string.join(policy.dns, ","),
+    policy.own_team,
+    string.join(policy.own_env, "\u{0}"),
     ..policy.env
   ]
   |> string.join("\u{0}")
@@ -138,7 +180,8 @@ pub fn run_args(
   key_env: List(String),
 ) -> List(String) {
   let env =
-    list.flat_map(list.append(policy.env, key_env), fn(pair) { ["--env", pair] })
+    list.flatten([policy.env, team_env(policy, key), key_env])
+    |> list.flat_map(fn(pair) { ["--env", pair] })
   list.flatten([
     ["run", "--detach", "--name", container_name(key)],
     ["--label", label <> "=1"],
