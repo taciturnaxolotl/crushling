@@ -30,6 +30,7 @@ import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/render
 import crushling/run
+import crushling/sandbox_http
 import crushling/sink
 import crushling/slack_tools
 import crushling/snapshot
@@ -917,16 +918,16 @@ fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
   let calls = process.new_subject()
   let secret = "test-secret"
   let assert Ok(Nil) =
-    mcp.start(
-      "127.0.0.1",
-      port,
-      secret,
-      slack_tools.tools(tailnet: False),
-      fn(key, name, arguments) {
-        process.send(calls, #(key, name, arguments))
-        Ok("posted")
-      },
-    )
+    sandbox_http.start("127.0.0.1", port, [
+      mcp.route(
+        secret,
+        slack_tools.tools(tailnet: False),
+        fn(key, name, arguments) {
+          process.send(calls, #(key, name, arguments))
+          Ok("posted")
+        },
+      ),
+    ])
   let keys = process.new_subject()
   let bridge =
     launcher.Bridge(

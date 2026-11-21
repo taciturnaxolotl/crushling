@@ -2,14 +2,14 @@
 //// crushling's Slack tools.
 ////
 //// Every thread has its own endpoint, `/mcp/<key>`, guarded by a bearer
-//// token derived from a secret only the bridge knows. The agent gets its
+//// token derived from a secret only the bridge knows (`token`). The agent gets its
 //// key and token through its environment (`env`), and its crush.json
 //// points at the endpoint (`provider.config_with`). Requests are answered
 //// with plain JSON; there is no server-initiated stream.
 
-import crushling/sys
+import crushling/sandbox_http
+import crushling/token as bearer
 import gleam/bit_array
-import gleam/bytes_tree
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/http
@@ -19,7 +19,6 @@ import gleam/json.{type Json}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import gleam/string
 import mist
 
 pub type Tool {
@@ -32,12 +31,9 @@ pub type Tool {
 pub type Call =
   fn(String, String, Dynamic) -> Result(String, String)
 
-@external(erlang, "crushling_ffi", "sha256_hex")
-fn sha256_hex(data: String) -> String
-
 /// The token a thread presents.
 pub fn token(secret: String, key: String) -> String {
-  sha256_hex(secret <> "\u{0}" <> key)
+  bearer.mint(secret, bearer.Mcp, key)
 }
 
 /// The environment a thread's agent needs to reach its endpoint.
@@ -185,71 +181,54 @@ fn error_reply(id: Json, code: Int, message: String) -> String {
 
 /// Whether a request carries the thread's token.
 pub fn authorized(secret: String, key: String, header: String) -> Bool {
-  key != "" && header == "Bearer " <> token(secret, key)
+  bearer.authorized(secret, bearer.Mcp, key, header)
 }
 
 const max_body = 1_000_000
 
-/// Serve the tools on `bind`:`port`.
-pub fn start(
-  bind: String,
-  port: Int,
+/// The route that serves the tools at `/mcp/<key>`.
+pub fn route(
   secret: String,
   tools: List(Tool),
   call: Call,
-) -> Result(Nil, String) {
-  let handler = fn(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
+) -> sandbox_http.Route {
+  fn(req: Request(mist.Connection)) {
     case request.path_segments(req) {
-      ["mcp", key] -> {
-        let auth = request.get_header(req, "authorization") |> result.unwrap("")
-        case authorized(secret, key, auth), req.method {
-          False, _ -> reply(401, "")
-          True, http.Post ->
-            case mist.read_body(req, max_body) {
-              Error(_) -> reply(413, "")
-              Ok(req) ->
-                case bit_array.to_string(req.body) {
-                  Error(Nil) -> reply(400, "")
-                  Ok(body) ->
-                    case respond(body, key, tools, call) {
-                      None -> reply(202, "")
-                      Some(json) ->
-                        reply(200, json)
-                        |> response.set_header(
-                          "content-type",
-                          "application/json",
-                        )
-                    }
-                }
-            }
-          // No server-initiated stream.
-          True, http.Get ->
-            reply(405, "") |> response.set_header("allow", "POST")
-          True, http.Delete -> reply(200, "")
-          True, _ -> reply(405, "")
-        }
-      }
-      _ -> reply(404, "")
+      ["mcp", key] -> Some(serve(req, key, secret, tools, call))
+      _ -> None
     }
   }
-  mist.new(handler)
-  |> mist.bind(bind)
-  |> mist.port(port)
-  |> mist.after_start(fn(_, _, _) { Nil })
-  |> mist.start
-  |> result.map(fn(_) { Nil })
-  |> result.map_error(fn(error) {
-    sys.warn("crushling: tool server: " <> string.inspect(error))
-    "could not serve the Slack tools on "
-    <> bind
-    <> ":"
-    <> string.inspect(port)
-    <> ": "
-    <> string.inspect(error)
-  })
 }
 
-fn reply(status: Int, body: String) -> Response(mist.ResponseData) {
-  response.new(status)
-  |> response.set_body(mist.Bytes(bytes_tree.from_string(body)))
+fn serve(
+  req: Request(mist.Connection),
+  key: String,
+  secret: String,
+  tools: List(Tool),
+  call: Call,
+) -> Response(mist.ResponseData) {
+  let reply = sandbox_http.reply
+  let auth = request.get_header(req, "authorization") |> result.unwrap("")
+  case authorized(secret, key, auth), req.method {
+    False, _ -> reply(401, "")
+    True, http.Post ->
+      case mist.read_body(req, max_body) {
+        Error(_) -> reply(413, "")
+        Ok(req) ->
+          case bit_array.to_string(req.body) {
+            Error(Nil) -> reply(400, "")
+            Ok(body) ->
+              case respond(body, key, tools, call) {
+                None -> reply(202, "")
+                Some(json) ->
+                  reply(200, json)
+                  |> response.set_header("content-type", "application/json")
+              }
+          }
+      }
+    // No server-initiated stream.
+    True, http.Get -> reply(405, "") |> response.set_header("allow", "POST")
+    True, http.Delete -> reply(200, "")
+    True, _ -> reply(405, "")
+  }
 }

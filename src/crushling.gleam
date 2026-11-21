@@ -42,6 +42,7 @@ import crushling/provider
 import crushling/registry
 import crushling/registry/tailnet
 import crushling/sandbox
+import crushling/sandbox_http
 import crushling/slack_tools
 import crushling/socket
 import crushling/sys
@@ -203,15 +204,15 @@ fn start() -> Result(Nil, String) {
           },
         )
       use _ <- result.map(
-        mcp.start(
-          setting("CRUSHLING_MCP_BIND", "127.0.0.1"),
-          port,
-          secret,
-          slack_tools.tools(tailnet: tailnet != option.None),
-          fn(key, name, arguments) {
-            slack_tools.call(context, key, name, arguments)
-          },
-        ),
+        sandbox_http.start(setting("CRUSHLING_MCP_BIND", "127.0.0.1"), port, [
+          mcp.route(
+            secret,
+            slack_tools.tools(tailnet: tailnet != option.None),
+            fn(key, name, arguments) {
+              slack_tools.call(context, key, name, arguments)
+            },
+          ),
+        ]),
       )
       io.println("crushling: Slack tools at " <> url)
     }

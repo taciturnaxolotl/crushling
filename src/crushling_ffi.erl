@@ -1,6 +1,7 @@
 -module(crushling_ffi).
 
 -export([line_at/2, uuid_v4/0, monotonic_ms/0, system_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
+         hmac_sha256_hex/2, equal_constant_time/2,
          file_exists/1, is_socket/1, file_stamp/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
          claude_version/0, read_file/1, write_bytes/2]).
 
@@ -31,6 +32,14 @@ log_warning(Text) ->
 
 sha256_hex(Data) ->
     binary:encode_hex(crypto:hash(sha256, Data), lowercase).
+
+hmac_sha256_hex(Secret, Data) ->
+    binary:encode_hex(crypto:mac(hmac, sha256, Secret, Data), lowercase).
+
+equal_constant_time(A, B) when byte_size(A) =:= byte_size(B) ->
+    crypto:hash_equals(A, B);
+equal_constant_time(_, _) ->
+    false.
 
 %% A file's size and modification time, which change when it is replaced.
 file_stamp(Path) ->
