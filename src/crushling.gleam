@@ -52,6 +52,7 @@ import crushling/slack_tools
 import crushling/socket
 import crushling/sys
 import crushling/tailscale
+import crushling/tunnel
 import gleam/erlang/process
 import gleam/int
 import gleam/io
@@ -141,6 +142,9 @@ fn start() -> Result(Nil, String) {
   let root =
     expand_home(setting("CRUSHLING_ROOT", "~/.local/state/crushling/threads"))
   use secret <- result.try(mcp_secret(root))
+  // Dial-out tunnels, served with the Slack tools. No launcher uses them
+  // yet: crush still listens on a socket.
+  use tunnels <- result.try(tunnel.start(tunnel.config(secret, root)))
   use port <- result.try(
     int.parse(setting("CRUSHLING_MCP_PORT", "7469"))
     |> result.replace_error("CRUSHLING_MCP_PORT is not a number"),
@@ -228,7 +232,9 @@ fn start() -> Result(Nil, String) {
     [] -> Ok(Nil)
     routes -> {
       let bind = setting("CRUSHLING_MCP_BIND", "127.0.0.1")
-      use _ <- result.map(sandbox_http.start(bind, port, routes))
+      use _ <- result.map(
+        sandbox_http.start(bind, port, [tunnel.route(tunnels), ..routes]),
+      )
       case mcp_url {
         "" -> Nil
         url -> io.println("crushling: Slack tools at " <> url)
