@@ -24,7 +24,10 @@ env(Name, Default) ->
 %% and data in Home and Extra ("K=V" strings) in its environment. Provider
 %% variables from the caller's environment are cleared so the server only
 %% sees what the test gives it: crush lets CRUSH_<NAME> override <NAME>, so
-%% CRUSH_HYPER_API_KEY would take Hyper around the proxy. Returns the OS pid.
+%% CRUSH_HYPER_API_KEY would take Hyper around the proxy. It runs in Home,
+%% not the project: crush loads a .env from its working directory, and the
+%% project's .env holds the org's CRUSH_HYPER_API_KEY, which would replace
+%% the thread token. Returns the OS pid.
 start(Socket, Log, Home, Extra) ->
     Crush = case os:find_executable("crush") of
         false -> error(crush_not_on_path);
@@ -41,6 +44,7 @@ start(Socket, Log, Home, Extra) ->
                              not lists:member(N, Names)],
     Port = open_port({spawn_executable, "/bin/sh"},
                      [{args, ["-c", lists:flatten(Cmd)]},
+                      {cd, unicode:characters_to_list(Home)},
                       {env, Cleared ++
                             [{"CRUSH_SERVER_IDLE_TIMEOUT", "600"},
                              {"CRUSH_GLOBAL_CONFIG", unicode:characters_to_list([Home, "/config"])},
@@ -78,7 +82,7 @@ sh(Dir, Command) ->
 timeout(Seconds, Fun) ->
     {timeout, Seconds, Fun}.
 
-%% A key from the environment or the project's .env.
+%% A setting (such as a key) from the environment or the project's .env.
 api_key(Name) ->
     case first_set([unicode:characters_to_list(Name)]) of
         {ok, V} -> {ok, unicode:characters_to_binary(V)};

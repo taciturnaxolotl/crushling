@@ -87,10 +87,13 @@ change there:
    exactly right: tunnel, proxy and Slack tools share that port. Only their
    comment ("the sandboxes reach the Slack tools and nothing else here")
    should say the bridge port. The `CRUSHLING-EGRESS` chain is unchanged.
-4. Secrets (`crushling.age`): add `CRUSHLING_HYPER_KEY` (required; the
-   bridge won't start without it). Remove `CRUSHLING_BACKEND`,
-   `CRUSHLING_LOGIN`, `CRUSHLING_EXTRA_BACKENDS`, `CRUSHLING_CLAUDE_VERSION`
-   and `CRUSH_HYPER_API_KEY`, which are no longer read. Optionally set the
+4. Secrets (`crushling.age`): add `CRUSHLING_HYPER_KEY` (required, or
+   `HYPER_API_KEY`; the bridge won't start without one). The proxy goes to
+   `https://hyper.charm.land` unless `CRUSHLING_PROXY_UPSTREAM` or
+   `HYPER_URL` says otherwise. Remove `CRUSHLING_BACKEND`,
+   `CRUSHLING_LOGIN`, `CRUSHLING_EXTRA_BACKENDS` and
+   `CRUSHLING_CLAUDE_VERSION`, which are no longer read.
+   (`CRUSH_HYPER_API_KEY` is still read as a last fallback for the key.) Optionally set the
    caps (`CRUSHLING_PROXY_THREAD_CAP_USD`, ...).
 5. `data.files` can drop `${cfg.dataDir}/.local/state/crushling`: there are
    no logins any more.

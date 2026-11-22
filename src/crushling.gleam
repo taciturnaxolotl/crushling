@@ -14,7 +14,7 @@
 //// | `CRUSHLING_ADMINS` | comma-separated Slack user ids who may approve tailnet access in that workspace; default everyone allowed. A workspace's `admins` setting in the store wins |
 //// | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `CRUSHLING_PUBLIC_URL` | the OAuth install, on only when all three are set: `<public url>/slack/install` starts it and Slack returns to `<public url>/slack/oauth/callback` (add that redirect URL in the app's settings). Both are served on the events server. Until the app's public distribution is on, only its own workspace can install it |
 //// | `CRUSHLING_STORE_KEY` | 32 bytes, base64: the key bot tokens are encrypted with in the store, `<root>/crushling.db`. Unset, one is made at `<root>/store-key` (mode 0600), like `<root>/mcp-secret`; back it up, since stored tokens can't be read without it |
-//// | `CRUSHLING_HYPER_KEY` | required: the org's Charm Hyper API key. Agents use Hyper through the bridge's inference proxy at `/proxy/<thread>` and never see the key |
+//// | `CRUSHLING_HYPER_KEY` | required: the org's Charm Hyper API key; else `HYPER_API_KEY`, else `CRUSH_HYPER_API_KEY`. Agents use Hyper through the bridge's inference proxy at `/proxy/<thread>` and never see the key, nor the bridge's own `HYPER_*` settings |
 //// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | Hyper models; default `deepseek-v4.1-flash` and `prism-flash` |
 //// | `CRUSHLING_MODE` | `sysadmin` (default: no permission prompts and no blocked commands) or `yolo` |
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
@@ -33,7 +33,7 @@
 //// | `CRUSHLING_TAILSCALE_API_KEY` | an API access token, instead of the OAuth client |
 //// | `CRUSHLING_TAILSCALE_TAG` | the tag sandboxes join with; default `tag:crushling` |
 //// | `CRUSHLING_TAILSCALE_TAILNET` | the tailnet's name; default `-`, the credential's own |
-//// | `CRUSHLING_PROXY_UPSTREAM` | where the proxy sends requests; default `https://hyper.charm.land` |
+//// | `CRUSHLING_PROXY_UPSTREAM` | where the proxy sends requests; else `HYPER_URL`, else `https://hyper.charm.land` |
 //// | `CRUSHLING_PROXY_THREAD_CAP_USD`, `CRUSHLING_PROXY_THREAD_CAP_TOKENS` | what one thread may spend through the proxy, in US dollars and/or tokens; unset is unlimited |
 //// | `CRUSHLING_PROXY_INSTANCE_CAP_USD`, `CRUSHLING_PROXY_INSTANCE_CAP_TOKENS` | the same for all threads together |
 
@@ -641,16 +641,16 @@ fn honcho_env() -> List(String) {
   })
 }
 
-/// The inference proxy, with the org's key from `CRUSHLING_HYPER_KEY`.
-/// Errors name the setting, never its value.
+/// The inference proxy, with the org's key from `CRUSHLING_HYPER_KEY`
+/// (or `HYPER_API_KEY`, or `CRUSH_HYPER_API_KEY`). Errors name the
+/// setting, never its value.
 fn proxy_from_settings(secret: String) -> Result(proxy.Proxy, String) {
-  use org_key <- result.try(case getenv("CRUSHLING_HYPER_KEY") {
-    Ok(key) if key != "" -> Ok(key)
-    _ ->
-      Error(
-        "CRUSHLING_HYPER_KEY is not set; agents use Hyper through the bridge with the org's key",
-      )
-  })
+  use org_key <- result.try(
+    proxy.org_key_from(getenv)
+    |> result.replace_error(
+      "CRUSHLING_HYPER_KEY (or HYPER_API_KEY) is not set; agents use Hyper through the bridge with the org's key",
+    ),
+  )
   let cap = fn(scope) {
     let name = fn(unit) { "CRUSHLING_PROXY_" <> scope <> "_CAP_" <> unit }
     proxy.parse_cap(setting(name("TOKENS"), ""), setting(name("USD"), ""))
@@ -666,12 +666,14 @@ fn proxy_from_settings(secret: String) -> Result(proxy.Proxy, String) {
   proxy.start(proxy.Config(
     secret:,
     org_key:,
-    upstream: setting("CRUSHLING_PROXY_UPSTREAM", proxy.default_upstream),
+    upstream: proxy.upstream_from(getenv),
     thread_cap:,
     instance_cap:,
     max_per_thread: proxy.default_max_per_thread,
     max_uploads: proxy.default_max_uploads,
     upload_timeout_ms: proxy.default_upload_timeout_ms,
   ))
-  |> result.map_error(fn(reason) { "CRUSHLING_PROXY_UPSTREAM " <> reason })
+  |> result.map_error(fn(reason) {
+    "the proxy upstream (CRUSHLING_PROXY_UPSTREAM or HYPER_URL) " <> reason
+  })
 }

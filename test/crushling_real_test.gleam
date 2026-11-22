@@ -5,10 +5,15 @@
 ////
 //// The `crush` on `PATH` must have `--dial` and resumable event streams.
 //// Every agent uses Hyper through a real inference proxy (`crushling/proxy`)
-//// with the org's key from `CRUSHLING_HYPER_KEY`, else `CRUSH_HYPER_API_KEY`
-//// (environment or `.env`). The agents themselves only ever see a thread
-//// token. Agents the local launcher starts dial in through the tunnel, as a
-//// sandbox does; the others listen on a unix socket the test connects to.
+//// with the org's key from `CRUSHLING_HYPER_KEY`, else `HYPER_API_KEY`, else
+//// `CRUSH_HYPER_API_KEY`, sent to `CRUSHLING_PROXY_UPSTREAM`, else
+//// `HYPER_URL`, else `proxy.default_upstream` (each from the environment or
+//// `.env`), as the bridge reads them. Set `HYPER_URL` to test against
+//// another Hyper. Those settings are the test's own: crush servers get only
+//// a proxy URL and a thread token, and run outside the project so crush
+//// doesn't load its `.env`. Agents the local launcher starts dial in
+//// through the tunnel, as a sandbox does; the others listen on a unix
+//// socket the test connects to.
 ////
 //// Models can be overridden with `CRUSHLING_TEST_LARGE` and
 //// `CRUSHLING_TEST_SMALL`. Assertions are about structure (order, diffs,
@@ -154,14 +159,8 @@ type Wiring {
 /// production. Started unlinked, because EUnit runs the generator in a
 /// process that exits before the tests do.
 fn start_wiring() -> Wiring {
-  let org_key = case api_key("CRUSHLING_HYPER_KEY") {
-    Ok(key) -> key
-    Error(Nil) -> {
-      let assert Ok(key) = api_key("CRUSH_HYPER_API_KEY")
-        as "set CRUSHLING_HYPER_KEY or CRUSH_HYPER_API_KEY in the environment or .env"
-      key
-    }
-  }
+  let assert Ok(org_key) = proxy.org_key_from(api_key)
+    as "set CRUSHLING_HYPER_KEY or HYPER_API_KEY in the environment or .env"
   let n = int.absolute_value(unique()) % 1_000_000
   let port = 30_000 + n % 2000
   let url = "http://127.0.0.1:" <> int.to_string(port)
@@ -171,7 +170,7 @@ fn start_wiring() -> Wiring {
       proxy.start(proxy.Config(
         secret:,
         org_key:,
-        upstream: env("CRUSHLING_PROXY_UPSTREAM", proxy.default_upstream),
+        upstream: proxy.upstream_from(api_key),
         thread_cap: meter.unlimited,
         instance_cap: meter.unlimited,
         max_per_thread: proxy.default_max_per_thread,

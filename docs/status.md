@@ -10,8 +10,12 @@ unless enabled:
 
 The `crush` on `PATH` must have `--dial` and resumable event streams (see
 "Sandbox image" below). Inference goes through a real inference proxy with
-the org's Hyper key from `CRUSHLING_HYPER_KEY`, else `CRUSH_HYPER_API_KEY`
-(environment or `.env`).
+the org's Hyper key from `CRUSHLING_HYPER_KEY`, else `HYPER_API_KEY`, else
+`CRUSH_HYPER_API_KEY` (environment or `.env`), sent to
+`CRUSHLING_PROXY_UPSTREAM`, else `HYPER_URL`, else `https://hyper.charm.land`.
+To test against another Hyper, set `HYPER_URL`. The test crush servers run outside the project
+directory, because crush loads a `.env` from its working directory and the
+project's would hand them the org's key in place of their thread token.
 
 They cover queued prompt order, diffs of `bash` edits, history staying
 clean, the bridge surviving a server killed mid-run, and the local launcher
@@ -31,7 +35,7 @@ Configuration is from the environment or `.env`; see the table at the top of
     SLACK_BOT_TOKEN=xoxb-...
     SLACK_APP_TOKEN=xapp-...
     CRUSHLING_ALLOWED_USERS=U012345
-    CRUSHLING_HYPER_KEY=...            # the org's Hyper key; agents never see it
+    CRUSHLING_HYPER_KEY=...            # the org's Hyper key (or HYPER_API_KEY); agents never see it
     CRUSHLING_LAUNCHER=local           # unsandboxed: agents run as you
 
 `local` runs `crush server --dial` against the bridge on
@@ -411,16 +415,22 @@ network.
 ## Provider
 
 Agents use Charm Hyper, and only through the bridge's inference proxy. The
-org's key is `CRUSHLING_HYPER_KEY`, which the bridge requires; it never
-leaves the bridge. Each agent's crush gets `HYPER_URL` (the proxy's
+org's key is `CRUSHLING_HYPER_KEY` (else `HYPER_API_KEY`, else
+`CRUSH_HYPER_API_KEY`), which the bridge requires; it never leaves the
+bridge. The proxy sends requests to `CRUSHLING_PROXY_UPSTREAM`, else
+`HYPER_URL`, else `https://hyper.charm.land`. These `HYPER_*` settings are
+the bridge's own and are never passed on to an agent. Each agent's crush gets `HYPER_URL` (the proxy's
 `/proxy/<thread>`) and `HYPER_API_KEY` (a token for that thread alone, which
 stops working when the thread's agent is stopped). crush.json names the
 Hyper models (`CRUSHLING_LARGE`, `CRUSHLING_SMALL`) and holds no key.
 
 crush lets `CRUSH_<NAME>` override `<NAME>`, even when empty, so an agent
 must never get `CRUSH_HYPER_API_KEY` or `CRUSH_HYPER_URL`. The local
-launcher clears the bridge's environment for the same reason, and the
-sandbox image must not define any `CRUSH_HYPER_*` variable.
+launcher clears the bridge's environment for the same reason (including
+the bridge's own `HYPER_URL` and `HYPER_API_KEY`), and the sandbox image
+must not define any `CRUSH_HYPER_*` variable. crush also loads a `.env` from
+its working directory without overriding what is set, so a crush must never
+run where a `.env` holds the org's key.
 
 The Claude and Hyper login backends, and the token refresher they needed,
 are gone: `CRUSHLING_BACKEND`, `CRUSHLING_LOGIN`, `CRUSHLING_EXTRA_BACKENDS`

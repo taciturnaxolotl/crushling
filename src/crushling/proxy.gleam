@@ -53,8 +53,46 @@ import gleam/string
 import gleam/uri
 import mist
 
-/// Hyper's own address, crush's default.
+/// Hyper's own address, crush's default, and where the proxy sends
+/// requests when nothing says otherwise.
 pub const default_upstream = "https://hyper.charm.land"
+
+/// The settings that name the upstream, in order of precedence; the first
+/// one set wins, else `default_upstream`. `HYPER_URL` is crush's own name
+/// for it.
+pub const upstream_settings = ["CRUSHLING_PROXY_UPSTREAM", "HYPER_URL"]
+
+/// The settings that hold the org's Hyper key, in order of precedence.
+/// `HYPER_API_KEY` is crush's own name for it; `CRUSH_HYPER_API_KEY` is
+/// read last so older `.env` files keep working.
+pub const org_key_settings = [
+  "CRUSHLING_HYPER_KEY", "HYPER_API_KEY", "CRUSH_HYPER_API_KEY",
+]
+
+/// The upstream from the bridge's settings, `lookup` reading one by name.
+/// These are the bridge's own: a sandbox only ever gets `crush_env`.
+pub fn upstream_from(lookup: fn(String) -> Result(String, Nil)) -> String {
+  first_set(upstream_settings, lookup) |> result.unwrap(default_upstream)
+}
+
+/// The org's key from the bridge's settings, `lookup` reading one by name.
+pub fn org_key_from(
+  lookup: fn(String) -> Result(String, Nil),
+) -> Result(String, Nil) {
+  first_set(org_key_settings, lookup)
+}
+
+fn first_set(
+  names: List(String),
+  lookup: fn(String) -> Result(String, Nil),
+) -> Result(String, Nil) {
+  list.find_map(names, fn(name) {
+    case lookup(name) {
+      Ok(value) if value != "" -> Ok(value)
+      _ -> Error(Nil)
+    }
+  })
+}
 
 /// Requests one thread may have in flight at once.
 pub const default_max_per_thread = 4
@@ -71,7 +109,7 @@ pub type Config {
     secret: String,
     /// The org's Hyper API key, the only one that leaves the bridge.
     org_key: String,
-    /// Where requests go; usually `default_upstream`. Must be https unless
+    /// Where requests go; usually `upstream_from` the settings. Must be https unless
     /// the host is a loopback address.
     upstream: String,
     thread_cap: Cap,

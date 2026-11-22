@@ -27,6 +27,7 @@ start(Crush, Url, Token, Home, Log) ->
                           {cd, H},
                           {env, [{"CRUSH_SERVER_DIAL_TOKEN", unicode:characters_to_list(Token)},
                                  {"HYPER_URL", false}, {"HYPER_API_KEY", false},
+                                 {"CRUSH_HYPER_URL", false}, {"CRUSH_HYPER_API_KEY", false},
                                  {"ANTHROPIC_API_KEY", false},
                                  {"CRUSH_GLOBAL_CONFIG", H ++ "/config"},
                                  {"CRUSH_GLOBAL_DATA", H ++ "/data"},

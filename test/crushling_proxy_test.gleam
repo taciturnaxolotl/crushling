@@ -3,9 +3,12 @@
 //// raw TCP one for trailers.
 ////
 //// The real tests, skipped unless `CRUSHLING_REAL=1` and a Hyper key is in
-//// `CRUSH_HYPER_API_KEY` (environment or `.env`), check TLS verification,
-//// send a request through the proxy to Hyper and then run a whole
-//// `crush run` against it.
+//// `CRUSHLING_HYPER_KEY`, `HYPER_API_KEY` or `CRUSH_HYPER_API_KEY`
+//// (environment or `.env`), check TLS verification, send a request through
+//// the proxy to Hyper and then run a whole `crush run` against it. Hyper is
+//// `CRUSHLING_PROXY_UPSTREAM`, else `HYPER_URL`, else
+//// `proxy.default_upstream`, as the bridge reads them. The TLS
+//// check still connects to production's host.
 
 import crushling/gun
 import crushling/proxy
@@ -394,6 +397,63 @@ fn raw_post(key: String, extra: String) -> String {
 }
 
 // Tests.
+
+/// A settings lookup over fixed pairs.
+fn settings(
+  pairs: List(#(String, String)),
+) -> fn(String) -> Result(String, Nil) {
+  fn(name) { list.key_find(pairs, name) }
+}
+
+pub fn upstream_setting_falls_back_in_order_test() {
+  let assert "https://hyper.charm.land" = proxy.default_upstream
+  let assert "https://hyper.charm.land" = proxy.upstream_from(settings([]))
+  let assert "https://hyper.example" =
+    proxy.upstream_from(settings([#("HYPER_URL", "https://hyper.example")]))
+  let assert "https://own.example" =
+    proxy.upstream_from(
+      settings([
+        #("HYPER_URL", "https://hyper.example"),
+        #("CRUSHLING_PROXY_UPSTREAM", "https://own.example"),
+      ]),
+    )
+  // An empty setting counts as unset.
+  let assert "https://hyper.example" =
+    proxy.upstream_from(
+      settings([
+        #("CRUSHLING_PROXY_UPSTREAM", ""),
+        #("HYPER_URL", "https://hyper.example"),
+      ]),
+    )
+  // crush's CRUSH_ override name is not one of the bridge's settings.
+  let assert "https://hyper.charm.land" =
+    proxy.upstream_from(settings([#("CRUSH_HYPER_URL", "https://x.example")]))
+}
+
+pub fn org_key_setting_falls_back_in_order_test() {
+  let assert Error(Nil) = proxy.org_key_from(settings([]))
+  let assert Ok("legacy") =
+    proxy.org_key_from(settings([#("CRUSH_HYPER_API_KEY", "legacy")]))
+  let assert Ok("standard") =
+    proxy.org_key_from(
+      settings([
+        #("CRUSH_HYPER_API_KEY", "legacy"),
+        #("HYPER_API_KEY", "standard"),
+      ]),
+    )
+  let assert Ok("own") =
+    proxy.org_key_from(
+      settings([
+        #("CRUSH_HYPER_API_KEY", "legacy"),
+        #("HYPER_API_KEY", "standard"),
+        #("CRUSHLING_HYPER_KEY", "own"),
+      ]),
+    )
+  let assert Ok("standard") =
+    proxy.org_key_from(
+      settings([#("CRUSHLING_HYPER_KEY", ""), #("HYPER_API_KEY", "standard")]),
+    )
+}
 
 pub fn bad_token_is_401_test() {
   let setup = setup()
@@ -918,7 +978,7 @@ fn tmp_dir() -> String
 fn to_dynamic(a: a) -> Dynamic
 
 pub fn real_proxy_test_() -> Dynamic {
-  case enabled(), api_key("CRUSH_HYPER_API_KEY") {
+  case enabled(), proxy.org_key_from(api_key) {
     True, Ok(key) ->
       to_dynamic([
         with_timeout(60, real_tls_is_verified),
@@ -934,7 +994,7 @@ fn real_proxy(key: String) -> #(proxy.Proxy, Int) {
     proxy.start(proxy.Config(
       secret:,
       org_key: key,
-      upstream: env("CRUSHLING_PROXY_UPSTREAM", proxy.default_upstream),
+      upstream: proxy.upstream_from(api_key),
       thread_cap: meter.unlimited,
       instance_cap: meter.unlimited,
       max_per_thread: proxy.default_max_per_thread,
