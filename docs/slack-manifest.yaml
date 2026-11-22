@@ -37,6 +37,7 @@ settings:
     request_url: https://crushling.dunkirk.sh/slack/events
     bot_events:
       - agent_session_stopped
+      - app_home_opened
       - app_mention
       - message.channels
       - message.groups
