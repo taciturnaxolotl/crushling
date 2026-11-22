@@ -23,6 +23,7 @@ import crushling/crush/client
 import crushling/gun
 import crushling/launcher
 import crushling/mcp
+import crushling/people
 import crushling/provider
 import crushling/proxy
 import crushling/proxy/meter
@@ -563,7 +564,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       token: "xoxb-test",
       bot_user: "UBOT",
       team: "T1",
-      allowed: set.from_list(["U1"]),
+      allowed: people.only(["U1"]),
       admins: set.new(),
       store: real_store(root),
       migrate_legacy: False,
@@ -660,7 +661,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       token: "xoxb-test",
       bot_user: "UBOT",
       team: "T1",
-      allowed: set.from_list(["U1"]),
+      allowed: people.only(["U1"]),
       admins: set.new(),
       store: real_store(root),
       migrate_legacy: False,

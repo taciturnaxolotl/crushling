@@ -4,6 +4,7 @@
 import crushling/crush/client
 import crushling/instance
 import crushling/launcher
+import crushling/people
 import crushling/registry
 import crushling/slack_tools
 import crushling/socket
@@ -197,24 +198,24 @@ pub fn settings_come_from_the_store_or_the_environment_test() {
   let env =
     instance.EnvTeam(
       id: "TA",
-      allowed: set.from_list(["U1", "U2"]),
+      allowed: people.only(["U1", "U2"]),
       admins: set.from_list(["U1"]),
     )
   let shared = shared(s, dir, process.new_subject(), "http://x/api", Some(env))
   // The environment's workspace falls back to the environment.
   let assert Ok(#(allowed, admins)) = instance.people(shared, "TA")
-  let assert 2 = set.size(allowed)
+  let assert 2 = set.size(allowed.ids)
   let assert True = set.contains(admins, "U1")
   // Another workspace gets nobody until its settings say.
   let assert Ok(#(allowed, _)) = instance.people(shared, "TB")
-  let assert True = set.is_empty(allowed)
+  let assert True = people.is_empty(allowed)
   let assert Ok(Nil) = store.set_setting(s, "TB", store.allowed_users, "U7, U8")
   let assert Ok(#(allowed, _)) = instance.people(shared, "TB")
-  let assert True = allowed == set.from_list(["U7", "U8"])
+  let assert True = allowed == people.only(["U7", "U8"])
   // Settings win over the environment.
   let assert Ok(Nil) = store.set_setting(s, "TA", store.allowed_users, "U9")
   let assert Ok(#(allowed, _)) = instance.people(shared, "TA")
-  let assert True = allowed == set.from_list(["U9"])
+  let assert True = allowed == people.only(["U9"])
 }
 
 pub fn self_host_seeds_its_workspace_test() {
@@ -234,11 +235,7 @@ pub fn self_host_seeds_its_workspace_test() {
   let assert "xoxb-env" = stored.bot_token
   let launches = process.new_subject()
   let env =
-    instance.EnvTeam(
-      id: "TA",
-      allowed: set.from_list(["U1"]),
-      admins: set.new(),
-    )
+    instance.EnvTeam(id: "TA", allowed: people.only(["U1"]), admins: set.new())
   let assert Ok(teams) =
     instance.start(shared(s, dir, launches, api, Some(env)))
   let assert Ok(started) = instance.start_team(teams, seeded)

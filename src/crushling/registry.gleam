@@ -26,6 +26,7 @@
 import crushling/crush/client
 import crushling/launcher.{type Launcher}
 import crushling/meta.{type Link, type Meta, Link, Meta}
+import crushling/people.{type People}
 import crushling/registry/entry.{
   type Entry, Entry, Live, Starting, Stopping, already_read, is_quiet,
   new as new_entry, tailnet_view,
@@ -61,10 +62,11 @@ pub type Config {
     bot_user: String,
     /// The workspace's id.
     team: String,
-    /// Slack user ids allowed to drive agents.
-    allowed: Set(String),
-    /// Slack user ids who may approve tailnet access; when empty, everyone
-    /// allowed may.
+    /// Who may drive agents: listed Slack user ids, and maybe every
+    /// member of the workspace.
+    allowed: People,
+    /// Slack user ids who may approve tailnet access; when empty, the ids
+    /// allowed may (nobody, when everyone is allowed).
     admins: Set(String),
     /// Where thread meta and code-channel links are kept.
     store: Store,
@@ -137,6 +139,15 @@ pub type Message {
   /// The thread actor for `key`, if its agent is up: for the agent's own
   /// Slack tools.
   Lookup(key: String, reply: Subject(Option(Subject(thread.Message))))
+  /// Whether `user` is a member of the workspace, from lookup `id`.
+  Member(user: String, id: Int, result: Result(Bool, String))
+}
+
+/// Something from a user whose membership is being looked up, waiting for
+/// the answer.
+type Waiting {
+  WaitingMessage(Incoming)
+  WaitingStop(channel: String, thread_ts: String, user: String)
 }
 
 type State {
@@ -164,8 +175,17 @@ type State {
     /// to be.
     broken: Set(String),
     tailnets: tailnet.Tailnets,
+    /// Who is a member of the workspace, as far as users.info said lately.
+    members: people.Cache,
+    /// Lookups in flight, by user: the lookup's id and what waits for it,
+    /// oldest first.
+    looking_up: Dict(String, #(Int, List(Waiting))),
   )
 }
+
+/// How long a membership lookup gets before what waits for it is turned
+/// away.
+const member_timeout_ms = 15_000
 
 /// After cancelling, how long turns get to post their closing note.
 const cancel_wait_ms = 10_000
@@ -202,12 +222,14 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       tailnets: tailnet.new(
         config.tailnet,
         config.client,
-        approvers(config),
+        approvers(config.allowed, config.admins),
         fn(key, event, after_ms) {
           process.send_after(self, after_ms, Tailnet(key, event))
           Nil
         },
       ),
+      members: people.new_cache(people.cache_ms),
+      looking_up: dict.new(),
     )
     |> actor.initialised
     |> actor.selecting(selector)
@@ -224,11 +246,125 @@ pub fn key(team: String, channel: String, thread_ts: String) -> String {
   sandbox.key(team, channel, thread_ts)
 }
 
-/// Who may approve tailnet access.
-fn approvers(config: Config) -> Set(String) {
-  case set.is_empty(config.admins) {
-    True -> config.allowed
-    False -> config.admins
+/// Who may approve tailnet access: the admins, else the ids allowed. An
+/// allowlist of everyone makes nobody an approver: being in the workspace
+/// isn't enough to put a sandbox on the operator's tailnet.
+pub fn approvers(allowed: People, admins: Set(String)) -> People {
+  case set.is_empty(admins), allowed.everyone {
+    False, _ -> people.People(everyone: False, ids: admins)
+    True, True -> people.nobody()
+    True, False -> allowed
+  }
+}
+
+/// Whether `user` may drive agents here, as far as is known now. Someone
+/// who needs a lookup that hasn't happened yet may not.
+fn may_use(state: State, user: String) -> Bool {
+  people.allows(state.config.allowed, user, fn(user) {
+    people.cached(state.members, user, sys.monotonic_ms()) == Some(True)
+  })
+}
+
+/// Whether `user`'s membership must be looked up before `may_use` can say.
+fn unknown(state: State, user: String) -> Bool {
+  people.needs_lookup(state.config.allowed, user)
+  && people.cached(state.members, user, sys.monotonic_ms()) == None
+}
+
+/// Hold `waiting` until `user`'s membership is known, and look it up unless
+/// a lookup is already under way. The lookup runs on its own process, so
+/// the registry keeps serving other threads meanwhile.
+fn wait_for_member(state: State, user: String, waiting: Waiting) -> State {
+  case dict.get(state.looking_up, user) {
+    Ok(#(id, queue)) ->
+      State(
+        ..state,
+        looking_up: dict.insert(state.looking_up, user, #(
+          id,
+          list.append(queue, [waiting]),
+        )),
+      )
+    Error(Nil) -> {
+      let id = state.generation + 1
+      let self = state.self
+      let client = state.config.client
+      let team = state.config.team
+      process.spawn_unlinked(fn() {
+        process.send(self, Member(user, id, people.lookup(client, team, user)))
+      })
+      process.send_after(
+        self,
+        member_timeout_ms,
+        Member(user, id, Error("users.info took too long")),
+      )
+      State(
+        ..state,
+        generation: id,
+        looking_up: dict.insert(state.looking_up, user, #(id, [waiting])),
+      )
+    }
+  }
+}
+
+/// A membership lookup finished: keep the answer, then deal with what
+/// waited for it. A failed lookup turns those away and isn't kept, so the
+/// next message asks again.
+fn member_known(
+  state: State,
+  user: String,
+  id: Int,
+  result: Result(Bool, String),
+) -> State {
+  let now = sys.monotonic_ms()
+  case dict.get(state.looking_up, user) {
+    Ok(#(current, queue)) if current == id -> {
+      let state =
+        State(
+          ..state,
+          looking_up: dict.delete(state.looking_up, user),
+          members: people.remember(
+            state.members,
+            user,
+            result.unwrap(result, False),
+            now,
+          ),
+        )
+      case result {
+        Ok(_) -> Nil
+        Error(reason) ->
+          sys.warn(
+            "crushling: couldn't tell whether "
+            <> user
+            <> " is a member of "
+            <> state.config.team
+            <> ", so ignoring them for now: "
+            <> reason,
+          )
+      }
+      let state =
+        list.fold(queue, state, fn(state, waiting) {
+          case waiting, state.stopping {
+            _, Some(_) -> state
+            WaitingMessage(incoming), None -> received(state, incoming, 0)
+            WaitingStop(channel, thread_ts, user), None ->
+              stop_requested(state, channel, thread_ts, user)
+          }
+        })
+      case result {
+        Ok(_) -> state
+        Error(_) -> State(..state, members: people.forget(state.members, user))
+      }
+    }
+    // A late answer to a lookup that timed out is still good to keep.
+    _ ->
+      case result {
+        Ok(member) ->
+          State(
+            ..state,
+            members: people.remember(state.members, user, member, now),
+          )
+        Error(_) -> state
+      }
   }
 }
 
@@ -311,6 +447,8 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       })
       actor.continue(state)
     }
+    Member(user, id, result) ->
+      actor.continue(member_known(state, user, id, result))
   }
 }
 
@@ -540,17 +678,22 @@ fn route(
     || links.is_seed(code, incoming.ts)
     || already_read(known, incoming.ts),
     addressed,
-    set.contains(config.allowed, incoming.user)
+    may_use(state, incoming.user)
   {
     True, _, _ -> state
     // Thread chatter the agent isn't following: the next turn catches up.
     _, False, _ -> state
-    False, True, False -> {
-      sys.warn(
-        "crushling: ignoring " <> incoming.user <> ", not on the allowlist",
-      )
-      remember(state, id)
-    }
+    False, True, False ->
+      case unknown(state, incoming.user) {
+        // Everyone may use it, but is this a member? Ask, then come back.
+        True -> wait_for_member(state, incoming.user, WaitingMessage(incoming))
+        False -> {
+          sys.warn(
+            "crushling: ignoring " <> incoming.user <> ", not on the allowlist",
+          )
+          remember(state, id)
+        }
+      }
     False, True, True ->
       Route(incoming:, origin:, key:, known:, prompt:)
       |> act(state, _, command)
@@ -923,26 +1066,35 @@ fn stop_requested(
       key(config.team, origin_channel, origin_ts)
     None -> key(config.team, channel, thread_ts)
   }
-  case set.contains(config.allowed, user), dict.get(state.threads, key) {
+  case may_use(state, user), dict.get(state.threads, key) {
     True, Ok(Entry(agent: Live(thread:, ..), ..) as entry)
       if entry.in_flight > 0 || entry.working
-    -> process.send(thread, thread.Cancel(None))
+    -> {
+      process.send(thread, thread.Cancel(None))
+      state
+    }
     False, _ ->
-      whisper(
-        config,
-        incoming,
-        "_only the people this agent works for can stop it._",
-      )
+      case unknown(state, user) {
+        True ->
+          wait_for_member(state, user, WaitingStop(channel, thread_ts, user))
+        False -> {
+          whisper(
+            config,
+            incoming,
+            "_only the people this agent works for can stop it._",
+          )
+          state
+        }
+      }
     // Nothing running here, so the session shouldn't say it is.
     True, _ -> {
       let client = config.client
       process.spawn_unlinked(fn() {
         slack.session_done(client, channel, thread_ts)
       })
-      Nil
+      state
     }
   }
-  state
 }
 
 fn busy(state: State) -> Bool {

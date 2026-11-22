@@ -13,6 +13,7 @@
 
 import crushling/crush/client
 import crushling/launcher.{type Launcher}
+import crushling/people.{type People}
 import crushling/registry
 import crushling/registry/tailnet
 import crushling/sandbox
@@ -53,7 +54,7 @@ pub type Shared {
 }
 
 pub type EnvTeam {
-  EnvTeam(id: String, allowed: Set(String), admins: Set(String))
+  EnvTeam(id: String, allowed: People, admins: Set(String))
 }
 
 /// A running workspace.
@@ -235,36 +236,66 @@ fn launch(
   }
 }
 
-/// A comma-separated list of user ids.
-pub fn parse_users(text: String) -> Set(String) {
-  string.split(text, ",")
-  |> list.map(string.trim)
-  |> list.filter(fn(user) { user != "" })
-  |> set.from_list
+/// The self-host workspace's allowlist and admins, from the values of
+/// `CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`. The allowlist must not
+/// be empty; `*` in it means every member of the workspace. Admins approve
+/// tailnet access, so they must be listed by id.
+pub fn env_people(
+  allowed: String,
+  admins: String,
+) -> Result(#(People, Set(String)), String) {
+  let allowed = people.parse(allowed)
+  let admins = people.parse(admins)
+  case people.is_empty(allowed), admins.everyone {
+    // An agent in sysadmin mode that anyone can drive is not a default
+    // worth having: everyone has to be asked for.
+    True, _ ->
+      Error(
+        "CRUSHLING_ALLOWED_USERS is empty; list the Slack user ids, or `*` for everyone in the workspace",
+      )
+    _, True ->
+      Error(
+        "CRUSHLING_ADMINS can't be `*`; admins approve tailnet access, so list their Slack user ids",
+      )
+    False, False -> Ok(#(allowed, admins.ids))
+  }
 }
 
 /// A workspace's allowlist and admins: its settings in the store, else the
-/// environment's for the environment's own workspace, else nobody.
+/// environment's for the environment's own workspace, else nobody. Admins
+/// are only ever listed ids: a `*` among them is dropped, with a warning.
 pub fn people(
   shared: Shared,
   team: String,
-) -> Result(#(Set(String), Set(String)), String) {
+) -> Result(#(People, Set(String)), String) {
   use settings <- result.map(store.settings(shared.store, team))
   let env = case shared.env_team {
     Some(env) if env.id == team -> Some(env)
     _ -> None
   }
-  let pick = fn(name, from_env) {
-    case dict.get(settings, name), env {
-      Ok(value), _ -> parse_users(value)
-      Error(Nil), Some(env) -> from_env(env)
-      Error(Nil), None -> set.new()
-    }
+  let allowed = case dict.get(settings, store.allowed_users), env {
+    Ok(value), _ -> people.parse(value)
+    Error(Nil), Some(env) -> env.allowed
+    Error(Nil), None -> people.nobody()
   }
-  #(
-    pick(store.allowed_users, fn(env: EnvTeam) { env.allowed }),
-    pick(store.admins, fn(env: EnvTeam) { env.admins }),
-  )
+  let admins = case dict.get(settings, store.admins), env {
+    Ok(value), _ -> {
+      let admins = people.parse(value)
+      case admins.everyone {
+        True ->
+          sys.warn(
+            "crushling: ignoring `*` in the admins setting of "
+            <> team
+            <> "; admins must be listed by id",
+          )
+        False -> Nil
+      }
+      admins.ids
+    }
+    Error(Nil), Some(env) -> env.admins
+    Error(Nil), None -> set.new()
+  }
+  #(allowed, admins)
 }
 
 fn start_instance(
@@ -308,9 +339,21 @@ fn start_instance(
     <> " as "
     <> team.bot_user
     <> " with "
-    <> string.inspect(set.size(allowed))
-    <> " allowed users",
+    <> people.describe(allowed),
   )
+  case
+    is_env && option.is_some(shared.tailnet),
+    allowed.everyone,
+    set.is_empty(admins)
+  {
+    True, True, True ->
+      sys.warn(
+        "crushling: everyone in "
+        <> team.id
+        <> " may use crushling and it has no admins, so nobody can approve tailnet access; list approvers in CRUSHLING_ADMINS",
+      )
+    _, _, _ -> Nil
+  }
   Instance(team: team.id, bot_user: team.bot_user, client:, registry:)
 }
 

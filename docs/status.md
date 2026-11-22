@@ -34,7 +34,7 @@ Configuration is from the environment or `.env`; see the table at the top of
 
     SLACK_BOT_TOKEN=xoxb-...
     SLACK_APP_TOKEN=xapp-...
-    CRUSHLING_ALLOWED_USERS=U012345
+    CRUSHLING_ALLOWED_USERS=U012345    # or * for every full member of the workspace
     CRUSHLING_HYPER_KEY=...            # the org's Hyper key (or HYPER_API_KEY); agents never see it
     CRUSHLING_LAUNCHER=local           # unsandboxed: agents run as you
 
@@ -141,7 +141,8 @@ owns the connection, so writes are serialized. The schema is versioned with
   (null unless on Enterprise Grid), `installed_by`, `installed_at` (unix
   seconds), `active`;
 - `team_settings`: `team_id`, `name`, `value`, a plain key/value list.
-  `allowed_users` and `admins` (comma-separated user ids) are read today;
+  `allowed_users` and `admins` (comma-separated user ids; `allowed_users`
+  also takes `*`, and a `*` in `admins` is ignored) are read today;
 - `threads`: `key` (key), `team_id`, `channel`, `thread_ts`, and the meta:
   `follow`, `paused`, `cursor`, `venue` (JSON), `tailnet` (JSON or null),
   `updated_at`;
@@ -159,9 +160,23 @@ without it.
 A workspace's allowlist and admins come from its `team_settings`. The
 self-host workspace, the one of `SLACK_BOT_TOKEN`, falls back to
 `CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`; an installed one starts
-with whoever installed it. Admins approve tailnet access (everyone allowed
-does when there are none), and only the self-host workspace gets tailnet
+with whoever installed it. Admins approve tailnet access (the ids allowed
+do when there are none), and only the self-host workspace gets tailnet
 access at all, since the Tailscale credential is the operator's.
+
+`*` in the allowlist (alone, or among ids) lets everyone in the workspace
+use crushling: full members only. Agents run in sysadmin mode, so guests
+(single- and multi-channel), people from other workspaces in Slack Connect
+channels, bots and apps, and deactivated accounts are turned away. Message
+events don't say which workspace their author is from, so the registry asks
+users.info (the user's `team_id` must be this workspace's, and not
+`is_restricted`, `is_ultra_restricted`, `is_bot` or `deleted`). The lookup
+runs on its own process while the user's messages wait, so other threads
+aren't held up; each answer, yes or no, is kept for ten minutes per user. A
+failed or slow (15 s) lookup turns the waiting messages away, is logged, and
+isn't kept. A listed id needs no lookup. Admins can't be `*`: the bridge
+refuses to start with `CRUSHLING_ADMINS=*`. With `*` and no admins, nobody
+may approve tailnet access, and the bridge warns about it at start.
 
 On start, self-host puts the `SLACK_BOT_TOKEN` workspace in the store (from
 auth.test), starts its instance, then one for every other active workspace
@@ -371,8 +386,9 @@ Daytona's exec), the same `command -v crushling-share` plus
 A thread's sandbox can join your tailnet for a while, so the agent can reach
 your machines. The agent asks with its `request_tailnet` tool, or someone
 says `!tailnet` in the thread. Either way a card appears with buttons to
-allow it for 1 or 8 hours, or to deny it. Only people on the allowlist can
-press them. Once it is on, the card shows when it ends and a "Turn off"
+allow it for 1 or 8 hours, or to deny it. Only admins can press them, or,
+with no admins, the ids on the allowlist (nobody, when the allowlist is
+`*`). Once it is on, the card shows when it ends and a "Turn off"
 button, and the agent gets a message that tells it how to connect.
 `!tailnet off` also ends it.
 

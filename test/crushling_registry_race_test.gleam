@@ -4,6 +4,7 @@
 
 import crushling/crush/client
 import crushling/launcher
+import crushling/people
 import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/store
@@ -65,7 +66,7 @@ fn start_with(
       token: "xoxb-test",
       bot_user: "UBOT",
       team: "T1",
-      allowed: set.from_list(["U1"]),
+      allowed: people.only(["U1"]),
       admins: set.new(),
       store: race_store(),
       migrate_legacy: False,

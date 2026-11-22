@@ -2,6 +2,7 @@ import crushling/crush/client
 import crushling/events
 import crushling/launcher
 import crushling/meta
+import crushling/people
 import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/registry/tailnet
@@ -206,7 +207,7 @@ fn start_registry_as(
       token: "xoxb-test",
       bot_user: "UBOT",
       team: "T1",
-      allowed: set.from_list(["U1"]),
+      allowed: people.only(["U1"]),
       admins: set.new(),
       store:,
       migrate_legacy:,

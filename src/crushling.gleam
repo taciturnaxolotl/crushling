@@ -10,8 +10,8 @@
 //// | `SLACK_SIGNING_SECRET` | the app's signing secret; set it to take events over HTTP at `/slack/events` |
 //// | `CRUSHLING_EVENTS_BIND`, `CRUSHLING_EVENTS_PORT` | where that endpoint, and the OAuth install, listen; default `127.0.0.1:7470` |
 //// | `SLACK_APP_TOKEN` | `xapp-` token for Socket Mode; with both set, events are taken both ways. One app-level token serves every workspace the app is installed in |
-//// | `CRUSHLING_ALLOWED_USERS` | comma-separated Slack user ids who may use it, in the `SLACK_BOT_TOKEN` workspace; required with that token. A workspace's `allowed_users` setting in the store wins |
-//// | `CRUSHLING_ADMINS` | comma-separated Slack user ids who may approve tailnet access in that workspace; default everyone allowed. A workspace's `admins` setting in the store wins |
+//// | `CRUSHLING_ALLOWED_USERS` | comma-separated Slack user ids who may use it, in the `SLACK_BOT_TOKEN` workspace; required with that token. `*` (alone or among ids) means everyone in the workspace: full members only, checked with users.info and kept 10 minutes, so not guests, people from other workspaces in shared channels, bots or deactivated accounts. A workspace's `allowed_users` setting in the store wins, and takes `*` too |
+//// | `CRUSHLING_ADMINS` | comma-separated Slack user ids who may approve tailnet access in that workspace; `*` is refused. Default: the ids in `CRUSHLING_ALLOWED_USERS`, or nobody when that is `*`. A workspace's `admins` setting in the store wins |
 //// | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `CRUSHLING_PUBLIC_URL` | the OAuth install, on only when all three are set: `<public url>/slack/install` starts it and Slack returns to `<public url>/slack/oauth/callback` (add that redirect URL in the app's settings). Both are served on the events server. Until the app's public distribution is on, only its own workspace can install it |
 //// | `CRUSHLING_STORE_KEY` | 32 bytes, base64: the key bot tokens are encrypted with in the store, `<root>/crushling.db`. Unset, one is made at `<root>/store-key` (mode 0600), like `<root>/mcp-secret`; back it up, since stored tokens can't be read without it |
 //// | `CRUSHLING_HYPER_KEY` | required: the org's Charm Hyper API key; else `HYPER_API_KEY`, else `CRUSH_HYPER_API_KEY`. Agents use Hyper through the bridge's inference proxy at `/proxy/<thread>` and never see the key, nor the bridge's own `HYPER_*` settings |
@@ -62,7 +62,6 @@ import gleam/io
 import gleam/list
 import gleam/option
 import gleam/result
-import gleam/set
 import gleam/string
 import slackline
 import slackline/app
@@ -337,8 +336,17 @@ fn seed_env_team(
   case getenv("SLACK_BOT_TOKEN") {
     Error(Nil) -> Ok(option.None)
     Ok(bot_token) -> {
-      use allowed <- result.try(allowed_users())
-      let admins = instance.parse_users(setting("CRUSHLING_ADMINS", ""))
+      use #(allowed, admins) <- result.try(instance.env_people(
+        setting("CRUSHLING_ALLOWED_USERS", ""),
+        setting("CRUSHLING_ADMINS", ""),
+      ))
+      case allowed.everyone {
+        True ->
+          io.println(
+            "crushling: everyone in the workspace may use it (members only, no guests or other workspaces)",
+          )
+        False -> Nil
+      }
       use #(team, me) <- result.try(instance.seed(
         store,
         slackline.new(bot_token),
@@ -420,20 +428,6 @@ fn events_address(http: option.Option(Http)) -> #(String, Result(Int, String)) {
 
 @external(erlang, "crushling_signal", "install")
 fn install_sigterm(subject: process.Subject(Nil)) -> Result(Nil, String)
-
-fn allowed_users() -> Result(set.Set(String), String) {
-  let users =
-    setting("CRUSHLING_ALLOWED_USERS", "")
-    |> string.split(",")
-    |> list.map(string.trim)
-    |> list.filter(fn(user) { user != "" })
-  case users {
-    // An agent in YOLO mode that anyone in the workspace can drive is not a
-    // default worth having.
-    [] -> Error("CRUSHLING_ALLOWED_USERS is empty; list the Slack user ids")
-    users -> Ok(set.from_list(users))
-  }
-}
 
 /// A setting under its current name, else its old one.
 fn fallback(name: String, old: String, default: String) -> String {

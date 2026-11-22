@@ -4,6 +4,7 @@
 //// lasts; `sync` makes that so after every change.
 
 import crushling/meta.{type Card, type Grant}
+import crushling/people.{type People}
 import crushling/sys
 import crushling/tailscale
 import gleam/dict.{type Dict}
@@ -73,7 +74,9 @@ pub opaque type Tailnets {
   Tailnets(
     setup: Option(Setup),
     client: slackline.Client,
-    allowed: Set(String),
+    /// Who may press the buttons. Never everyone (see
+    /// `registry.approvers`), so no membership lookup is needed.
+    approvers: People,
     /// Send an event about a thread back after a delay in milliseconds.
     later: fn(String, Event, Int) -> Nil,
     links: Dict(String, Link),
@@ -108,13 +111,13 @@ pub type Outcome {
 pub fn new(
   setup: Option(Setup),
   client: slackline.Client,
-  allowed: Set(String),
+  approvers: People,
   later: fn(String, Event, Int) -> Nil,
 ) -> Tailnets {
   Tailnets(
     setup:,
     client:,
-    allowed:,
+    approvers:,
     later:,
     links: dict.new(),
     asking: set.new(),
@@ -199,7 +202,8 @@ fn pressed(
   card: Card,
 ) -> Outcome {
   let t = Tailnets(..t, asking: set.delete(t.asking, key))
-  case set.contains(t.allowed, user), thread, choice {
+  let approves = people.allows(t.approvers, user, fn(_) { False })
+  case approves, thread, choice {
     False, _, _ -> {
       let client = t.client
       process.spawn_unlinked(fn() {
