@@ -11,7 +11,7 @@ pub type Models {
   Models(large: String, small: String)
 }
 
-pub const default_large = "deepseek-v4.1-flash"
+pub const default_large = "prism"
 
 pub const default_small = "prism-flash"
 
