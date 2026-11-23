@@ -287,6 +287,8 @@ pub fn sink(
     },
     reply: open_reply,
     post: fn(markdown) { post(markdown, markdown_blocks(markdown)) },
+    post_blocks: post,
+    update_blocks: update,
     upload: fn(name, content) {
       case in_code_channel {
         // The Code tab shows the changes there.
@@ -585,13 +587,16 @@ pub type Command {
   /// `!tailnet` asks to put the sandbox on the tailnet; `!tailnet off`
   /// takes it off.
   TailnetCommand(on: Bool)
+  /// `!model` shows the model card; `!model <id> [level]` switches.
+  ModelCommand(argument: String)
   /// A `##` aside meant for the people in the thread, not the agent.
   SideComment
   NotACommand
 }
 
 pub fn command(prompt: String) -> Command {
-  case string.lowercase(string.trim(prompt)) {
+  let trimmed = string.trim(prompt)
+  case string.lowercase(trimmed) {
     "!stop" | "stop" | "cancel" | "stop!" -> StopCommand
     "!help" -> HelpCommand
     "!pause" -> PauseCommand
@@ -599,13 +604,16 @@ pub fn command(prompt: String) -> Command {
     "!done" | "!archive" -> DoneCommand
     "!tailnet" | "!tailscale" -> TailnetCommand(on: True)
     "!tailnet off" | "!tailscale off" -> TailnetCommand(on: False)
+    "!model" -> ModelCommand("")
+    // Model ids keep their case: take the argument from the original.
+    "!model " <> _ -> ModelCommand(string.trim(string.drop_start(trimmed, 7)))
     "##" <> _ -> SideComment
     _ -> NotACommand
   }
 }
 
 pub const help =
-  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
+  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• `!model` shows the model and lets you pick another and its reasoning; `!model <id> [level]` switches directly, and `!model default` goes back.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
 /// A file attached to a Slack message. `size` is what Slack says, if it
 /// says.

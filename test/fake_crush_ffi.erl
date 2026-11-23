@@ -12,6 +12,15 @@
 %%   refused           GET .../events answered 404 (the workspace is gone)
 %%   prompt            POST .../agent; Value is the run id
 %%   busy              GET .../agent/sessions/{id}
+%%   model             POST .../agent/sessions/{id}/model; Value is the
+%%                     selection, decoded
+%%   providers         GET .../providers
+%%
+%% Its catalog (GET .../providers) has three Hyper models: `alpha`, with
+%% effort levels, `beta`, which can only toggle thinking, and `broken`,
+%% which crush lists but can't build. The session runs `alpha` until a pin
+%% says otherwise; pinning `broken` or a model not in the catalog is
+%% refused, as crush does.
 %%
 %% `next/1` receives them.
 
@@ -80,7 +89,7 @@ next(TimeoutMs) ->
 %% The controller: the listening socket's owner and the fake's state.
 
 -record(ctl, {owner, listen, events = none, busy = true, exists = false,
-              expire = false}).
+              expire = false, pinned = none}).
 
 ctl_init(Owner, Path) ->
     {ok, Listen} = gen_tcp:listen(0, [binary, {ifaddr, {local, Path}},
@@ -169,8 +178,32 @@ route(S = #ctl{owner = Owner}, Method, Target, Headers, Body, From) ->
             {json(200, <<"{\"id\":\"", ?SESSION/binary, "\"}">>), S};
         {'GET', Session} ->
             Owner ! {fake_crush, busy, S#ctl.busy},
+            {Model, Cfg} = case S#ctl.pinned of
+                none -> {alpha(), <<"{}">>};
+                Pinned = #{<<"model">> := Id} ->
+                    {catalog_model(Id), json:encode(Pinned)}
+            end,
             {json(200, iolist_to_binary(["{\"is_busy\":",
-                                         atom_to_binary(S#ctl.busy), "}"])), S};
+                                         atom_to_binary(S#ctl.busy),
+                                         ",\"model\":", Model,
+                                         ",\"model_cfg\":", Cfg, "}"])), S};
+        {'GET', <<WS:(byte_size(WS))/binary, "/config">>} ->
+            {json(200, <<"{\"models\":{\"large\":{\"model\":\"alpha\",\"provider\":\"hyper\"}}}">>), S};
+        {'GET', <<WS:(byte_size(WS))/binary, "/providers">>} ->
+            Owner ! {fake_crush, providers, nil},
+            {json(200, iolist_to_binary([
+                "[{\"id\":\"openai\",\"models\":[]},",
+                "{\"id\":\"hyper\",\"models\":[", alpha(), ",", beta(),
+                ",{\"id\":\"broken\",\"name\":\"Broken\"}]}]"])), S};
+        {'POST', <<Session:(byte_size(Session))/binary, "/model">>} ->
+            #{<<"model">> := Selection} = json:decode(Body),
+            case catalog_model(maps:get(<<"model">>, Selection, <<>>)) of
+                none ->
+                    {json(400, <<"{\"message\":\"model is not available\"}">>), S};
+                _ ->
+                    Owner ! {fake_crush, model, Selection},
+                    {json(200, <<>>), S#ctl{pinned = Selection}}
+            end;
         {'POST', _} ->
             case binary:longest_common_suffix([Path, <<"/shell">>]) of
                 6 -> {json(200, <<"{\"output\":\"\",\"exit_code\":0}">>), S};
@@ -183,6 +216,23 @@ route(S = #ctl{owner = Owner}, Method, Target, Headers, Body, From) ->
     end.
 
 %% One process per connection, serving requests in turn.
+
+alpha() ->
+    <<"{\"id\":\"alpha\",\"name\":\"Alpha\",",
+      "\"pricing\":{\"input\":1,\"output\":2.5},",
+      "\"reasoning\":{\"thinking\":\"toggleable\",",
+      "\"default_effort_level\":\"high\",\"effort_levels\":[",
+      "{\"value\":\"low\",\"display\":\"Low\"},",
+      "{\"value\":\"high\",\"display\":\"High\"}]}}">>.
+
+beta() ->
+    <<"{\"id\":\"beta\",\"name\":\"Beta\",",
+      "\"pricing\":{\"input\":0.5,\"output\":1.5},",
+      "\"reasoning\":{\"thinking\":\"toggleable\"}}">>.
+
+catalog_model(<<"alpha">>) -> alpha();
+catalog_model(<<"beta">>) -> beta();
+catalog_model(_) -> none.
 
 accept(Ctl, Listen) ->
     case gen_tcp:accept(Listen) of

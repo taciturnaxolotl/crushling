@@ -26,10 +26,11 @@
 import crushling/crush/client
 import crushling/launcher.{type Launcher}
 import crushling/meta.{type Link, type Meta, Link, Meta}
+import crushling/models
 import crushling/people.{type People}
 import crushling/registry/entry.{
-  type Entry, Entry, Live, Starting, Stopping, already_read, is_quiet,
-  new as new_entry, tailnet_view,
+  type Entry, Entry, Live, Starting, Stopping, already_read, has_waiting,
+  is_quiet, new as new_entry, tailnet_view,
 }
 import crushling/registry/incoming.{type Incoming, Incoming, is_dm}
 import crushling/registry/links.{type Links}
@@ -141,6 +142,15 @@ pub type Message {
   Lookup(key: String, reply: Subject(Option(Subject(thread.Message))))
   /// Whether `user` is a member of the workspace, from lookup `id`.
   Member(user: String, id: Int, result: Result(Bool, String))
+  /// Someone picked on a thread's model card. `home` is the thread's
+  /// channel and ts; the card may be elsewhere, such as at the top of a
+  /// code channel.
+  ModelPicked(
+    home: #(String, String),
+    pick: models.Pick,
+    card: meta.Card,
+    user: String,
+  )
 }
 
 /// Something from a user whose membership is being looked up, waiting for
@@ -148,6 +158,12 @@ pub type Message {
 type Waiting {
   WaitingMessage(Incoming)
   WaitingStop(channel: String, thread_ts: String, user: String)
+  WaitingPick(
+    home: #(String, String),
+    pick: models.Pick,
+    card: meta.Card,
+    user: String,
+  )
 }
 
 type State {
@@ -348,6 +364,8 @@ fn member_known(
             WaitingMessage(incoming), None -> received(state, incoming, 0)
             WaitingStop(channel, thread_ts, user), None ->
               stop_requested(state, channel, thread_ts, user)
+            WaitingPick(home, pick, card, user), None ->
+              model_picked(state, home, pick, card, user)
           }
         })
       case result {
@@ -449,6 +467,11 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     }
     Member(user, id, result) ->
       actor.continue(member_known(state, user, id, result))
+    ModelPicked(home, pick, card, user) ->
+      case state.stopping {
+        Some(_) -> actor.continue(state)
+        None -> actor.continue(model_picked(state, home, pick, card, user))
+      }
   }
 }
 
@@ -764,10 +787,29 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
         "_<@" <> route.incoming.user <> "> took the sandbox off the tailnet._",
       )
       |> apply_tailnet(state, route.key, Some(entry), _)
+    slack.ModelCommand(argument), Some(entry) ->
+      case models.parse_argument(argument) {
+        Ok(request) ->
+          deliver(
+            state,
+            route.key,
+            entry,
+            thread.ModelCommand(request, route.incoming.user),
+          )
+        Error(Nil) -> {
+          whisper(
+            config,
+            route.incoming,
+            "_`!model` shows the model; `!model <id> [level]` switches, and `!model default` goes back to the default._",
+          )
+          state
+        }
+      }
     slack.PauseCommand, None
     | slack.ResumeCommand, None
     | slack.DoneCommand, None
     | slack.TailnetCommand(..), None
+    | slack.ModelCommand(..), None
     -> {
       whisper(config, route.incoming, "_I'm not working in this thread._")
       state
@@ -803,6 +845,76 @@ fn queue(state: State, route: Route, known: Option(Entry)) -> State {
         )
       launch(state, route.key, entry)
     }
+  }
+}
+
+/// Hand the thread actor a message: now if its agent is up, once it is if
+/// it is starting or stopping, and after waking it if it is asleep.
+fn deliver(
+  state: State,
+  key: String,
+  entry: Entry,
+  message: thread.Message,
+) -> State {
+  case dict.has_key(state.threads, key), entry.agent {
+    True, Live(thread:, ..) -> {
+      process.send(thread, message)
+      state
+    }
+    True, _ -> {
+      let entry = Entry(..entry, pending: list.append(entry.pending, [message]))
+      State(..state, threads: dict.insert(state.threads, key, entry))
+    }
+    False, _ -> launch(state, key, Entry(..entry, pending: [message]))
+  }
+}
+
+/// A pick on a model card. Slack already shows the pick in the menu, so a
+/// refusal is said privately to whoever picked.
+fn model_picked(
+  state: State,
+  home: #(String, String),
+  pick: models.Pick,
+  card: meta.Card,
+  user: String,
+) -> State {
+  let #(channel, thread_ts) = home
+  let key = key(state.config.team, channel, thread_ts)
+  let refuse = fn(text) {
+    let client = state.config.client
+    process.spawn_unlinked(fn() {
+      slack.whisper(client, card.channel, card.thread_ts, user, text)
+    })
+    state
+  }
+  case may_use(state, user), unknown(state, user) {
+    // Everyone may use it, but is this a member? Ask, then come back.
+    False, True ->
+      wait_for_member(state, user, WaitingPick(home, pick, card, user))
+    False, False -> refuse("_you can't change this thread's model._")
+    True, _ ->
+      case entry_for(state, key, channel, thread_ts) {
+        Ok(Some(entry)) ->
+          deliver(state, key, entry, thread.CardPicked(pick, card.ts, user))
+        _ -> refuse("_I'm not working in that thread anymore._")
+      }
+  }
+}
+
+/// Change a thread's meta, from its entry in memory or, for a thread whose
+/// agent was stopped meanwhile, its row in the store.
+fn update_meta(state: State, key: String, change: fn(Meta) -> Meta) -> State {
+  let entry = case dict.get(state.threads, key) {
+    Ok(entry) -> Some(entry)
+    Error(Nil) ->
+      saved_thread(state.config, key)
+      |> option.map(fn(saved) {
+        new_entry(saved.channel, saved.thread_ts, saved.meta)
+      })
+  }
+  case entry {
+    Some(entry) -> set_meta(state, key, entry, change(entry.meta))
+    None -> state
   }
 }
 
@@ -905,6 +1017,8 @@ fn launch(state: State, key: String, entry: Entry) -> State {
           mode: config.mode,
           notify: fn(notice) { process.send(self, FromThread(key, notice)) },
           on_connect: fn(_) { Nil },
+          model: meta.model,
+          home: #(channel, thread_ts),
         ),
       )
       |> result.map_error(fn(error) { "thread: " <> string.inspect(error) })
@@ -951,9 +1065,20 @@ fn started(
         Ok(thread) -> {
           let assert Ok(pid) = process.subject_owner(thread)
           let monitor = process.monitor(pid)
-          let entry = Entry(..entry, agent: Live(thread:, monitor:))
+          list.each(entry.pending, process.send(thread, _))
+          let entry =
+            Entry(..entry, agent: Live(thread:, monitor:), pending: [])
           State(..state, threads: dict.insert(state.threads, key, entry))
           |> pump(key)
+          // Not every launch brings a prompt (`!model` wakes a thread too),
+          // so start the idle timer; a prompt being prepared keeps it from
+          // firing.
+          |> fn(state) {
+            case dict.get(state.threads, key) {
+              Ok(entry) -> idle_soon(state, key, entry)
+              Error(Nil) -> state
+            }
+          }
           |> fn(state) {
             tailnet.check(state.tailnets, key, tailnet_view(entry), None)
             |> apply_tailnet(state, key, Some(entry), _)
@@ -1170,8 +1295,8 @@ fn done_shutting_down(
 fn stopped(state: State, key: String, result: Result(Nil, String)) -> State {
   case dict.get(state.threads, key), result {
     Ok(Entry(agent: Stopping(..), ..) as entry), Ok(Nil) ->
-      case entry.backlog, state.finishing {
-        [_, ..], False ->
+      case has_waiting(entry), state.finishing {
+        True, False ->
           launch(
             state,
             key,
@@ -1258,6 +1383,10 @@ fn from_thread(state: State, key: String, notice: thread.Notice) -> State {
     }
     thread.Activity(busy:), Ok(entry) ->
       idle_soon(state, key, Entry(..entry, working: busy))
+    // The agent may have been stopped while it switched: the choice still
+    // counts.
+    thread.ModelChosen(choice), _ ->
+      update_meta(state, key, fn(meta) { Meta(..meta, model: choice) })
     _, Error(Nil) -> state
   }
 }

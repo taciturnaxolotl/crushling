@@ -1,6 +1,7 @@
 //// Socket Mode: one WebSocket to Slack, reopened whenever Slack asks or the
 //// connection drops, with every event turned into a `msg.Incoming`.
 
+import crushling/models
 import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/registry/tailnet
@@ -77,6 +78,7 @@ pub fn router(base: app.App, find: Find) -> app.App {
     }
   })
   |> tailnet_buttons(find)
+  |> model_menus(find)
 }
 
 /// The installation an event was delivered to: its `authorizations` name
@@ -165,6 +167,49 @@ pub fn pressed(
     registry.key(team, channel, thread_ts),
     tailnet.Pressed(choice:, channel:, thread_ts:, user:, card:),
   )
+}
+
+/// The menus on a `!model` card. The thread does the switching; Slack only
+/// needs to hear that the pick arrived.
+fn model_menus(app: app.App, find: Find) -> app.App {
+  use app, action_id <- list.fold(
+    [models.model_action, models.reasoning_action],
+    app,
+  )
+  use action, payload <- app.action(app, action_id)
+  let team = option.map(payload.team, fn(team) { team.id })
+  let enterprise = option.map(payload.enterprise, fn(org) { org.id })
+  case target(find, team, enterprise), picked(action, payload) {
+    Ok(Target(registry:, ..)), Ok(message) -> process.send(registry, message)
+    _, _ -> Nil
+  }
+  app.ack()
+}
+
+/// A pick on a model card, as a registry message. The card's block id names
+/// the thread it belongs to, which may not be where the card is (a code
+/// channel's card sits at the top of the channel).
+pub fn picked(
+  action: interaction.BlockAction,
+  payload: interaction.BlockActionsPayload,
+) -> Result(registry.Message, Nil) {
+  use #(action_id, block_id, value) <- result.try(case action {
+    interaction.StaticSelectAction(
+      action_id:,
+      block_id: Some(block_id),
+      selected_option: Some(option),
+      ..,
+    ) -> Ok(#(action_id, block_id, option.value))
+    _ -> Error(Nil)
+  })
+  use home <- result.try(models.read_block_id(block_id))
+  use pick <- result.try(models.read_pick(action_id, value))
+  use card <- result.map(case payload.container {
+    Some(interaction.MessageContainer(message_ts:, channel_id:, thread_ts:, ..)) ->
+      tailnet.card(channel_id, message_ts, thread_ts)
+    _ -> Error(Nil)
+  })
+  registry.ModelPicked(home:, pick:, card:, user: payload.user.id)
 }
 
 /// The messages worth routing: mentions, thread replies, direct messages,

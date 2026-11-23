@@ -38,6 +38,9 @@ pub type Entry {
     summary_ts: String,
     /// True while the thread says it is busy.
     working: Bool,
+    /// Messages for the thread actor that came while its agent was asleep
+    /// or starting, sent once it is live.
+    pending: List(thread.Message),
   )
 }
 
@@ -53,6 +56,7 @@ pub fn new(channel: String, thread_ts: String, meta: Meta) -> Entry {
     preparing: False,
     summary_ts: "",
     working: False,
+    pending: [],
   )
 }
 
@@ -66,11 +70,17 @@ pub fn already_read(known: Option(Entry), ts: String) -> Bool {
   }
 }
 
+/// True when something waits for the agent: messages to prepare, or
+/// messages for the thread actor that came while it wasn't up.
+pub fn has_waiting(entry: Entry) -> Bool {
+  entry.backlog != [] || entry.pending != []
+}
+
 /// True when the thread is idle and nothing is waiting for it.
 pub fn is_quiet(entry: Entry) -> Bool {
   entry.in_flight == 0
   && !entry.preparing
-  && entry.backlog == []
+  && !has_waiting(entry)
   && !entry.working
 }
 

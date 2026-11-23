@@ -129,6 +129,10 @@ pub fn threads_and_links_test() {
         until_ms: 1_800_000_000_000,
         card: meta.Card("C9", "2.0", "1.0"),
       )),
+      model: Some(meta.ModelChoice(
+        model: "kimi-k3",
+        reasoning: meta.Effort("high"),
+      )),
     )
   let assert Ok(None) = store.thread(s, "T1-C9-1.0")
   let assert Ok(Nil) =

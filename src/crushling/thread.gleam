@@ -15,12 +15,15 @@
 import crushling/crush/client
 import crushling/crush/event
 import crushling/gun
+import crushling/meta.{type ModelChoice}
+import crushling/models
 import crushling/render
 import crushling/run.{type Run}
 import crushling/sink.{type Reply, type Sink}
 import crushling/snapshot
 import crushling/sys
 import crushling/thread/conn.{type Connection}
+import crushling/thread/model
 import crushling/thread/repo
 import crushling/thread/resume
 import crushling/thread/subagents.{type Subagents}
@@ -65,6 +68,10 @@ pub type Notice {
   /// opened, so the registry can skip the copy of the request that Slack posts
   /// there. Otherwise it is "".
   Moved(venue: Venue, opened_ts: String)
+  /// The thread's model choice changed: `Some` for a model someone picked,
+  /// `None` for the default. The registry saves it, so a new actor for the
+  /// thread starts with it.
+  ModelChosen(choice: Option(ModelChoice))
 }
 
 pub type Config {
@@ -85,6 +92,11 @@ pub type Config {
     /// Called with the event stream's connection each time it attaches. Tests
     /// use it to drop the connection; elsewhere it does nothing.
     on_connect: fn(gun.Conn) -> Nil,
+    /// The model picked for the thread, if any. crush keeps a session's model
+    /// only in memory, so it is pinned again on every connect.
+    model: Option(ModelChoice),
+    /// The thread's own channel and ts, for its `!model` cards.
+    home: #(String, String),
   )
 }
 
@@ -119,6 +131,10 @@ pub type Message {
   Watchdog
   Reconnect
   Gun(gun.Message)
+  /// `!model`, with or without a model to switch to.
+  ModelCommand(request: models.Request, user: String)
+  /// Someone picked on the card posted as `card_ts`.
+  CardPicked(pick: models.Pick, card_ts: String, user: String)
 }
 
 type Queued {
@@ -179,6 +195,10 @@ type State {
     titled: Bool,
     /// The busy state last sent to the registry.
     reported_busy: Bool,
+    /// The model picked for the thread, pinned on every connect.
+    model: Option(ModelChoice),
+    /// The connected server's model catalog, once fetched.
+    catalog: Option(List(models.Model)),
   )
 }
 
@@ -242,6 +262,8 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       retries: 0,
       titled: False,
       reported_busy: False,
+      model: config.model,
+      catalog: None,
     )
     |> actor.initialised
     |> actor.selecting(selector)
@@ -299,6 +321,10 @@ fn step(state: State, message: Message) -> State {
     Flush -> flush(State(..state, flushing: False))
     Watchdog -> watchdog(state)
     Gun(message) -> on_gun(state, message)
+    ModelCommand(request, user) ->
+      with_model(state, model.command(_, request, user))
+    CardPicked(pick, card_ts, user) ->
+      with_model(state, model.pick(_, pick, card_ts, user))
     Stop -> state
   }
 }
@@ -367,6 +393,15 @@ fn connect(state: State) -> State {
   case conn.open(state.target, state.session_id, resume) {
     Ok(connection) -> {
       state.config.on_connect(connection.events)
+      // Reaching a server that may be new (the workspace wasn't still on
+      // it), the catalog may differ and any pin is gone: pin the thread's
+      // choice again. The same server still has both.
+      let state = case connection.reused {
+        True -> State(..state, connection: Some(connection))
+        False ->
+          State(..state, connection: Some(connection), catalog: None)
+          |> with_model(model.restore(_, state.model))
+      }
       let state =
         State(
           ..state,
@@ -415,6 +450,27 @@ fn settle_orphan(state: State, connection: Connection) -> State {
         }
       }
   }
+}
+
+// Models ----------------------------------------------------------------------
+
+/// Run a `thread/model` step on the connection, then keep what it found and
+/// tell the registry about a changed choice.
+fn with_model(state: State, step: fn(model.Context) -> model.Done) -> State {
+  let done =
+    model.run(
+      state.connection,
+      state.sink,
+      state.config.home,
+      state.catalog,
+      step,
+    )
+  let choice = model.apply(done.change, state.model)
+  case choice == state.model {
+    True -> Nil
+    False -> state.config.notify(ModelChosen(choice))
+  }
+  State(..state, catalog: done.catalog, model: choice)
 }
 
 fn fail_everything(state: State, reason: String) -> State {

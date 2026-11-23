@@ -29,7 +29,56 @@ pub type Meta {
     venue: Venue,
     /// Tailnet access someone allowed, while it lasts.
     tailnet: Option(Grant),
+    /// The model someone picked with `!model`, applied to the agent's
+    /// session every time it connects. None runs the bridge's default.
+    model: Option(ModelChoice),
   )
+}
+
+/// A Hyper model id and how it should reason.
+pub type ModelChoice {
+  ModelChoice(model: String, reasoning: Reasoning)
+}
+
+/// How a model reasons, as picked. Which of these a model takes depends on
+/// the model: effort levels, a thinking toggle, or neither.
+pub type Reasoning {
+  /// Whatever crush does when nothing is picked: the model's default effort
+  /// level, and thinking off.
+  DefaultReasoning
+  Effort(level: String)
+  Thinking(on: Bool)
+}
+
+pub fn model_choice_to_json(choice: ModelChoice) -> json.Json {
+  json.object([
+    #("model", json.string(choice.model)),
+    ..case choice.reasoning {
+      DefaultReasoning -> []
+      Effort(level) -> [#("effort", json.string(level))]
+      Thinking(on) -> [#("think", json.bool(on))]
+    }
+  ])
+}
+
+pub fn model_choice_decoder() -> decode.Decoder(ModelChoice) {
+  use model <- decode.field("model", decode.string)
+  use effort <- decode.optional_field(
+    "effort",
+    None,
+    decode.map(decode.string, Some),
+  )
+  use think <- decode.optional_field(
+    "think",
+    None,
+    decode.map(decode.bool, Some),
+  )
+  let reasoning = case effort, think {
+    Some(""), _ | None, None -> DefaultReasoning
+    Some(level), _ -> Effort(level)
+    None, Some(on) -> Thinking(on)
+  }
+  decode.success(ModelChoice(model:, reasoning:))
 }
 
 /// Tailnet access someone allowed: until when, in milliseconds since the
@@ -44,7 +93,14 @@ pub type Card {
 }
 
 pub fn new(follow: Bool) -> Meta {
-  Meta(follow:, paused: False, cursor: "", venue: venue.Thread, tailnet: None)
+  Meta(
+    follow:,
+    paused: False,
+    cursor: "",
+    venue: venue.Thread,
+    tailnet: None,
+    model: None,
+  )
 }
 
 /// Where a code channel came from: the thread that opened it, and when.
@@ -100,6 +156,7 @@ pub fn read(path: String) -> Result(Meta, Nil) {
       cursor:,
       venue: legacy_venue(stored, code_channel, repo),
       tailnet:,
+      model: None,
     ))
   })
   |> result.replace_error(Nil)

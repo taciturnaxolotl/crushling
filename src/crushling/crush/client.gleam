@@ -3,6 +3,7 @@
 //// server, and `perform` runs one over a `gun` connection.
 
 import crushling/gun
+import crushling/meta.{type ModelChoice, DefaultReasoning, Effort, Thinking}
 import gleam/bit_array
 import gleam/dynamic/decode.{type Decoder}
 import gleam/http.{type Method, Delete, Get, Post}
@@ -299,6 +300,51 @@ pub fn session_busy(workspace_id: String, session_id: String) -> Call(Bool) {
   let decoder =
     decode.optional_field("is_busy", False, decode.bool, decode.success)
   Call(Get, session(workspace_id, session_id), None, 200, parse_with(decoder))
+}
+
+/// The session as raw JSON: the model it runs on (`model`, a catwalk model)
+/// and how it was picked (`model_cfg`). `crushling/models` reads it.
+pub fn session_info(workspace_id: String, session_id: String) -> Call(String) {
+  Call(Get, session(workspace_id, session_id), None, 200, Ok)
+}
+
+/// The providers crush knows, with their model catalogs, as raw JSON.
+pub fn providers(workspace_id: String) -> Call(String) {
+  Call(Get, workspace(workspace_id) <> "/providers", None, 200, Ok)
+}
+
+/// The workspace's resolved config as raw JSON; `models.large` is what a
+/// session runs when nothing is pinned.
+pub fn workspace_config(workspace_id: String) -> Call(String) {
+  Call(Get, workspace(workspace_id) <> "/config", None, 200, Ok)
+}
+
+/// Pin a session to a model and its reasoning from its next turn on. crush
+/// refuses a model it can't build; callers check `reasoning` suits the
+/// model first.
+pub fn set_session_model(
+  workspace_id workspace_id: String,
+  session_id session_id: String,
+  provider provider: String,
+  choice choice: ModelChoice,
+) -> Call(Nil) {
+  let selection =
+    json.object([
+      #("provider", json.string(provider)),
+      #("model", json.string(choice.model)),
+      ..case choice.reasoning {
+        DefaultReasoning -> []
+        Effort(level) -> [#("reasoning_effort", json.string(level))]
+        Thinking(on) -> [#("think", json.bool(on))]
+      }
+    ])
+  Call(
+    Post,
+    session(workspace_id, session_id) <> "/model",
+    Some(json.object([#("model", selection)])),
+    200,
+    ignore_body,
+  )
 }
 
 /// Run a shell command in the workspace directory, on the server's side of

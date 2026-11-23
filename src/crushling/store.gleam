@@ -104,6 +104,8 @@ const migrations = [
     PRIMARY KEY (team_id, channel)
   );
   CREATE TABLE bridge (name TEXT PRIMARY KEY, value TEXT NOT NULL);",
+  // The model picked with `!model`, as JSON, or NULL for the default.
+  "ALTER TABLE threads ADD COLUMN model TEXT;",
 ]
 
 /// The schema version this code writes.
@@ -504,8 +506,8 @@ fn write_thread(
   let Thread(key:, team:, channel:, thread_ts:, meta:) = thread
   exec(connection, verb <> " INTO threads
        (key, team_id, channel, thread_ts, follow, paused, cursor, venue,
-        tailnet, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        tailnet, model, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
     sqlight.text(key),
     sqlight.text(team),
     sqlight.text(channel),
@@ -518,6 +520,12 @@ fn write_thread(
       sqlight.text,
       option.map(meta.tailnet, fn(grant) {
         json.to_string(meta.grant_to_json(grant))
+      }),
+    ),
+    sqlight.nullable(
+      sqlight.text,
+      option.map(meta.model, fn(choice) {
+        json.to_string(meta.model_choice_to_json(choice))
       }),
     ),
     sqlight.int(now_seconds()),
@@ -534,18 +542,23 @@ fn thread_decoder() -> decode.Decoder(Thread) {
   use cursor <- decode.field(6, decode.string)
   use venue_json <- decode.field(7, decode.string)
   use tailnet_json <- decode.field(8, decode.optional(decode.string))
+  use model_json <- decode.field(9, decode.optional(decode.string))
   let venue =
     json.parse(venue_json, venue.decoder()) |> result.unwrap(venue.Thread)
   let tailnet =
     option.then(tailnet_json, fn(text) {
       json.parse(text, meta.grant_decoder()) |> option.from_result
     })
+  let model =
+    option.then(model_json, fn(text) {
+      json.parse(text, meta.model_choice_decoder()) |> option.from_result
+    })
   decode.success(Thread(
     key:,
     team:,
     channel:,
     thread_ts:,
-    meta: Meta(follow:, paused:, cursor:, venue:, tailnet:),
+    meta: Meta(follow:, paused:, cursor:, venue:, tailnet:, model:),
   ))
 }
 
@@ -561,7 +574,7 @@ fn read_thread(
   query(
     connection,
     "SELECT key, team_id, channel, thread_ts, follow, paused, cursor, venue,
-       tailnet FROM threads WHERE key = ?",
+       tailnet, model FROM threads WHERE key = ?",
     [sqlight.text(key)],
     thread_decoder(),
   )

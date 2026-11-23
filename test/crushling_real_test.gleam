@@ -281,6 +281,8 @@ fn sink(calls: Subject(Call)) -> sink.Sink {
       Ok(Nil)
     },
     post: progress,
+    post_blocks: fn(text, _) { progress(text) },
+    update_blocks: fn(_, _, _) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
     branch: fn(_, _) { Error("no branches in this test") },
     open_code_channel: fn(_) { Error("no code channels in this test") },
@@ -315,17 +317,21 @@ fn start_observed(
 ) -> #(Subject(thread.Message), Subject(Call)) {
   let calls = process.new_subject()
   let assert Ok(t) =
-    thread.start(thread.Config(
-      socket: env.socket,
-      root: env.work,
-      title: "crushling real test",
-      venue: venue.Thread,
-      sink: sink(calls),
-      flush_ms: 250,
-      mode: client.Sysadmin,
-      notify: on_finished(fn(finished) { process.send(calls, Done(finished)) }),
-      on_connect:,
-    ))
+    thread.start(
+      thread.Config(
+        socket: env.socket,
+        root: env.work,
+        title: "crushling real test",
+        venue: venue.Thread,
+        sink: sink(calls),
+        flush_ms: 250,
+        mode: client.Sysadmin,
+        notify: on_finished(fn(finished) { process.send(calls, Done(finished)) }),
+        on_connect:,
+        model: None,
+        home: #("C", "1.0"),
+      ),
+    )
   #(t, calls)
 }
 
@@ -721,6 +727,8 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> sink.Sink {
     reply: fn(_) { fake_reply(post, fn(_) { Nil }) },
     update_plan: fn(_, _) { Ok(Nil) },
     post:,
+    post_blocks: fn(text, _) { post(text) },
+    update_blocks: fn(_, _, _) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
     branch: fn(intro, title) {
       process.send(calls, Branched(intro, title))
@@ -753,6 +761,8 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
           process.send(calls, MainFinished(finished.solicited))
         }),
         on_connect: fn(_) { Nil },
+        model: None,
+        home: #("C", "1.0"),
       ),
     )
   process.send(
@@ -848,6 +858,8 @@ fn code_sink(
     reply: fn(_) { fake_reply(post, fn(_) { Nil }) },
     update_plan: fn(_, _) { Ok(Nil) },
     post:,
+    post_blocks: fn(text, _) { post(text) },
+    update_blocks: fn(_, _, _) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
     branch: fn(_, _) { Error("no branches in this test") },
     open_code_channel: fn(name) {
@@ -908,6 +920,8 @@ fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
           process.send(calls, CodeFinished(finished.changes, finished.patch))
         }),
         on_connect: fn(_) { Nil },
+        model: None,
+        home: #("C", "1.0"),
       ),
     )
   process.send(

@@ -142,6 +142,8 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
       working: fn(_) { Nil },
       title: fn(_) { Nil },
       post:,
+      post_blocks: fn(text, _) { post(text) },
+      update_blocks: fn(_, _, _) { Ok(Nil) },
       post_plan: fn(plan) { post(render.plan_markdown(plan)) },
       update_plan: fn(_, _) { Ok(Nil) },
       reply: fn(_) {
@@ -173,6 +175,8 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
           }
         },
         on_connect: fn(_) { Nil },
+        model: None,
+        home: #("C", "1.0"),
       ),
     )
   #(server, t, seen)

@@ -21,6 +21,9 @@ pub type Connection {
     /// Whether the event stream was opened with a `Last-Event-ID`. The
     /// server then replays what was missed, or starts with a resync event.
     resumed: Bool,
+    /// Whether the workspace joined before was still on the server: the
+    /// same server, with everything it held in memory.
+    reused: Bool,
   )
 }
 
@@ -119,6 +122,7 @@ pub fn open(
       workspace_id:,
       session_id: "",
       resumed: option.is_some(resume.last_event_id),
+      reused:,
     )
   let session = case reused, session_id {
     True, Some(id) -> Ok(id)
