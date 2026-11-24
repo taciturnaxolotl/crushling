@@ -307,7 +307,8 @@ pub fn answer_and_note_test() {
   let assert Some("_no reply._") =
     render.note(feed([done("", "", False)]), False)
   let assert None = render.note(feed([done("hi", "", False)]), True)
-  let assert Some("_stopped._") = render.note(feed([done("", "", True)]), True)
+  // Whoever stopped a run knows; it gets no note.
+  let assert None = render.note(feed([done("", "", True)]), True)
   let assert Some(limited) =
     render.note(feed([done("", "429 rate_limit_error", False)]), False)
   let assert True =

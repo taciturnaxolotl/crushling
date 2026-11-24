@@ -120,12 +120,18 @@ pub fn show(subs: Subagents, parent: Parent) -> Subagents {
 }
 
 /// When a run is cancelled, its subagents stop too. Post `note` in each of
-/// their threads.
+/// their threads, unless it is "".
 pub fn close(subs: Subagents, note: String) -> Nil {
   dict.each(subs.by_call, fn(_, sub) {
     case sub.done, sub.thread {
       False, Some(thread) -> {
-        let _ = thread.post(note)
+        case note {
+          "" -> Nil
+          note -> {
+            let _ = thread.post(note)
+            Nil
+          }
+        }
         thread.working(False)
       }
       _, _ -> Nil

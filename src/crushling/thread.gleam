@@ -280,7 +280,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     Stop -> {
       case state.active {
         Some(active) -> {
-          close_reply(state.sink, state.config.root, active, "_stopped._")
+          close_reply(state.sink, state.config.root, active, "")
           state.sink.working(False)
         }
         None -> Nil
@@ -354,7 +354,7 @@ fn parent(state: State) -> subagents.Parent {
 fn cancel(state: State, note: Option(String)) -> State {
   subagents.close(state.subs, case note {
     Some(note) -> "_" <> note <> "_"
-    None -> "_stopped._"
+    None -> ""
   })
   case state.connection, state.active {
     Some(connection), Some(active) -> {

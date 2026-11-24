@@ -215,11 +215,11 @@ pub fn answer(run: Run) -> List(String) {
 }
 
 /// A closing note, when the run didn't simply finish. `answered` is whether
-/// any of the answer was posted.
+/// any of the answer was posted. A run someone stopped gets none: they know.
 pub fn note(run: Run, answered: Bool) -> Option(String) {
   let did_work = run.tools != []
   case run.outcome {
-    Some(run.Cancelled) -> Some("_stopped._")
+    Some(run.Cancelled) -> None
     Some(run.Errored(reason)) -> {
       let #(cause, advice) = explain(reason)
       let where = case answered, did_work {
