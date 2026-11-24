@@ -13,10 +13,7 @@ import gleam/bool
 import gleam/erlang/process
 import gleam/float
 import gleam/http
-import gleam/http/request
-import gleam/httpc as gleam_httpc
 import gleam/int
-import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -41,6 +38,7 @@ import slackline/api/files/complete_upload_external
 import slackline/block
 import slackline/file
 import slackline/httpc
+import slackline/interaction
 import slackline/message
 import slackline/stream
 import slackline/stream/httpc as reply
@@ -526,25 +524,14 @@ pub fn whisper(
 /// Replace the ephemeral message an interaction came from, through its
 /// `response_url`, with `text`.
 pub fn replace_ephemeral(response_url: String, text: String) -> Nil {
-  case request.to(response_url) {
-    Ok(req) -> {
-      let body =
-        json.object([
-          #("replace_original", json.bool(True)),
-          #("response_type", json.string("ephemeral")),
-          #("text", json.string(text)),
-        ])
-        |> json.to_string
-      let _ =
-        req
-        |> request.set_method(http.Post)
-        |> request.set_header("content-type", "application/json")
-        |> request.set_body(body)
-        |> gleam_httpc.send
-      Nil
-    }
-    Error(Nil) -> Nil
-  }
+  let message =
+    interaction.ResponseMessage(
+      ..interaction.ephemeral(text),
+      replace_original: Some(True),
+    )
+  let _ =
+    httpc.webhook(response_url, interaction.response_message_to_json(message))
+  Nil
 }
 
 /// `whisper`, with blocks; `text` is the fallback for notifications.
