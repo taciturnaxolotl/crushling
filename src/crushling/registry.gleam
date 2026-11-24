@@ -142,6 +142,9 @@ pub type Message {
   Lookup(key: String, reply: Subject(Option(Subject(thread.Message))))
   /// Whether `user` is a member of the workspace, from lookup `id`.
   Member(user: String, id: Int, result: Result(Bool, String))
+  /// The thread didn't count its jobs for the idle check of `generation` in
+  /// time.
+  JobsUncounted(key: String, generation: Int)
   /// Someone picked on a thread's model card. `home` is the thread's
   /// channel and ts; the card may be elsewhere, such as at the top of a
   /// code channel.
@@ -456,6 +459,18 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     }
     IdleCheck(key, generation) ->
       actor.continue(idle_check(state, key, generation))
+    JobsUncounted(key, generation) ->
+      case dict.get(state.threads, key) {
+        Ok(Entry(counting: True, ..) as entry)
+          if entry.generation == generation && entry.agent != Starting
+        -> {
+          sys.warn(
+            "crushling: " <> key <> " didn't count its background jobs in time",
+          )
+          actor.continue(jobs_counted(state, key, entry, generation, 0))
+        }
+        _ -> actor.continue(state)
+      }
     ThreadDown(down) -> actor.continue(thread_down(state, down))
     Tailnet(key, event) -> actor.continue(on_tailnet(state, key, event))
     Lookup(key, reply) -> {
@@ -1383,6 +1398,8 @@ fn from_thread(state: State, key: String, notice: thread.Notice) -> State {
     }
     thread.Activity(busy:), Ok(entry) ->
       idle_soon(state, key, Entry(..entry, working: busy))
+    thread.JobsRunning(generation:, running:), Ok(entry) ->
+      jobs_counted(state, key, entry, generation, running)
     // The agent may have been stopped while it switched: the choice still
     // counts.
     thread.ModelChosen(choice), _ ->
@@ -1406,24 +1423,94 @@ fn idle_soon(state: State, key: String, entry: Entry) -> State {
     }
     False -> Nil
   }
-  let entry = Entry(..entry, generation:)
+  // Work since the last check starts the job hold over.
+  let held_since = case is_quiet(entry) {
+    True -> entry.held_since
+    False -> None
+  }
+  let entry = Entry(..entry, generation:, held_since:)
   State(..state, generation:, threads: dict.insert(state.threads, key, entry))
 }
 
+/// A quiet thread's idle time is up. Its agent may still have background
+/// jobs running (a build, a server, a login waiting on someone), which crush
+/// doesn't count as busy: ask the thread, and decide in `jobs_counted`.
 fn idle_check(state: State, key: String, generation: Int) -> State {
   case dict.get(state.threads, key) {
-    Ok(Entry(agent: Live(..), ..) as entry) if entry.generation == generation ->
+    Ok(Entry(agent: Live(thread:, ..), ..) as entry)
+      if entry.generation == generation
+    ->
       case is_quiet(entry) {
         False -> state
         True -> {
-          sys.info("crushling: " <> key <> " is idle; stopping its agent")
-          // A code channel stays open: going quiet isn't the work being
-          // done. `!done` archives it.
-          stop_agent(state, key)
+          process.send(thread, thread.CountJobs(generation))
+          // A thread busy on a slow call answers late; a wedged one never
+          // does, and mustn't keep its sandbox for it.
+          process.send_after(
+            state.self,
+            job_count_timeout_ms,
+            JobsUncounted(key, generation),
+          )
+          let entry = Entry(..entry, counting: True)
+          State(..state, threads: dict.insert(state.threads, key, entry))
         }
       }
     _ -> state
   }
+}
+
+/// The longest a quiet thread's agent is kept for its background jobs, so a
+/// forgotten dev server can't hold a sandbox forever.
+const max_job_hold_ms = 7_200_000
+
+/// How long the thread gets to count its jobs before the idle stop goes ahead
+/// without the count.
+const job_count_timeout_ms = 30_000
+
+/// The thread counted its running background jobs for the idle check of
+/// `generation`. None: stop the agent. Some: keep it and check again later,
+/// up to `max_job_hold_ms` from the first time.
+fn jobs_counted(
+  state: State,
+  key: String,
+  entry: Entry,
+  generation: Int,
+  running: Int,
+) -> State {
+  let entry = Entry(..entry, counting: False)
+  let state = State(..state, threads: dict.insert(state.threads, key, entry))
+  let now = sys.monotonic_ms()
+  let held_since = option.unwrap(entry.held_since, now)
+  case entry.generation == generation && is_quiet(entry), running {
+    // Something happened since the check: its own idle timer decides.
+    False, _ -> state
+    True, 0 -> stop_idle(state, key, "is idle")
+    True, _ if now - held_since >= max_job_hold_ms ->
+      stop_idle(state, key, "has been idle with background jobs too long")
+    True, _ -> {
+      sys.info(
+        "crushling: "
+        <> key
+        <> " is idle but has "
+        <> int.to_string(running)
+        <> " background jobs running; keeping its agent",
+      )
+      process.send_after(
+        state.self,
+        state.config.idle_ms,
+        IdleCheck(key, generation),
+      )
+      let entry = Entry(..entry, held_since: Some(held_since))
+      State(..state, threads: dict.insert(state.threads, key, entry))
+    }
+  }
+}
+
+fn stop_idle(state: State, key: String, why: String) -> State {
+  sys.info("crushling: " <> key <> " " <> why <> "; stopping its agent")
+  // A code channel stays open: going quiet isn't the work being done.
+  // `!done` archives it.
+  stop_agent(state, key)
 }
 
 /// Save the thread's new venue. For a new code channel, also link the channel

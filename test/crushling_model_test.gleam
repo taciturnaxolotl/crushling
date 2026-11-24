@@ -379,6 +379,9 @@ fn start_server(path: String) -> Server
 @external(erlang, "fake_crush_ffi", "stop")
 fn stop_server(server: Server) -> Nil
 
+@external(erlang, "fake_crush_ffi", "set_jobs")
+fn set_jobs(server: Server, jobs: Int) -> Nil
+
 @external(erlang, "fake_crush_ffi", "next")
 fn next_request(timeout_ms: Int) -> Result(#(String, dynamic.Dynamic), Nil)
 
@@ -674,8 +677,17 @@ type Launch {
 
 const test_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 
-pub fn a_thread_woken_for_model_goes_back_to_sleep_test() {
-  let socket = socket_path("wake")
+/// Drop what earlier tests' fakes said: tests share one mailbox.
+fn drain() -> Nil {
+  case next_request(0) {
+    Ok(_) -> drain()
+    Error(Nil) -> Nil
+  }
+}
+
+fn start_woken_registry(name: String) {
+  drain()
+  let socket = socket_path(name)
   let server = start_server(socket)
   let launches = process.new_subject()
   let fake =
@@ -721,7 +733,7 @@ pub fn a_thread_woken_for_model_goes_back_to_sleep_test() {
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root: "/tmp/crushling-model-test",
     ))
-  // `!model` on an asleep thread wakes it to show the card...
+  // `!model` on an asleep thread wakes it to show the card.
   process.send(
     r,
     registry.Received(
@@ -729,11 +741,45 @@ pub fn a_thread_woken_for_model_goes_back_to_sleep_test() {
     ),
   )
   let assert Ok(Launched(_)) = process.receive(launches, 2000)
+  #(server, launches, thread_key)
+}
+
+pub fn a_thread_woken_for_model_goes_back_to_sleep_test() {
+  let #(server, launches, thread_key) = start_woken_registry("wake")
   // The card's reads reached the woken agent's crush...
   let _ = expect("providers")
   let _ = expect("busy")
-  // ...and, with no prompt to run, it is stopped again once idle.
-  let assert Ok(Stopped(stopped)) = process.receive(launches, 3000)
+  // ...and, with no prompt to run, it is stopped again once idle. (The
+  // thread first spends a few seconds retrying the card's post to this
+  // test's dead Slack.)
+  let assert Ok(Stopped(stopped)) = process.receive(launches, 15_000)
   let assert True = stopped == thread_key
   stop_server(server)
+}
+
+pub fn an_idle_agent_with_background_jobs_is_kept_test() {
+  let #(server, launches, thread_key) = start_woken_registry("jobs")
+  set_jobs(server, 1)
+  // The idle check finds a job running, twice over, and keeps the agent.
+  let assert 1 = count_jobs()
+  let assert 1 = count_jobs()
+  let assert Error(Nil) = process.receive(launches, 0)
+  // Once the job is done, the next check stops it.
+  set_jobs(server, 0)
+  let assert Ok(Stopped(stopped)) = process.receive(launches, 15_000)
+  let assert True = stopped == thread_key
+  stop_server(server)
+}
+
+/// The count the next idle check got. The first comes late: the thread
+/// spends a few seconds retrying the card's post to this test's dead Slack.
+fn count_jobs() -> Int {
+  case next_request(15_000) {
+    Ok(#("jobs", count)) -> {
+      let assert Ok(count) = decode.run(count, decode.int)
+      count
+    }
+    Ok(_) -> count_jobs()
+    Error(Nil) -> panic as "no job count"
+  }
 }

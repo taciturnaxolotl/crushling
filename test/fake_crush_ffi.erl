@@ -25,7 +25,7 @@
 %% `next/1` receives them.
 
 -export([start/1, stop/1, push/2, drop/1, set_busy/2, set_exists/2,
-         expire_on_get/1, next/1, suspend/1, resume/1]).
+         set_jobs/2, expire_on_get/1, next/1, suspend/1, resume/1]).
 
 -define(WS, <<"w1">>).
 -define(SESSION, <<"s1">>).
@@ -60,6 +60,11 @@ set_busy(Ctl, Busy) ->
     Ctl ! {busy, Busy},
     nil.
 
+%% How many background jobs GET .../jobs/running reports (0 to start).
+set_jobs(Ctl, Jobs) ->
+    Ctl ! {jobs, Jobs},
+    nil.
+
 set_exists(Ctl, Exists) ->
     Ctl ! {exists, Exists},
     nil.
@@ -89,7 +94,7 @@ next(TimeoutMs) ->
 %% The controller: the listening socket's owner and the fake's state.
 
 -record(ctl, {owner, listen, events = none, busy = true, exists = false,
-              expire = false, pinned = none}).
+              expire = false, pinned = none, jobs = 0}).
 
 ctl_init(Owner, Path) ->
     {ok, Listen} = gen_tcp:listen(0, [binary, {ifaddr, {local, Path}},
@@ -115,6 +120,8 @@ ctl_loop(S = #ctl{owner = Owner}) ->
             ctl_loop(S#ctl{busy = Busy});
         {exists, Exists} ->
             ctl_loop(S#ctl{exists = Exists});
+        {jobs, Jobs} ->
+            ctl_loop(S#ctl{jobs = Jobs});
         expire_on_get ->
             ctl_loop(S#ctl{expire = true});
         {request, From, Method, Path, Headers, Body} ->
@@ -187,6 +194,9 @@ route(S = #ctl{owner = Owner}, Method, Target, Headers, Body, From) ->
                                          atom_to_binary(S#ctl.busy),
                                          ",\"model\":", Model,
                                          ",\"model_cfg\":", Cfg, "}"])), S};
+        {'GET', <<Session:(byte_size(Session))/binary, "/jobs/running">>} ->
+            Owner ! {fake_crush, jobs, S#ctl.jobs},
+            {json(200, integer_to_binary(S#ctl.jobs)), S};
         {'GET', <<WS:(byte_size(WS))/binary, "/config">>} ->
             {json(200, <<"{\"models\":{\"large\":{\"model\":\"alpha\",\"provider\":\"hyper\"}}}">>), S};
         {'GET', <<WS:(byte_size(WS))/binary, "/providers">>} ->

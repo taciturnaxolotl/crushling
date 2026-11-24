@@ -308,6 +308,18 @@ pub fn session_info(workspace_id: String, session_id: String) -> Call(String) {
   Call(Get, session(workspace_id, session_id), None, 200, Ok)
 }
 
+/// How many background shells the session's agent (and its subagents) has
+/// running.
+pub fn running_jobs(workspace_id: String, session_id: String) -> Call(Int) {
+  Call(
+    Get,
+    session(workspace_id, session_id) <> "/jobs/running",
+    None,
+    200,
+    parse_with(decode.int),
+  )
+}
+
 /// The providers crush knows, with their model catalogs, as raw JSON.
 pub fn providers(workspace_id: String) -> Call(String) {
   Call(Get, workspace(workspace_id) <> "/providers", None, 200, Ok)

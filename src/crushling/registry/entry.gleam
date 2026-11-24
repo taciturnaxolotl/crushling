@@ -7,7 +7,7 @@ import crushling/slack
 import crushling/thread
 import crushling/venue
 import gleam/erlang/process.{type Subject}
-import gleam/option.{type Option, Some}
+import gleam/option.{type Option, None, Some}
 
 pub type Agent {
   /// The agent is launching.
@@ -41,6 +41,11 @@ pub type Entry {
     /// Messages for the thread actor that came while its agent was asleep
     /// or starting, sent once it is live.
     pending: List(thread.Message),
+    /// Since when (monotonic ms) a quiet thread's agent has been kept for its
+    /// background jobs; None when it isn't.
+    held_since: Option(Int),
+    /// Whether an idle check is waiting for the thread to count its jobs.
+    counting: Bool,
   )
 }
 
@@ -57,6 +62,8 @@ pub fn new(channel: String, thread_ts: String, meta: Meta) -> Entry {
     summary_ts: "",
     working: False,
     pending: [],
+    held_since: None,
+    counting: False,
   )
 }
 

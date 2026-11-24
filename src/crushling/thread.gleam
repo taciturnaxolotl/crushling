@@ -72,6 +72,9 @@ pub type Notice {
   /// `None` for the default. The registry saves it, so a new actor for the
   /// thread starts with it.
   ModelChosen(choice: Option(ModelChoice))
+  /// How many background jobs the agent has running, for the registry's
+  /// idle check of `generation`.
+  JobsRunning(generation: Int, running: Int)
 }
 
 pub type Config {
@@ -135,6 +138,9 @@ pub type Message {
   ModelCommand(request: models.Request, user: String)
   /// Someone picked on the card posted as `card_ts`.
   CardPicked(pick: models.Pick, card_ts: String, user: String)
+  /// Count the agent's running background jobs for the registry's idle
+  /// check of `generation`; answered with `JobsRunning`.
+  CountJobs(generation: Int)
 }
 
 type Queued {
@@ -325,6 +331,20 @@ fn step(state: State, message: Message) -> State {
       with_model(state, model.command(_, request, user))
     CardPicked(pick, card_ts, user) ->
       with_model(state, model.pick(_, pick, card_ts, user))
+    CountJobs(generation) -> {
+      // Unknown counts as none: the agent is idle as far as anyone can tell.
+      let running = case state.connection {
+        Some(connection) ->
+          conn.call(
+            connection,
+            client.running_jobs(connection.workspace_id, connection.session_id),
+          )
+          |> result.unwrap(0)
+        None -> 0
+      }
+      state.config.notify(JobsRunning(generation:, running:))
+      state
+    }
     Stop -> state
   }
 }
