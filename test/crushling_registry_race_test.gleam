@@ -8,6 +8,7 @@ import crushling/people
 import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/store
+import crushling/thread
 import gleam/erlang/process.{type Subject}
 import gleam/option.{None, Some}
 import gleam/set
@@ -237,4 +238,27 @@ pub fn shutdown_budget_covers_its_timers_test() {
   let assert True = registry.shutdown_budget_ms(60_000) > 60_000 + 130_000
   let assert True =
     registry.shutdown_budget_ms(0) == registry.shutdown_budget_ms(1000) - 1000
+}
+
+/// An agent whose sandbox died (out of memory, say) is stopped once its
+/// thread gives up reconnecting, so the next message starts a new one
+/// rather than waiting on the dead one.
+pub fn a_lost_agent_is_stopped_and_started_again_test() {
+  let calls = process.new_subject()
+  let r = start(calls)
+  let key = registry.key("T1", "C1", "40.1")
+  process.send(r, message("40.1", "40.1", "<@UBOT> hi", True))
+  let assert Launch(_, go) = next(calls)
+  process.send(go, Nil)
+  let _ = wait_live(r, key, 50)
+  process.send(r, registry.FromThread(key, thread.Lost))
+  let assert Stop(stopping, stop_go) = next(calls)
+  let assert True = stopping == key
+  process.send(stop_go, Ok(Nil))
+  process.send(r, message("40.1", "40.2", "carry on", False))
+  let assert Launch(again, go) = next(calls)
+  let assert True = again == key
+  process.send(go, Nil)
+  let _ = wait_live(r, key, 50)
+  Nil
 }

@@ -1661,6 +1661,10 @@ fn from_thread(state: State, key: String, notice: thread.Notice) -> State {
       idle_soon(state, key, Entry(..entry, working: busy))
     thread.JobsRunning(generation:, running:), Ok(entry) ->
       jobs_counted(state, key, entry, generation, running)
+    thread.Lost, Ok(_) -> {
+      sys.warn("crushling: lost the agent of " <> key <> "; stopping it")
+      stop_agent(state, key)
+    }
     // The agent may have been stopped while it switched: the choice still
     // counts.
     thread.ModelChosen(choice), _ ->

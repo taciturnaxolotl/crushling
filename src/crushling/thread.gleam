@@ -75,6 +75,10 @@ pub type Notice {
   /// How many background jobs the agent has running, for the registry's
   /// idle check of `generation`.
   JobsRunning(generation: Int, running: Int)
+  /// The agent is gone (its sandbox died, say of running out of memory) and
+  /// reconnecting gave up. The registry stops what's left of it, so the
+  /// next message starts a new one.
+  Lost
 }
 
 pub type Config {
@@ -457,7 +461,13 @@ fn connect(state: State) -> State {
     Error(reason) -> {
       sys.warn("crushling: connect failed: " <> reason)
       case state.retries >= max_retries {
-        True -> fail_everything(state, "could not reach the agent: " <> reason)
+        True -> {
+          state.config.notify(Lost)
+          fail_everything(
+            state,
+            "The agent stopped unexpectedly (its sandbox may have run out of memory), so this run is over. Send a message to start it again; the workspace is kept.",
+          )
+        }
         False -> {
           process.send_after(state.self, conn.backoff(state.retries), Reconnect)
           State(..state, retries: state.retries + 1)
