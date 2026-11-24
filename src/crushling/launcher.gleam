@@ -8,6 +8,7 @@
 //// inference proxy (`crushling/proxy`) with a token of the thread's own.
 //// The agent's crush.json comes from `provider.config` and holds no key.
 
+import crushling/github/route as github_route
 import crushling/mcp
 import crushling/provider
 import crushling/proxy
@@ -82,12 +83,14 @@ pub type Bridge {
 pub const default_hello_timeout_ms = 30_000
 
 /// The bridge, from the instance secret, the URL sandboxes reach the
-/// sandbox server at, the tunnels and the proxy.
+/// sandbox server at, the tunnels and the proxy. With `github`, git and gh
+/// in sandboxes reach GitHub through the bridge.
 pub fn bridge(
   url url: String,
   secret secret: String,
   tunnels tunnels: tunnel.Tunnels,
   proxy proxy: proxy.Proxy,
+  github github: Bool,
   hello_timeout_ms hello_timeout_ms: Int,
 ) -> Bridge {
   Bridge(
@@ -99,6 +102,11 @@ pub fn bridge(
         mcp.env(secret, key),
         tunnel.env(secret, key),
         proxy.crush_env(url, secret, key),
+        // GitHub reads through the bridge, when it's set up.
+        case github {
+          True -> github_route.env(url, secret, key)
+          False -> []
+        },
       ])
     },
     open: fn(key) { tunnel.open(tunnels, key) },

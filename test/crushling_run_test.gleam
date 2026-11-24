@@ -323,15 +323,6 @@ pub fn answer_and_note_test() {
   let assert True = string.contains(text, "may be partial")
 }
 
-pub fn changes_line_test() {
-  let assert None = render.changes([])
-  let assert Some("_changed `a.go` +3 −1, `bin/x` (binary)_") =
-    render.changes([
-      snapshot.Change("a.go", Ok(3), Ok(1)),
-      snapshot.Change("bin/x", Error(Nil), Error(Nil)),
-    ])
-}
-
 pub fn numstat_test() {
   let assert [
     snapshot.Change("a.go", Ok(3), Ok(1)),

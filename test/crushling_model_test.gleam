@@ -439,7 +439,7 @@ fn start(
         sink.Reply(show: fn(_, _, _) { Nil }, finish: fn(_) { [] })
       },
       upload: fn(_, _) { Ok(Nil) },
-      branch: fn(_, _) { Error("no") },
+      branch: fn(_, _, _) { Error("no") },
       open_code_channel: fn(_) { Error("no") },
       context: fn(_) { Nil },
       code: fn(_, _, _) { Nil },

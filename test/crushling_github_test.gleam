@@ -3,6 +3,7 @@
 //// and the registry connecting and disconnecting someone against a fake
 //// Slack.
 
+import crushling/connections
 import crushling/crush/client
 import crushling/github
 import crushling/home
@@ -25,8 +26,8 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
-import gleam/set
 import gleam/result
+import gleam/set
 import gleam/string
 import gleam/uri
 import mist
@@ -65,14 +66,20 @@ fn fake_with(
     serve(asks, answers)
   })
   let assert Ok(asks) = process.receive(ready, 1000)
-  github.Config(client_id: "Iv1.test", client_secret: secret, send: fn(req) {
-    process.send(seen, req)
-    let answer = process.call(asks, 1000, fn(reply) { #(req.path, reply) })
-    case answer {
-      Ok(#(status, body)) -> Ok(response.new(status) |> response.set_body(body))
-      Error(reason) -> Error(reason)
-    }
-  })
+  github.Config(
+    client_id: "Iv1.test",
+    client_secret: secret,
+    accounts: github.no_accounts,
+    send: fn(req) {
+      process.send(seen, req)
+      let answer = process.call(asks, 1000, fn(reply) { #(req.path, reply) })
+      case answer {
+        Ok(#(status, body)) ->
+          Ok(response.new(status) |> response.set_body(body))
+        Error(reason) -> Error(reason)
+      }
+    },
+  )
 }
 
 fn serve(
@@ -383,10 +390,30 @@ pub fn home_view_test() {
   let assert True = string.contains(texts(v), "None of your threads")
   let v = home.view(base(home.NotConnected(Some("Couldn't connect: nope."))))
   let assert True = string.contains(texts(v), "Couldn't connect: nope.")
-  let v = home.view(base(home.Connected("octo", None)))
+  let v = home.view(base(home.Connected("octo", None, None)))
   let assert [action] = buttons(v)
   let assert True = action == home.disconnect_action
   let assert True = string.contains(texts(v), "@octo")
+  // Where crushling can read, and how to add it elsewhere.
+  let v =
+    home.view(
+      base(home.Connected(
+        "octo",
+        None,
+        Some(github.Accounts(["charmbracelet"], "https://x/install")),
+      )),
+    )
+  let assert True = string.contains(texts(v), "*charmbracelet*")
+  let assert True = string.contains(texts(v), "https://x/install")
+  let v =
+    home.view(
+      base(home.Connected(
+        "octo",
+        None,
+        Some(github.Accounts([], "https://x/install")),
+      )),
+    )
+  let assert True = string.contains(texts(v), "isn't on any GitHub account")
   let v =
     home.view(
       base(home.Connecting("ABCD-1234", "https://github.com/login/device", 15)),
@@ -403,31 +430,43 @@ pub fn home_view_test() {
   let assert False = string.contains(texts(v), "$")
   // Their threads are listed, linked when Slack gave a link.
   let v =
-    home.view(
-      home.Home(
-        github: home.Unavailable,
-        today: meter.zero,
-        month: meter.zero,
-        default_model: "prism",
-        threads: [
-          home.Thread(
-            "C1",
-            Some("https://x.slack.com/p1"),
-            "kimi-k3",
-            meter.Usage(0, 0, 0.42, 1),
-          ),
-          home.Thread("C2", None, "prism", meter.zero),
-        ],
-        thread_count: 25,
-      ),
-    )
-  let assert True = string.contains(texts(v), "<https://x.slack.com/p1|a thread>")
+    home.view(home.Home(
+      github: home.Unavailable,
+      today: meter.zero,
+      month: meter.zero,
+      default_model: "prism",
+      threads: [
+        home.Thread(
+          "C1",
+          Some("https://x.slack.com/p1"),
+          "kimi-k3",
+          meter.Usage(0, 0, 0.42, 1),
+        ),
+        home.Thread("C2", None, "prism", meter.zero),
+      ],
+      thread_count: 25,
+    ))
+  let assert True =
+    string.contains(texts(v), "<https://x.slack.com/p1|a thread>")
   let assert True = string.contains(texts(v), "kimi-k3 · $0.42")
   let assert True = string.contains(texts(v), "a thread in <#C2>")
   let assert True = string.contains(texts(v), "and 23 more")
   // It encodes for views.publish.
   let encoded = json.to_string(view.view_to_json(v))
   let assert True = string.contains(encoded, "\"type\":\"home\"")
+}
+
+pub fn nudge_test() {
+  let #(text, blocks) = home.ask_connect("C1", "1.5", Some("octo/hyper"))
+  let assert True =
+    text
+    == "crushling would like private access to `octo/hyper`. Would you like to connect crushling to your GitHub account?"
+  let assert True = string.contains(string.inspect(blocks), "C1|1.5")
+  let #(text, blocks) = home.ask_install("octo", "hyper", "https://x/install")
+  let assert True = string.contains(text, "isn't set up on *octo*")
+  let assert True = string.contains(string.inspect(blocks), "https://x/install")
+  let assert Ok(#("C1", "1.5")) = home.nudged_from("C1|1.5")
+  let assert Error(Nil) = home.nudged_from("")
 }
 
 pub fn github_command_test() {
@@ -465,7 +504,8 @@ fn fake_slack(calls: Subject(#(String, String))) -> #(String, process.Pid) {
           }
         "chat.getPermalink" ->
           "{\"ok\":true,\"channel\":\"C1\",\"permalink\":\"https://x.slack.com/p1\"}"
-        "views.publish" -> "{\"ok\":true,\"view\":{\"id\":\"V1\",\"type\":\"home\",\"blocks\":[]}}"
+        "views.publish" ->
+          "{\"ok\":true,\"view\":{\"id\":\"V1\",\"type\":\"home\",\"blocks\":[]}}"
         _ -> "{\"ok\":true,\"channel\":\"C1\",\"ts\":\"99.0\"}"
       }
       response.new(200)
@@ -531,7 +571,10 @@ pub fn connecting_from_a_thread_saves_the_account_test() {
     fake(
       [
         #("/login/device/code", [#(200, code_body)]),
-        #("/login/oauth/access_token", [#(200, pending_body), #(200, granted_body)]),
+        #("/login/oauth/access_token", [
+          #(200, pending_body),
+          #(200, granted_body),
+        ]),
         #("/user", [#(200, "{\"login\":\"octo\"}")]),
       ],
       process.new_subject(),
@@ -574,9 +617,20 @@ pub fn only_allowed_people_connect_test() {
   process.send(r, registry.GitHubConnect("U2"))
   let assert Ok(_) = home_with(calls, "can't use crushling", 2000)
   let assert False = asked_github(seen, "/login/device/code", 300)
-  // Someone listed does, in the same registry.
-  process.send(r, registry.GitHubConnect("U1"))
+  // Someone listed does, in the same registry. Pressed on the note in a
+  // thread, the code is said there too.
+  // The code replaces the message whose button they pressed.
+  process.send(
+    r,
+    registry.GitHubConnectIn(
+      "U1",
+      connections.Place("C1", "1.0", Some(api <> "/respond")),
+    ),
+  )
   let assert True = asked_github(seen, "/login/device/code", 2000)
+  let assert Ok(said) = next_call(calls, "respond", 2000)
+  let assert True = string.contains(said, "ABCD-1234")
+  let assert True = string.contains(said, "\"replace_original\":true")
   let assert Ok(_) = home_with(calls, "ABCD-1234", 2000)
   process.send(r, registry.GitHubDisconnect("U1"))
   stop(slack_pid)
@@ -626,7 +680,10 @@ pub fn disconnecting_mid_connect_stops_it_test() {
       [
         #("/login/device/code", [#(200, code_body)]),
         // Pending once, then yes: only a poller still running would see it.
-        #("/login/oauth/access_token", [#(200, pending_body), #(200, granted_body)]),
+        #("/login/oauth/access_token", [
+          #(200, pending_body),
+          #(200, granted_body),
+        ]),
         #("/user", [#(200, "{\"login\":\"octo\"}")]),
       ],
       seen,

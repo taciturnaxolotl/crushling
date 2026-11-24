@@ -168,18 +168,16 @@ fn start_wiring() -> Wiring {
   let started = process.new_subject()
   process.spawn_unlinked(fn() {
     let assert Ok(p) =
-      proxy.start(
-        proxy.Config(
-          secret:,
-          org_key:,
-          upstream: proxy.upstream_from(api_key),
-          thread_cap: meter.unlimited,
-          instance_cap: meter.unlimited,
-          max_per_thread: proxy.default_max_per_thread,
-          max_uploads: proxy.default_max_uploads,
-          upload_timeout_ms: proxy.default_upload_timeout_ms,
-          ),
-      )
+      proxy.start(proxy.Config(
+        secret:,
+        org_key:,
+        upstream: proxy.upstream_from(api_key),
+        thread_cap: meter.unlimited,
+        instance_cap: meter.unlimited,
+        max_per_thread: proxy.default_max_per_thread,
+        max_uploads: proxy.default_max_uploads,
+        upload_timeout_ms: proxy.default_upload_timeout_ms,
+      ))
     let assert Ok(tunnels) =
       tunnel.start(tunnel.config(
         secret,
@@ -201,6 +199,7 @@ fn start_wiring() -> Wiring {
       secret:,
       tunnels:,
       proxy: p,
+      github: False,
       hello_timeout_ms: launcher.default_hello_timeout_ms,
     ),
     proxy: p,
@@ -287,7 +286,7 @@ fn sink(calls: Subject(Call)) -> sink.Sink {
     update_blocks: fn(_, _, _) { Ok(Nil) },
     delete: fn(_) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
-    branch: fn(_, _) { Error("no branches in this test") },
+    branch: fn(_, _, _) { Error("no branches in this test") },
     open_code_channel: fn(_) { Error("no code channels in this test") },
     context: fn(_) { Nil },
     code: fn(_, _, _) { Nil },
@@ -716,6 +715,8 @@ type SubCall {
   Branched(intro: String, title: String)
   InBranch(text: String)
   InMain(text: String)
+  /// A message in the main conversation changed, like a subagent's first.
+  Updated(text: String)
   MainFinished(solicited: Bool)
 }
 
@@ -735,12 +736,18 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> sink.Sink {
     update_plan: fn(_, _) { Ok(Nil) },
     post:,
     post_blocks: fn(text, _) { post(text) },
-    update_blocks: fn(_, _, _) { Ok(Nil) },
+    update_blocks: fn(_, text, _) {
+      process.send(calls, case in_branch {
+        True -> InBranch(text)
+        False -> Updated(text)
+      })
+      Ok(Nil)
+    },
     delete: fn(_) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
-    branch: fn(intro, title) {
+    branch: fn(intro, _, title) {
       process.send(calls, Branched(intro, title))
-      Ok(#(recording_sink(calls, True), "https://slack.example/thread"))
+      Ok(#(recording_sink(calls, True), "https://slack.example/thread", "9.0"))
     },
     open_code_channel: fn(_) { Error("no code channels in this test") },
     context: fn(_) { Nil },
@@ -756,23 +763,22 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
   use env <- with_env("subagent", wiring)
   let calls = process.new_subject()
   let assert Ok(t) =
-    thread.start(
-      thread.Config(
-        socket: env.socket,
-        root: env.work,
-        title: "crushling subagent test",
-        venue: venue.Thread,
-        sink: recording_sink(calls, False),
-        flush_ms: 250,
-        mode: client.Sysadmin,
-        notify: on_finished(fn(finished) {
-          process.send(calls, MainFinished(finished.solicited))
-        }),
-        on_connect: fn(_) { Nil },
-        model: None,
-        home: #("C", "1.0"),
-      ),
-    )
+    thread.start(thread.Config(
+      socket: env.socket,
+      root: env.work,
+      title: "crushling subagent test",
+      // Subagents get threads of their own only in a code channel.
+      venue: venue.CodeChannel(channel: "CTEST", repo: env.work),
+      sink: recording_sink(calls, False),
+      flush_ms: 250,
+      mode: client.Sysadmin,
+      notify: on_finished(fn(finished) {
+        process.send(calls, MainFinished(finished.solicited))
+      }),
+      on_connect: fn(_) { Nil },
+      model: None,
+      home: #("C", "1.0"),
+    ))
   process.send(
     t,
     prompt(
@@ -799,7 +805,15 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
   let assert True =
     list.any(seen, fn(call) {
       case call {
-        InMain(text) -> string.contains(text, "* finished _")
+        InMain(text) -> string.contains(text, "* finished ")
+        _ -> False
+      }
+    })
+  // Its first message says how it went.
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        Updated(text) -> string.contains(text, "*")
         _ -> False
       }
     })
@@ -819,7 +833,7 @@ fn collect_sub_calls(
   let reported =
     list.any(acc, fn(call) {
       case call {
-        InMain(text) -> string.contains(text, "* finished _")
+        InMain(text) -> string.contains(text, "* finished ")
         _ -> False
       }
     })
@@ -870,7 +884,7 @@ fn code_sink(
     update_blocks: fn(_, _, _) { Ok(Nil) },
     delete: fn(_) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
-    branch: fn(_, _) { Error("no branches in this test") },
+    branch: fn(_, _, _) { Error("no branches in this test") },
     open_code_channel: fn(name) {
       process.send(calls, Opened(name))
       case in_channel, opens {

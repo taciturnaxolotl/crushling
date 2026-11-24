@@ -8,7 +8,6 @@
 //// Everything here is pure; `crushling/slack` turns it into blocks.
 
 import crushling/run.{type Run}
-import crushling/snapshot
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -346,31 +345,6 @@ fn clip_reason(reason: String) -> String {
   case string.length(reason) > 200 {
     True -> string.slice(reason, 0, 199) <> "…"
     False -> reason
-  }
-}
-
-/// A line naming what changed, with line counts.
-pub fn changes(changes: List(snapshot.Change)) -> Option(String) {
-  case changes {
-    [] -> None
-    changes -> {
-      let shown = list.take(changes, 8)
-      let more = list.length(changes) - list.length(shown)
-      let items =
-        list.map(shown, fn(change) {
-          let counts = case change.added, change.removed {
-            Ok(added), Ok(removed) ->
-              " +" <> int.to_string(added) <> " −" <> int.to_string(removed)
-            _, _ -> " (binary)"
-          }
-          "`" <> string.replace(change.path, "`", "'") <> "`" <> counts
-        })
-      let items = case more > 0 {
-        True -> list.append(items, ["and " <> int.to_string(more) <> " more"])
-        False -> items
-      }
-      Some("_changed " <> string.join(items, ", ") <> "_")
-    }
   }
 }
 

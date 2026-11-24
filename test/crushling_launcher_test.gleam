@@ -72,6 +72,7 @@ fn real_bridge_at(root: String, url: String) -> launcher.Bridge {
     secret:,
     tunnels:,
     proxy: p,
+    github: False,
     hello_timeout_ms: launcher.default_hello_timeout_ms,
   )
 }

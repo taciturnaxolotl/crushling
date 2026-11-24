@@ -31,10 +31,11 @@ pub type Sink {
     reply: fn(String) -> Reply,
     /// Attach a file, given its name and contents.
     upload: fn(String, String) -> Result(Nil, String),
-    /// Start a new thread for a subagent. `intro` is its first message and
-    /// `title` names its session. Returns the new thread's sink and a link to
-    /// it.
-    branch: fn(String, String) -> Result(#(Sink, String), String),
+    /// Start a new thread for a subagent: its first message, as text and
+    /// blocks, and the title for its session. Returns the new thread's sink,
+    /// a link to it, and the first message's ts, to update it later.
+    branch: fn(String, List(block.Block), String) ->
+      Result(#(Sink, String, String), String),
     /// Open a code channel called `name` from this thread. Returns the
     /// channel's sink and id.
     open_code_channel: fn(String) -> Result(#(Sink, String), String),

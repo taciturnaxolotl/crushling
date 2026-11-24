@@ -154,7 +154,7 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
         })
       },
       upload: fn(_, _) { Ok(Nil) },
-      branch: fn(_, _) { Error("no") },
+      branch: fn(_, _, _) { Error("no") },
       open_code_channel: fn(_) { Error("no") },
       context: fn(_) { Nil },
       code: fn(_, _, _) { Nil },

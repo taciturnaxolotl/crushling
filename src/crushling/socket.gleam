@@ -1,6 +1,7 @@
 //// Socket Mode: one WebSocket to Slack, reopened whenever Slack asks or the
 //// connection drops, with every event turned into a `msg.Incoming`.
 
+import crushling/connections
 import crushling/home
 import crushling/models
 import crushling/registry
@@ -88,21 +89,46 @@ pub fn router(base: app.App, find: Find) -> app.App {
   |> home_buttons(find)
 }
 
-/// The GitHub buttons on the App Home.
+/// The GitHub buttons on the App Home, and on the asks in threads.
 fn home_buttons(app: app.App, find: Find) -> app.App {
+  let app = {
+    // A link: GitHub opens in the browser; here the ask says what's next.
+    use action, payload <- app.action(app, home.install_action)
+    case action, payload.response_url {
+      interaction.ButtonAction(value: Some(owner), ..), Some(url) -> {
+        process.spawn_unlinked(fn() {
+          slack.replace_ephemeral(url, home.installing(owner))
+        })
+        Nil
+      }
+      _, _ -> Nil
+    }
+    app.ack()
+  }
   use app, action_id <- list.fold(
     [home.connect_action, home.disconnect_action],
     app,
   )
-  use _, payload <- app.action(app, action_id)
+  use action, payload <- app.action(app, action_id)
   let team = option.map(payload.team, fn(team) { team.id })
   let enterprise = option.map(payload.enterprise, fn(org) { org.id })
+  // The note asking someone in a thread carries the thread; the Home's
+  // buttons carry nothing.
+  let place = case action {
+    interaction.ButtonAction(value: Some(value), ..) ->
+      home.nudged_from(value)
+      |> result.map(fn(pair) {
+        connections.Place(pair.0, pair.1, payload.response_url)
+      })
+    _ -> Error(Nil)
+  }
   case target(find, team, enterprise) {
     Ok(Target(registry:, ..)) -> {
       let user = payload.user.id
-      process.send(registry, case action_id == home.connect_action {
-        True -> registry.GitHubConnect(user)
-        False -> registry.GitHubDisconnect(user)
+      process.send(registry, case action_id == home.connect_action, place {
+        True, Ok(place) -> registry.GitHubConnectIn(user, place)
+        True, Error(Nil) -> registry.GitHubConnect(user)
+        False, _ -> registry.GitHubDisconnect(user)
       })
     }
     Error(Nil) -> Nil

@@ -13,7 +13,10 @@ import gleam/bool
 import gleam/erlang/process
 import gleam/float
 import gleam/http
+import gleam/http/request
+import gleam/httpc as gleam_httpc
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -214,7 +217,7 @@ pub fn sink(
       False -> Nil
     }
   }
-  let branch = fn(intro, title) {
+  let branch = fn(intro, blocks, title) {
     // In a code channel a subagent gets a thread there; elsewhere a new
     // top-level message with its own session.
     let child = case in_code_channel {
@@ -224,7 +227,7 @@ pub fn sink(
     use root <- result.try(
       send(fn() {
         chat.post_message(channel:, text: fallback(intro))
-        |> post_message.blocks(markdown_blocks(intro))
+        |> post_message.blocks(blocks)
         |> post_message.unfurl_links(False)
         |> httpc.send(client)
         |> result.map(fn(posted) { posted.ts })
@@ -237,7 +240,7 @@ pub fn sink(
       |> result.unwrap("")
     let branch = sink(client, team, channel, child(root))
     branch.title(title)
-    Ok(#(branch, link))
+    Ok(#(branch, link, root))
   }
   thread_sink.Sink(
     conversation: thread_sink.Conversation(channel, thread_ts),
@@ -516,6 +519,47 @@ pub fn whisper(
   let _ =
     chat.post_ephemeral(channel:, user:, text:)
     |> post_ephemeral.thread_ts(thread_ts)
+    |> httpc.send(client)
+  Nil
+}
+
+/// Replace the ephemeral message an interaction came from, through its
+/// `response_url`, with `text`.
+pub fn replace_ephemeral(response_url: String, text: String) -> Nil {
+  case request.to(response_url) {
+    Ok(req) -> {
+      let body =
+        json.object([
+          #("replace_original", json.bool(True)),
+          #("response_type", json.string("ephemeral")),
+          #("text", json.string(text)),
+        ])
+        |> json.to_string
+      let _ =
+        req
+        |> request.set_method(http.Post)
+        |> request.set_header("content-type", "application/json")
+        |> request.set_body(body)
+        |> gleam_httpc.send
+      Nil
+    }
+    Error(Nil) -> Nil
+  }
+}
+
+/// `whisper`, with blocks; `text` is the fallback for notifications.
+pub fn whisper_blocks(
+  client: slackline.Client,
+  channel: String,
+  thread_ts: String,
+  user: String,
+  text: String,
+  blocks: List(block.Block),
+) -> Nil {
+  let _ =
+    chat.post_ephemeral(channel:, user:, text:)
+    |> post_ephemeral.thread_ts(thread_ts)
+    |> post_ephemeral.blocks(blocks)
     |> httpc.send(client)
   Nil
 }

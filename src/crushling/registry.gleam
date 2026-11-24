@@ -26,6 +26,8 @@
 import crushling/connections
 import crushling/crush/client
 import crushling/github
+import crushling/github/route as github_route
+import crushling/home
 import crushling/launcher.{type Launcher}
 import crushling/meta.{type Link, type Meta, Link, Meta}
 import crushling/models
@@ -153,6 +155,17 @@ pub type Message {
   /// Connect or disconnect `user`'s GitHub account, from the App Home.
   GitHubConnect(user: String)
   GitHubDisconnect(user: String)
+  /// `user` pressed Connect on the note asking them, in a thread.
+  GitHubConnectIn(user: String, place: connections.Place)
+  /// Thread `key`'s agent couldn't read GitHub for want of a connection:
+  /// ask whoever it works for, in the thread, now and then.
+  GitHubNudge(key: String, want: github_route.Want)
+  /// Who to ask, for `GitHubNudge`.
+  GitHubNudgeTo(key: String, user: String, want: github_route.Want)
+  /// The GitHub access token the agent of thread `key` reads with: that of
+  /// whoever it's working for. None when they haven't connected, or the
+  /// thread has no agent running.
+  GitHubAccess(key: String, reply: Subject(Result(Option(String), String)))
   /// The thread didn't count its jobs for the idle check of `generation` in
   /// time.
   JobsUncounted(key: String, generation: Int)
@@ -213,8 +226,14 @@ type State {
     looking_up: Dict(String, #(Int, List(Waiting))),
     /// The workspace's GitHub connections and App Homes.
     connections: Subject(connections.Message),
+    /// When each person was last asked to connect GitHub in each thread,
+    /// by thread and user, in monotonic ms.
+    nudged: Dict(#(String, String, String), Int),
   )
 }
+
+/// Asked to connect GitHub at most this often per person and thread.
+const nudge_every_ms = 600_000
 
 /// How long a membership lookup gets before what waits for it is turned
 /// away.
@@ -275,6 +294,7 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       members: people.new_cache(people.cache_ms),
       looking_up: dict.new(),
       connections:,
+      nudged: dict.new(),
     )
     |> actor.initialised
     |> actor.selecting(selector)
@@ -488,6 +508,14 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(idle_check(state, key, generation))
     HomeOpened(user) -> actor.continue(home_ask(state, user, ShowHome))
     GitHubConnect(user) -> actor.continue(home_ask(state, user, Connect(None)))
+    GitHubConnectIn(user, place) ->
+      actor.continue(home_ask(state, user, Connect(Some(place))))
+    GitHubNudge(key, want) -> {
+      nudge_who(state, key, want)
+      actor.continue(state)
+    }
+    GitHubNudgeTo(key, user, want) ->
+      actor.continue(nudge(state, key, user, want))
     GitHubDisconnect(user) -> {
       process.send(state.connections, connections.Disconnect(user, None))
       actor.continue(state)
@@ -515,6 +543,10 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     }
     Member(user, id, result) ->
       actor.continue(member_known(state, user, id, result))
+    GitHubAccess(key, reply) -> {
+      github_access(state, key, reply)
+      actor.continue(state)
+    }
     ModelPicked(home, pick, card, user) ->
       case state.stopping {
         Some(_) -> actor.continue(state)
@@ -781,7 +813,11 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
     slack.GitHubCommand(connect:), _ -> {
       let user = route.incoming.user
       let from =
-        Some(connections.Place(route.incoming.channel, route.incoming.thread_ts))
+        Some(connections.Place(
+          route.incoming.channel,
+          route.incoming.thread_ts,
+          None,
+        ))
       case connect {
         True -> home_ask(state, user, Connect(from))
         False -> {
@@ -985,7 +1021,8 @@ fn home_ask(state: State, user: String, ask: HomeAsk) -> State {
       case ask, allowed {
         Connect(from:), True ->
           process.send(state.connections, connections.Connect(user, from))
-        Connect(from: Some(connections.Place(channel:, thread_ts:))), False -> {
+        Connect(from: Some(connections.Place(channel:, thread_ts:, ..))), False
+        -> {
           let client = state.config.client
           process.spawn_unlinked(fn() {
             slack.whisper(
@@ -1013,6 +1050,110 @@ fn home_ask(state: State, user: String, ask: HomeAsk) -> State {
   }
 }
 
+/// Find out, off the registry, whose agent it is.
+fn nudge_who(state: State, key: String, want: github_route.Want) -> Nil {
+  case dict.get(state.threads, key) {
+    Ok(Entry(agent: Live(thread:, ..), ..)) -> {
+      let self = state.self
+      process.spawn_unlinked(fn() {
+        let asked = process.new_subject()
+        process.send(thread, thread.Requester(asked))
+        case process.receive(asked, 5000) {
+          Ok("") | Error(Nil) -> Nil
+          Ok(user) -> process.send(self, GitHubNudgeTo(key, user, want))
+        }
+      })
+      Nil
+    }
+    _ -> Nil
+  }
+}
+
+fn nudge(
+  state: State,
+  key: String,
+  user: String,
+  want: github_route.Want,
+) -> State {
+  let now = sys.monotonic_ms()
+  // Asked once a while per thread, person, and what for: a connect and
+  // then an install are both asked.
+  let asked = #(key, user, case want {
+    github_route.Connection(..) -> "connect"
+    github_route.Install(owner:, ..) -> "install:" <> string.lowercase(owner)
+  })
+  let recently = case dict.get(state.nudged, asked) {
+    Ok(at) -> now - at < nudge_every_ms
+    Error(Nil) -> False
+  }
+  case recently, dict.get(state.threads, key) {
+    False, Ok(entry) -> {
+      let client = state.config.client
+      let github = state.config.github
+      let #(channel, thread_ts) = #(entry.channel, entry.thread_ts)
+      process.spawn_unlinked(fn() {
+        let ask = case want {
+          github_route.Connection(repo:) ->
+            Some(home.ask_connect(channel, thread_ts, repo))
+          github_route.Install(owner:, repo:) ->
+            github
+            |> option.then(fn(config) { config.accounts() })
+            |> option.map(fn(accounts) {
+              home.ask_install(owner, repo, accounts.install_url)
+            })
+        }
+        case ask {
+          Some(#(text, blocks)) ->
+            slack.whisper_blocks(client, channel, thread_ts, user, text, blocks)
+          None -> Nil
+        }
+      })
+      let nudged =
+        dict.filter(state.nudged, fn(_, at) { now - at < nudge_every_ms })
+        |> dict.insert(asked, now)
+      State(..state, nudged:)
+    }
+    _, _ -> state
+  }
+}
+
+/// Answer `GitHubAccess` off the registry: asking the thread and the
+/// connections actor (which may refresh with GitHub) takes a while.
+fn github_access(
+  state: State,
+  key: String,
+  reply: Subject(Result(Option(String), String)),
+) -> Nil {
+  case dict.get(state.threads, key) {
+    Ok(Entry(agent: Live(thread:, ..), ..)) -> {
+      let connections = state.connections
+      process.spawn_unlinked(fn() {
+        process.send(reply, {
+          // Sent and received rather than called, so a thread or actor
+          // that has gone is a timeout here, not a crash.
+          let asked = process.new_subject()
+          process.send(thread, thread.Requester(asked))
+          case process.receive(asked, 5000) {
+            Error(Nil) -> Error("the thread didn't say whose it is")
+            Ok("") -> Ok(None)
+            Ok(user) -> {
+              let answer = process.new_subject()
+              process.send(connections, connections.Access(user, answer))
+              process.receive(answer, github_access_ms)
+              |> result.unwrap(Error("GitHub took too long"))
+            }
+          }
+        })
+      })
+      Nil
+    }
+    _ -> process.send(reply, Ok(None))
+  }
+}
+
+/// How long a token may take, a refresh with GitHub included.
+pub const github_access_ms = 30_000
+
 /// `user`'s threads with a running agent: ones they've sent a prompt in.
 fn threads_of(state: State, user: String) -> List(connections.Thread) {
   dict.to_list(state.threads)
@@ -1020,15 +1161,17 @@ fn threads_of(state: State, user: String) -> List(connections.Thread) {
     let #(key, entry) = pair
     case entry.agent, set.contains(entry.people, user) {
       Live(..), True ->
-        Ok(connections.Thread(
-          key:,
-          channel: entry.channel,
-          thread_ts: entry.thread_ts,
-          model: case entry.meta.model {
-            Some(choice) -> choice.model
-            None -> state.config.default_model
-          },
-        ))
+        Ok(
+          connections.Thread(
+            key:,
+            channel: entry.channel,
+            thread_ts: entry.thread_ts,
+            model: case entry.meta.model {
+              Some(choice) -> choice.model
+              None -> state.config.default_model
+            },
+          ),
+        )
       _, _ -> Error(Nil)
     }
   })

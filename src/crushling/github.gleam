@@ -39,7 +39,20 @@ pub type Config {
     /// Only to revoke tokens on disconnect.
     client_secret: Option(String),
     send: fn(Request(String)) -> Result(Response(String), String),
+    /// Where the app is installed, when its private key is known
+    /// (`github/app`); `no_accounts` without it.
+    accounts: fn() -> Option(Accounts),
   )
+}
+
+/// The accounts the app is installed on, and the page that installs it on
+/// another. A person's token only reaches repos where it is.
+pub type Accounts {
+  Accounts(logins: List(String), install_url: String)
+}
+
+pub fn no_accounts() -> Option(Accounts) {
+  None
 }
 
 /// Send with gleam_httpc.
@@ -186,28 +199,46 @@ fn wait_loop(
 @external(erlang, "timer", "sleep")
 fn sleep(ms: Int) -> Nil
 
+/// Why a refresh failed.
+pub type RefreshError {
+  /// GitHub said no: the refresh token was revoked or has expired. The
+  /// connection is gone.
+  Refused(reason: String)
+  /// GitHub couldn't be asked, or answered oddly; try again later.
+  Unreachable(reason: String)
+}
+
 /// Swap a refresh token for new tokens. `now` is Unix seconds.
 pub fn refresh(
   config: Config,
   tokens: Tokens,
   now: Int,
-) -> Result(Tokens, String) {
-  use text <- result.try(body(
-    config,
-    form("/login/oauth/access_token", [
-      #("client_id", config.client_id),
-      #("grant_type", "refresh_token"),
-      #("refresh_token", tokens.refresh),
-    ]),
-    "refreshing the GitHub token",
-  ))
+) -> Result(Tokens, RefreshError) {
+  use text <- result.try(
+    body(
+      config,
+      form("/login/oauth/access_token", [
+        #("client_id", config.client_id),
+        #("grant_type", "refresh_token"),
+        #("refresh_token", tokens.refresh),
+      ]),
+      "refreshing the GitHub token",
+    )
+    |> result.map_error(Unreachable),
+  )
   json.parse(text, tokens_decoder(now))
   |> result.map_error(fn(_) {
     case json.parse(text, error_decoder()) {
-      Ok(#(error, _)) -> "GitHub refused the refresh (" <> error <> ")"
-      Error(_) -> refused(text)
+      Ok(#(error, _)) -> Refused("GitHub refused the refresh (" <> error <> ")")
+      Error(_) -> Unreachable(refused(text))
     }
   })
+}
+
+/// Whether the refresh token has expired too, so only connecting again
+/// helps. `now` is Unix seconds.
+pub fn lapsed(tokens: Tokens, now: Int) -> Bool {
+  tokens.refresh_expires_at != 0 && tokens.refresh_expires_at <= now
 }
 
 /// Whether `tokens` should be refreshed before use: the access token

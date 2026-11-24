@@ -3,6 +3,7 @@
 //// running, and what the workspace has spent. Built fresh from `Home` each
 //// time; pure, so the view is easy to test.
 
+import crushling/github
 import crushling/proxy/meter.{type Usage}
 import gleam/float
 import gleam/int
@@ -49,7 +50,13 @@ pub type GitHub {
   Asking
   /// Waiting for them to enter `code` at `url`, for `minutes` more at most.
   Connecting(code: String, url: String, minutes: Int)
-  Connected(login: String, note: Option(String))
+  /// `accounts`: where crushling's GitHub App is, when known; their token
+  /// only reaches repos there.
+  Connected(
+    login: String,
+    note: Option(String),
+    accounts: Option(github.Accounts),
+  )
 }
 
 /// A thread whose agent is running.
@@ -128,7 +135,7 @@ fn github(state: GitHub) -> List(block.Block) {
         <> ".",
       ),
     ]
-    Connected(login:, note:) -> [
+    Connected(login:, note:, accounts:) -> [
       button_section(
         "Connected as *<https://github.com/"
           <> login
@@ -139,7 +146,7 @@ fn github(state: GitHub) -> List(block.Block) {
         disconnect_action,
         block.Danger,
       ),
-      ..note_block(note)
+      ..list.append(installed(accounts), note_block(note))
     ]
   }
 }
@@ -171,6 +178,32 @@ fn running(threads: List(Thread), count: Int) -> List(block.Block) {
         }
       ]
     }
+  }
+}
+
+/// Where agents can read, and the link to add crushling elsewhere.
+fn installed(accounts: Option(github.Accounts)) -> List(block.Block) {
+  case accounts {
+    None -> []
+    Some(github.Accounts(logins: [], install_url:)) -> [
+      context(
+        "crushling isn't on any GitHub account yet, so agents can only read public repos. <"
+        <> install_url
+        <> "|Add it to an account>",
+      ),
+    ]
+    Some(github.Accounts(logins:, install_url:)) -> [
+      context(
+        "Agents can read repos on "
+        <> string.join(
+          list.map(logins, fn(login) { "*" <> login <> "*" }),
+          ", ",
+        )
+        <> ". <"
+        <> install_url
+        <> "|Add crushling to another account>",
+      ),
+    ]
   }
 }
 
@@ -226,4 +259,81 @@ pub fn dollars(amount: Float) -> String {
   <> int.to_string(cents / 100)
   <> "."
   <> string.pad_start(int.to_string(cents % 100), 2, "0")
+}
+
+/// Asked in a thread when its agent couldn't read `repo` on GitHub for
+/// want of the person's connection: Connect answers there, with the code.
+/// The text, and the blocks.
+pub fn ask_connect(
+  channel: String,
+  thread_ts: String,
+  repo: Option(String),
+) -> #(String, List(block.Block)) {
+  let what = case repo {
+    Some(repo) -> "`" <> repo <> "`"
+    None -> "your private repositories"
+  }
+  let text =
+    "crushling would like private access to "
+    <> what
+    <> ". Would you like to connect crushling to your GitHub account?"
+  #(text, [
+    block.section(text: block.mrkdwn(text), with: [
+      section.accessory(
+        element.button(text: "Connect GitHub", action_id: connect_action, with: [
+          button.style(block.Primary),
+          button.value(channel <> "|" <> thread_ts),
+        ]),
+      ),
+    ]),
+  ])
+}
+
+pub const install_action = "crushling_github_install"
+
+/// Asked when the person is connected but crushling's GitHub App isn't on
+/// the account `owner/repo` belongs to: the button opens GitHub's page to
+/// add it.
+pub fn ask_install(
+  owner: String,
+  repo: String,
+  install_url: String,
+) -> #(String, List(block.Block)) {
+  let text =
+    "crushling would like access to `"
+    <> owner
+    <> "/"
+    <> repo
+    <> "`, but it isn't set up on *"
+    <> owner
+    <> "* yet. Would you like to add it? If you don't own "
+    <> owner
+    <> ", GitHub asks its owners to approve."
+  #(text, [
+    block.section(text: block.mrkdwn(text), with: [
+      section.accessory(
+        element.button(
+          text: "Add to " <> owner,
+          action_id: install_action,
+          with: [
+            button.style(block.Primary),
+            button.url(install_url),
+            button.value(owner),
+          ],
+        ),
+      ),
+    ]),
+  ])
+}
+
+/// Said in place of the install ask once its button is pressed.
+pub fn installing(owner: String) -> String {
+  "Once crushling is on *"
+  <> owner
+  <> "*, the agent carries on by itself. If an owner has to approve it, the agent waits up to 10 minutes."
+}
+
+/// The thread a Connect button was pressed for, from its value.
+pub fn nudged_from(value: String) -> Result(#(String, String), Nil) {
+  string.split_once(value, "|")
 }

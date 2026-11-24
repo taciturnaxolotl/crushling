@@ -13,6 +13,7 @@
 
 import crushling/crush/client
 import crushling/github
+import crushling/github/route as github_route
 import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
 import crushling/registry
@@ -484,22 +485,63 @@ fn int_max(a: Int, b: Int) -> Int {
   }
 }
 
+/// The GitHub token thread `key`'s agent reads with, from its workspace's
+/// registry.
+pub fn github_access(
+  teams: Teams,
+  store: Store,
+) -> fn(String) -> Result(Option(String), String) {
+  fn(key) {
+    case instance_of(teams, store, key) {
+      Error(reason) -> Error(reason)
+      Ok(found) -> {
+        let reply = process.new_subject()
+        process.send(found.registry, registry.GitHubAccess(key, reply))
+        process.receive(reply, registry.github_access_ms + 10_000)
+        |> result.unwrap(Error("the workspace didn't answer in time"))
+      }
+    }
+  }
+}
+
+/// Ask whoever thread `key`'s agent works for, in its thread, for what a
+/// GitHub read is missing.
+pub fn github_ask(
+  teams: Teams,
+  store: Store,
+) -> fn(String, github_route.Want) -> Nil {
+  fn(key, want) {
+    case instance_of(teams, store, key) {
+      Ok(found) -> process.send(found.registry, registry.GitHubNudge(key, want))
+      Error(_) -> Nil
+    }
+  }
+}
+
+/// The instance serving thread `key`: its team is in its key, else in its
+/// row in the store.
+fn instance_of(
+  teams: Teams,
+  store: Store,
+  key: String,
+) -> Result(Instance, String) {
+  let team = case sandbox.team_of(key) {
+    Ok(team) -> Ok(team)
+    Error(Nil) ->
+      case store.thread(store, key) {
+        Ok(Some(thread)) -> Ok(thread.team)
+        _ -> Error(Nil)
+      }
+  }
+  team
+  |> result.try(fn(team) { find(teams, team) |> option.to_result(Nil) })
+  |> result.replace_error("this thread's workspace isn't served here")
+}
+
 /// The Slack tools reach each thread's own workspace: its team is in its
 /// key, else in its row in the store.
 pub fn tools_context(teams: Teams, store: Store) -> slack_tools.Context {
-  let instance_of = fn(key) {
-    let team = case sandbox.team_of(key) {
-      Ok(team) -> Ok(team)
-      Error(Nil) ->
-        case store.thread(store, key) {
-          Ok(Some(thread)) -> Ok(thread.team)
-          _ -> Error(Nil)
-        }
-    }
-    team
-    |> result.try(fn(team) { find(teams, team) |> option.to_result(Nil) })
-    |> result.replace_error("this thread's workspace isn't served here")
-  }
+  let instance_of = instance_of(teams, store, _)
   slack_tools.Context(
     workspace: fn(key) {
       use found <- result.map(instance_of(key))

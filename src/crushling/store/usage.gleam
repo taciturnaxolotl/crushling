@@ -77,7 +77,8 @@ fn usage_decoder() -> decode.Decoder(Usage) {
   decode.success(Usage(input_tokens:, output_tokens:, cost_usd:, requests:))
 }
 
-const sums = "SELECT coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0),
+const sums =
+  "SELECT coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0),
   coalesce(sum(cost_usd), 0.0), coalesce(sum(requests), 0) FROM usage"
 
 fn total(

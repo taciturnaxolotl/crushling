@@ -54,6 +54,17 @@ pub fn respond(
   tools: List(Tool),
   call: Call,
 ) -> Option(String) {
+  respond_with(body, key, tools, call, "")
+}
+
+/// `respond`, with `notes` added to the instructions the agent gets.
+pub fn respond_with(
+  body: String,
+  key: String,
+  tools: List(Tool),
+  call: Call,
+  notes: String,
+) -> Option(String) {
   let id_decoder =
     decode.one_of(decode.int |> decode.map(json.int), [
       decode.string |> decode.map(json.string),
@@ -90,7 +101,13 @@ pub fn respond(
                   #("version", json.string("0.1.0")),
                 ]),
               ),
-              #("instructions", json.string(instructions)),
+              #(
+                "instructions",
+                json.string(case notes {
+                  "" -> instructions
+                  notes -> instructions <> "\n\n" <> notes
+                }),
+              ),
             ]),
           )
         }
@@ -192,9 +209,19 @@ pub fn route(
   tools: List(Tool),
   call: Call,
 ) -> sandbox_http.Route {
+  route_with(secret, tools, call, "")
+}
+
+/// `route`, with `notes` added to the instructions the agent gets.
+pub fn route_with(
+  secret: String,
+  tools: List(Tool),
+  call: Call,
+  notes: String,
+) -> sandbox_http.Route {
   fn(req: Request(mist.Connection)) {
     case request.path_segments(req) {
-      ["mcp", key] -> Some(serve(req, key, secret, tools, call))
+      ["mcp", key] -> Some(serve(req, key, secret, tools, call, notes))
       _ -> None
     }
   }
@@ -206,6 +233,7 @@ fn serve(
   secret: String,
   tools: List(Tool),
   call: Call,
+  notes: String,
 ) -> Response(mist.ResponseData) {
   let reply = sandbox_http.reply
   let auth = request.get_header(req, "authorization") |> result.unwrap("")
@@ -218,7 +246,7 @@ fn serve(
           case bit_array.to_string(req.body) {
             Error(Nil) -> reply(400, "")
             Ok(body) ->
-              case respond(body, key, tools, call) {
+              case respond_with(body, key, tools, call, notes) {
                 None -> reply(202, "")
                 Some(json) ->
                   reply(200, json)

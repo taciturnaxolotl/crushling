@@ -4,6 +4,9 @@
 //// with the purpose as a prefix, so a token minted for one endpoint never
 //// opens another.
 
+import gleam/list
+import gleam/string
+
 pub type Purpose {
   /// The Slack tools at `/mcp/<key>`.
   Mcp
@@ -11,6 +14,9 @@ pub type Purpose {
   Tunnel
   /// The inference proxy at `/proxy/<key>/...`.
   Proxy
+  /// GitHub through the bridge. Its requests carry no key in the path, so
+  /// the token carries it: see `bound`.
+  GitHub
 }
 
 @external(erlang, "crushling_ffi", "hmac_sha256_hex")
@@ -24,6 +30,7 @@ fn prefix(purpose: Purpose) -> String {
     Mcp -> "mcp:"
     Tunnel -> "tunnel:"
     Proxy -> "proxy:"
+    GitHub -> "github:"
   }
 }
 
@@ -42,4 +49,29 @@ pub fn authorized(
 ) -> Bool {
   key != ""
   && equal_constant_time(header, "Bearer " <> mint(secret, purpose, key))
+}
+
+/// A token that names its thread: `<key>.<mac>`. For requests whose path
+/// can't carry the key, such as gh's to `api.github.com`.
+pub fn bound(secret: String, purpose: Purpose, key: String) -> String {
+  key <> "." <> mint(secret, purpose, key)
+}
+
+/// The thread a `bound` token is for, if it is one.
+pub fn opened(
+  secret: String,
+  purpose: Purpose,
+  token: String,
+) -> Result(String, Nil) {
+  // The mac is hex, so the key is everything before the last dot.
+  case string.split(token, ".") |> list.reverse {
+    [mac, ..rest] if rest != [] -> {
+      let key = list.reverse(rest) |> string.join(".")
+      case equal_constant_time(mac, mint(secret, purpose, key)) {
+        True -> Ok(key)
+        False -> Error(Nil)
+      }
+    }
+    _ -> Error(Nil)
+  }
 }

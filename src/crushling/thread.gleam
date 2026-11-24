@@ -115,6 +115,9 @@ pub type Message {
   /// known, because Slack streams each reply to one person.
   Prompt(text: String, attachments: List(client.Attachment), from: String)
   Where(reply: Subject(Location))
+  /// Who sent the prompt being worked on, or the last one: whose GitHub
+  /// the agent uses. "" before anyone has.
+  Requester(reply: Subject(String))
   /// Post a message in the thread's current conversation, and reply with its
   /// ts. The agent's Slack tools use this.
   Say(text: String, reply: Subject(Result(String, String)))
@@ -199,6 +202,9 @@ type State {
     retries: Int,
     /// Whether the Slack session has its title.
     titled: Bool,
+    /// What the thread is about: its first prompt's first line, cut short.
+    /// A code channel opened without a name is named after it.
+    topic: String,
     /// The busy state last sent to the registry.
     reported_busy: Bool,
     /// The model picked for the thread, pinned on every connect.
@@ -267,6 +273,7 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       subs: subagents.new(),
       retries: 0,
       titled: False,
+      topic: "",
       reported_busy: False,
       model: config.model,
       catalog: None,
@@ -286,7 +293,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     Stop -> {
       case state.active {
         Some(active) -> {
-          close_reply(state.sink, state.config.root, active, "")
+          close_reply(state.sink, state.config.root, state.subs, active, "")
           state.sink.working(False)
         }
         None -> Nil
@@ -312,6 +319,13 @@ fn step(state: State, message: Message) -> State {
       |> send_next
     Where(reply) -> {
       process.send(reply, Location(state.sink.conversation, state.config.root))
+      state
+    }
+    Requester(reply) -> {
+      process.send(reply, case state.active {
+        Some(active) if active.from != "" -> active.from
+        _ -> state.requester
+      })
       state
     }
     Say(text, reply) -> {
@@ -368,6 +382,10 @@ fn parent(state: State) -> subagents.Parent {
     sink: state.sink,
     root: state.config.root,
     known: state.known,
+    threads: case state.venue {
+      venue.CodeChannel(..) -> True
+      _ -> False
+    },
   )
 }
 
@@ -499,7 +517,7 @@ fn fail_everything(state: State, reason: String) -> State {
     [], None -> Nil
     // An open reply ends with the note instead.
     _, Some(Active(reply: Some(_), ..) as active) ->
-      close_reply(state.sink, state.config.root, active, note)
+      close_reply(state.sink, state.config.root, state.subs, active, note)
     _, _ -> {
       let _ = state.sink.post(note)
       Nil
@@ -537,9 +555,13 @@ fn send_prompt(state: State, connection: Connection, next: Queued) -> State {
   case sent {
     Ok(Nil) -> {
       state.sink.working(True)
-      case state.titled {
-        True -> Nil
-        False -> state.sink.title(session_title(next.text))
+      let state = case state.titled {
+        True -> state
+        False -> {
+          let topic = session_title(next.text)
+          state.sink.title(topic)
+          State(..state, topic:)
+        }
       }
       process.send_after(state.self, watchdog_ms, Watchdog)
       let active =
@@ -748,9 +770,12 @@ fn open_code_channel(
   found: repo.Found,
   name: String,
 ) -> #(State, Result(String, String)) {
-  let name = case string.trim(name) {
-    "" -> found.name
-    name -> name
+  // The agent's name for the work, else what the thread is about, else
+  // the repository: the Code tab shows the repository anyway.
+  let name = case string.trim(name), string.trim(state.topic) {
+    "", "" -> found.name
+    "", topic -> topic
+    name, _ -> name
   }
   state.config.notify(Opening)
   case state.sink.open_code_channel(name) {
@@ -767,22 +792,22 @@ fn open_code_channel(
       let to = venue.CodeChannel(channel:, repo: found.dir)
       state.config.notify(Moved(to, opened_ts))
       let thread = state.sink
-      // End the reply in the thread. The rest of the run goes to the channel,
-      // starting after what was already said.
-      let active =
-        option.map(state.active, fn(active) {
-          close_reply(
-            thread,
-            state.config.root,
-            active,
-            "_continued in <#" <> channel <> ">_",
+      let note = "_working on `" <> found.name <> "` in <#" <> channel <> ">_"
+      // Said once: as the end of the reply in the thread when a run is under
+      // way (the rest of it goes to the channel, starting after what was
+      // already said), else on its own.
+      let active = case state.active {
+        Some(active) -> {
+          close_reply(thread, state.config.root, state.subs, active, note)
+          Some(
+            Active(..active, reply: None, said_before: render.reply(active.run)),
           )
-          Active(..active, reply: None, said_before: render.reply(active.run))
-        })
-      let _ =
-        thread.post(
-          "_working on `" <> found.name <> "` in <#" <> channel <> ">_",
-        )
+        }
+        None -> {
+          let _ = thread.post(note)
+          None
+        }
+      }
       thread.working(False)
       channel_sink.working(active != None)
       let state = State(..state, venue: to, sink: channel_sink, active:)
@@ -799,7 +824,12 @@ fn flush(state: State) -> State {
     Some(active) ->
       State(
         ..state,
-        active: Some(show_progress(state.sink, state.config.root, active)),
+        active: Some(show_progress(
+          state.sink,
+          state.config.root,
+          state.subs,
+          active,
+        )),
       )
     None -> state
   }
@@ -847,9 +877,14 @@ fn watchdog(state: State) -> State {
 }
 
 /// Show the run as it goes: what the agent has said, and its steps.
-fn show_progress(sink: Sink, root: String, active: Active) -> Active {
+fn show_progress(
+  sink: Sink,
+  root: String,
+  subs: subagents.Subagents,
+  active: Active,
+) -> Active {
   let text = said_since(render.reply(active.run), active.said_before)
-  let steps = render.all_tasks(active.run, root)
+  let steps = render.all_tasks(active.run, root) |> subagents.rows(subs, _)
   case active.reply, text, steps {
     None, "", [] -> active
     _, _, _ -> {
@@ -877,10 +912,16 @@ fn said_since(text: String, before: String) -> String {
 }
 
 /// End an open reply with what it has, and `note`.
-fn close_reply(sink: Sink, root: String, active: Active, note: String) -> Nil {
+fn close_reply(
+  sink: Sink,
+  root: String,
+  subs: subagents.Subagents,
+  active: Active,
+  note: String,
+) -> Nil {
   case active.reply {
     Some(_) ->
-      case show_progress(sink, root, active).reply {
+      case show_progress(sink, root, subs, active).reply {
         Some(reply) -> {
           let _ = reply.finish(note)
           Nil
@@ -952,11 +993,6 @@ fn finish(state: State, active: Active) -> Nil {
   let answer = render.answer(active.run)
   let closing =
     [
-      // A code channel's Code tab already lists what changed.
-      case state.venue {
-        venue.CodeChannel(..) -> None
-        _ -> render.changes(changes)
-      },
       case active.run.outcome, active.cancel_note {
         Some(run.Cancelled), Some(note) -> Some("_" <> note <> "_")
         _, _ -> render.note(active.run, answer != [])
@@ -964,9 +1000,9 @@ fn finish(state: State, active: Active) -> Nil {
     ]
     |> option.values
     |> string.join("\n\n")
-  // The reply ends the run. It holds what the agent said, its steps, and a line
-  // that names the changed files.
-  let active = show_progress(sink, state.config.root, active)
+  // The reply ends the run. It holds what the agent said and its steps; what
+  // changed is in the Code tab, or the patch attached below.
+  let active = show_progress(sink, state.config.root, state.subs, active)
   let reply_ts = case active.reply, closing {
     Some(reply), _ -> reply.finish(closing) |> list.last |> result.unwrap("")
     None, "" -> ""

@@ -1,7 +1,7 @@
 # GitHub access and the App Home
 
-A design, not yet built. It lets people delegate GitHub work to the agent:
-read private repos, push branches, and stage pull requests that a person
+Steps 1 and 2 are built (see Order of work). It lets people delegate
+GitHub work to the agent: read private repos, push branches, and stage pull requests that a person
 opens from Slack. It also adds an App Home where each person manages their
 connection and sees what crushling is doing.
 
@@ -10,8 +10,9 @@ connection and sees what crushling is doing.
 - **The agent acts as the person who asked.** Each person connects their
   GitHub account once. The agent uses their token, so it can never reach
   more than they can, and GitHub shows the work as "<person> via crushling".
-  A token for the app itself (`crushling[bot]`) is only for reading public
-  repos when nobody has connected.
+  Without a connection, requests go to GitHub with no token, which reads
+  public repos (and REST data) but not GraphQL. A token for the app itself
+  (`crushling[bot]`) could fill that gap later.
 - **Grants are standing.** A connected person's threads use their
   connection without asking each time. That is safe because the token is
   theirs: "standing" means "the agent can do what you could do", never more.
@@ -47,37 +48,53 @@ deletes it.
 
 The token of the person whose message the agent is working on: the sender
 of the current turn's prompt. A turn crush starts by itself (a subagent
-report) keeps the last sender. If they haven't connected:
+report) keeps the last sender. If a read is refused for want of access, the bridge asks that person, in
+the thread, in one private message that changes as things move on, and
+holds the agent's command until they act (up to 10 minutes):
 
-- public repos still clone and read (through the app's own token);
-- anything else fails with a clear message to the agent, and the person gets
-  an ephemeral "connect GitHub so I can do this" with a button.
+- **Not connected**: "crushling would like private access to `owner/repo`.
+  Would you like to connect crushling to your GitHub account?" Connect
+  turns the message into the device code, then into "Connected as @login".
+  The read is sent again as them.
+- **Connected, but the app isn't installed on `owner`**: "crushling would
+  like access to `owner/repo`, but it isn't set up on owner yet…", with a
+  button to GitHub's install page. The bridge watches for the installation
+  (which may wait on an org owner's approval) and sends the read again.
+
+Only if they don't act in time does the agent get an error, which says
+what's missing. Public repos read without asking: with the app's own
+token when its key is set, else with none. The App Home lists the
+accounts the app is on, with a link to add another.
 
 ## Git through the bridge
 
-The sandbox image sets:
+Each sandbox gets git settings in its environment (`GIT_CONFIG_*`), so
+`https://github.com/`, `git@github.com:` and `ssh://git@github.com/` all go
+to the bridge's `/git/<owner>/<repo>/...`, with the thread's token in an
+`Authorization` header. The token names the thread (`<key>.<mac>`), so the
+bridge knows whose GitHub to use. It forwards to GitHub with that person's
+token:
 
-    git config --system url."http://172.30.0.1:7469/git/".insteadOf https://github.com/
-
-so every `git clone/fetch/push` of a GitHub URL goes to the bridge's
-`/git/<thread>/...` route, authenticated with the thread's existing bridge
-token. The bridge forwards to GitHub with the person's token:
-
-- **upload-pack** (clone, fetch): passed through as is.
-- **receive-pack** (push): the bridge reads the pkt-line command list at the
-  start of the request, and refuses the push unless every ref is
-  `refs/heads/crushling/*`, none is a deletion, and none is a force push (the
-  old id must match what GitHub has). Only then is the request streamed on.
-- **LFS**: refused at first. Rarely needed by the agent.
+- **upload-pack** (clone, fetch): streamed through as is.
+- **receive-pack** (push): refused for now. Step 3 lets it through after
+  reading the pkt-line command list at the start of the request: every ref
+  must be `refs/heads/crushling/*`, none a deletion, none a force push (the
+  old id must match what GitHub has).
+- **LFS**: refused.
+- A redirect to another GitHub URL (a renamed repo) is rewritten to stay
+  on the bridge. An error is answered in plain text, which git shows the
+  agent after `remote:`.
 
 ## `gh` through the bridge
 
-A `gh` wrapper in the image sends the read-only commands (`pr view`,
-`pr diff`, `pr checks`, `issue view`, `repo view`, `api` GETs) through the
-bridge's `/github/<thread>/` route, which adds the token. Everything else,
-including `gh auth login` and any write, is refused with a pointer to
-`propose_pr`. This alone would have made the #hyper review of a private PR
-work.
+The image's `gh` is a wrapper ahead of the real one. It sets gh's
+`http_unix_socket` to a socket that socat forwards to the bridge, and the
+thread's token is `GH_TOKEN`. gh then speaks plain HTTP to the bridge with
+`Host: api.github.com`, and the bridge sends it on with the person's token.
+Only reads go through: GET and HEAD, and GraphQL queries (no `mutation` or
+`subscription` outside strings and comments). Anything else is refused with
+a JSON `message` gh prints. This alone would have made the #hyper review of
+a private PR work.
 
 ## Staging pull requests
 
@@ -126,18 +143,21 @@ One GitHub App in the charmbracelet org, made by an org admin:
   metadata read
 - installed on the repos the agent may work in
 
-The bridge gets `CRUSHLING_GITHUB_CLIENT_ID`, plus `CRUSHLING_GITHUB_APP_ID`
-and `CRUSHLING_GITHUB_PRIVATE_KEY` for the app's own token. The Slack app's
+The bridge gets `CRUSHLING_GITHUB_CLIENT_ID` (and optionally
+`CRUSHLING_GITHUB_CLIENT_SECRET`, to revoke on disconnect). An app token
+for unconnected GraphQL reads would add `CRUSHLING_GITHUB_APP_ID` and
+`CRUSHLING_GITHUB_PRIVATE_KEY`. Sandboxes need the image's `gh` wrapper and
+socat. The Slack app's
 manifest turns on `home_tab_enabled`.
 
 ## Order of work
 
 Each step is usable on its own:
 
-1. **App Home and connecting.** The Home (GitHub section and stats), device
+1. **App Home and connecting.** Done. The Home (GitHub section and stats), device
    flow, token storage and refresh, `!github connect`/`disconnect`.
-2. **Reads through the bridge.** The git proxy's upload-pack, the read-only
-   `gh` wrapper. Private clones and PR reviews work.
+2. **Reads through the bridge.** Done: the git proxy's upload-pack, the
+   read-only `gh` wrapper. Private clones and PR reviews work.
 3. **Fenced pushes.** receive-pack with the ref checks.
 4. **Staged PRs.** `propose_pr` and the card.
 5. **Later: MCP servers** in the App Home.

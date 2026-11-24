@@ -1,0 +1,56 @@
+#!/bin/sh
+# gh, through the crushling bridge. The sandbox holds no GitHub token: gh
+# speaks plain HTTP over a unix socket (its http_unix_socket setting) that
+# socat forwards to the bridge, with the thread's bridge token as GH_TOKEN.
+# The bridge adds the GitHub token of the person the agent works for, and
+# lets only reads through.
+#
+# Installed ahead of the real gh in PATH. Without the bridge's settings it
+# is plain gh.
+set -eu
+real=/usr/bin/gh
+fail() { echo "gh (crushling): $*" >&2; exit 1; }
+
+base=${CRUSHLING_BRIDGE_URL:-}
+if [ -z "${GH_TOKEN:-}" ] || [ -z "$base" ]; then
+  exec "$real" "$@"
+fi
+command -v socat >/dev/null || fail "socat is missing from the image"
+
+hostport=${base#http://}
+hostport=${hostport%%/*}
+host=${hostport%:*}
+port=${hostport##*:}
+[ "$host" != "$hostport" ] || port=80
+
+dir=${TMPDIR:-/tmp}/crushling-gh-$(id -u)
+sock=$dir/bridge.sock
+mkdir -p -m 0700 "$dir"
+
+up() { socat -u OPEN:/dev/null "UNIX-CONNECT:$sock" 2>/dev/null; }
+
+if ! up; then
+  # One forwarder per sandbox, however many gh run at once.
+  exec 9>"$dir/lock"
+  flock 9
+  if ! up; then
+    rm -f "$sock"
+    setsid socat "UNIX-LISTEN:$sock,fork,mode=0600" "TCP:$host:$port" \
+      </dev/null >/dev/null 2>&1 &
+    i=0
+    until up; do
+      i=$((i + 1))
+      [ "$i" -le 50 ] || fail "couldn't start the forwarder to the bridge"
+      sleep 0.1
+    done
+  fi
+  exec 9>&-
+fi
+
+config=$dir/config
+mkdir -p "$config"
+[ -f "$config/config.yml" ] ||
+  printf 'http_unix_socket: %s\nprompt: disabled\n' "$sock" >"$config/config.yml"
+
+GH_CONFIG_DIR=$config GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+  GH_TELEMETRY=false DO_NOT_TRACK=1 exec "$real" "$@"

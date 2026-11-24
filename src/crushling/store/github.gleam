@@ -23,7 +23,6 @@ pub type Account {
   )
 }
 
-
 fn aad(team: String, user: String) -> BitArray {
   bit_array.from_string("github:" <> team <> ":" <> user)
 }

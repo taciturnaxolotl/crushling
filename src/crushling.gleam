@@ -15,8 +15,9 @@
 //// | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `CRUSHLING_PUBLIC_URL` | the OAuth install, on only when all three are set: `<public url>/slack/install` starts it and Slack returns to `<public url>/slack/oauth/callback` (add that redirect URL in the app's settings). Both are served on the events server. Until the app's public distribution is on, only its own workspace can install it |
 //// | `CRUSHLING_STORE_KEY` | 32 bytes, base64: the key bot tokens are encrypted with in the store, `<root>/crushling.db`. Unset, one is made at `<root>/store-key` (mode 0600), like `<root>/mcp-secret`; back it up, since stored tokens can't be read without it |
 //// | `CRUSHLING_HYPER_KEY` | required: the org's Charm Hyper API key; else `HYPER_API_KEY`, else `CRUSH_HYPER_API_KEY`. Agents use Hyper through the bridge's inference proxy at `/proxy/<thread>` and never see the key, nor the bridge's own `HYPER_*` settings |
-//// | `CRUSHLING_GITHUB_CLIENT_ID` | the client id of the GitHub App people connect their GitHub accounts through (in the App Home, or with `!github connect`); unset turns GitHub off. The app needs device flow on |
+//// | `CRUSHLING_GITHUB_CLIENT_ID` | the client id of the GitHub App people connect their GitHub accounts through (in the App Home, or with `!github connect`); unset turns GitHub off. The app needs device flow on. With the docker launcher, sandboxes' git and gh then read GitHub through the bridge at `/git/...` and as `api.github.com`, as the person the agent works for (`crushling/github/route`) |
 //// | `CRUSHLING_GITHUB_CLIENT_SECRET` | optional: lets a disconnect revoke the token on GitHub too |
+//// | `CRUSHLING_GITHUB_PRIVATE_KEY` | optional: the GitHub App's private key, PEM or base64 of it. Reads of public repos nobody connected for then use the app's token rather than none (`crushling/github/app`) |
 //// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | Hyper models; default `prism` and `prism-flash` |
 //// | `CRUSHLING_MODE` | `sysadmin` (default: no permission prompts and no blocked commands) or `yolo` |
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
@@ -43,6 +44,8 @@ import crushling/crush/client
 import crushling/events
 import crushling/files
 import crushling/github
+import crushling/github/app as github_app
+import crushling/github/route as github_route
 import crushling/install
 import crushling/instance
 import crushling/launcher
@@ -135,12 +138,17 @@ fn start() -> Result(Nil, String) {
     int.parse(setting("CRUSHLING_HELLO_TIMEOUT_SECONDS", "30"))
     |> result.replace_error("CRUSHLING_HELLO_TIMEOUT_SECONDS is not a number"),
   )
+  use #(github, app) <- result.try(github_app(github_from_settings()))
+  // Sandboxes reach GitHub through the bridge; a local agent uses the
+  // host's own git and gh.
+  let github_reads = github != option.None && !local
   let bridge =
     launcher.bridge(
       url: bridge_url,
       secret:,
       tunnels:,
       proxy:,
+      github: github_reads,
       hello_timeout_ms: hello_s * 1000,
     )
   // Self-host: the workspace of SLACK_BOT_TOKEN, seeded into the store.
@@ -152,7 +160,6 @@ fn start() -> Result(Nil, String) {
   let models = models()
   use launcher <- result.try(launcher_for(root, models, bridge, own_team))
   let tailnet = tailnet(launcher)
-  let github = github_from_settings()
 
   use install_on <- result.try(install_settings())
   use _ <- result.try(case env_team, install_on {
@@ -200,16 +207,41 @@ fn start() -> Result(Nil, String) {
     sandbox_http.start(bind, port, [
       tunnel.route(tunnels),
       proxy.route(proxy),
-      mcp.route(
+      mcp.route_with(
         secret,
         slack_tools.tools(tailnet: tailnet != option.None),
         fn(key, name, arguments) {
           slack_tools.call(context, key, name, arguments)
         },
+        case github_reads {
+          True -> github_route.instructions
+          False -> ""
+        },
       ),
       files.route(secret, root, fn(key, name, contents, comment) {
         slack_tools.share(context, key, name, contents, comment)
       }),
+      ..case github_reads {
+        True -> [
+          github_route.route(github_route.Setup(
+            secret:,
+            access: instance.github_access(teams, store),
+            web: github_route.github(),
+            api: github_route.github_api(),
+            bridge_url:,
+            app_token: fn(owner, repo) {
+              option.then(app, github_app.token(_, owner, repo))
+            },
+            installed: fn(owner, repo) {
+              option.then(app, github_app.installed(_, owner, repo))
+            },
+            ask: instance.github_ask(teams, store),
+            wait_ms: github_route.default_wait_ms,
+            poll_ms: github_route.default_poll_ms,
+          )),
+        ]
+        False -> []
+      }
     ]),
   )
   io.println(
@@ -478,6 +510,62 @@ fn save_spend(proxy: proxy.Proxy, store: store.Store) -> Nil {
 
 /// The GitHub App people connect their accounts through: on when
 /// `CRUSHLING_GITHUB_CLIENT_ID` is set.
+/// With the GitHub App's private key, reads nobody connected for use the
+/// app's own token on public repos; without it, no token.
+/// With the GitHub App's private key, the app's own token reads public
+/// repos nobody connected for, and the bridge knows where the app is
+/// installed. The config's `accounts` asks it.
+fn github_app(
+  github: option.Option(github.Config),
+) -> Result(
+  #(option.Option(github.Config), option.Option(github_app.App)),
+  String,
+) {
+  case github, setting("CRUSHLING_GITHUB_PRIVATE_KEY", "") {
+    option.None, _ | _, "" -> Ok(#(github, option.None))
+    option.Some(config), pem ->
+      case github_app.parse_key(pem) {
+        Error(Nil) ->
+          Error(
+            "CRUSHLING_GITHUB_PRIVATE_KEY is not an RSA private key in PEM (or base64 of one)",
+          )
+        Ok(key) -> {
+          use app <- result.map(
+            github_app.start(config, key)
+            |> result.replace_error("couldn't start the GitHub App's keeper"),
+          )
+          // Say where it's installed, or how to install it, once.
+          process.spawn_unlinked(fn() {
+            case github_app.accounts(app) {
+              option.Some(github.Accounts(logins: [], install_url:)) ->
+                io.println_error(
+                  "crushling: the GitHub App isn't installed anywhere, so connected people can read no private repos; install it at "
+                  <> install_url,
+                )
+              option.Some(github.Accounts(logins:, ..)) ->
+                io.println(
+                  "crushling: the GitHub App is installed on "
+                  <> string.join(logins, ", "),
+                )
+              option.None ->
+                io.println_error(
+                  "crushling: couldn't ask GitHub about the GitHub App; is CRUSHLING_GITHUB_PRIVATE_KEY the app's key?",
+                )
+            }
+          })
+          #(
+            option.Some(
+              github.Config(..config, accounts: fn() {
+                github_app.accounts(app)
+              }),
+            ),
+            option.Some(app),
+          )
+        }
+      }
+  }
+}
+
 fn github_from_settings() -> option.Option(github.Config) {
   case setting("CRUSHLING_GITHUB_CLIENT_ID", "") {
     "" -> option.None
@@ -489,6 +577,7 @@ fn github_from_settings() -> option.Option(github.Config) {
           secret -> option.Some(secret)
         },
         send: github.http,
+        accounts: github.no_accounts,
       ))
   }
 }

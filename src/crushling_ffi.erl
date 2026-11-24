@@ -3,7 +3,8 @@
 -export([line_at/2, uuid_v4/0, monotonic_ms/0, system_ms/0, log_warning/1, log_info/1, exec/3, sha256_hex/1,
          hmac_sha256_hex/2, equal_constant_time/2,
          file_exists/1, is_socket/1, file_stamp/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
-         read_file/1, write_bytes/2, list_dir/1, delete_file/1, is_loopback/1]).
+         read_file/1, write_bytes/2, list_dir/1, delete_file/1, is_loopback/1,
+         rsa_key/1, rs256/2]).
 
 line_at(Lines, Index) ->
     element(Index + 1, Lines).
@@ -187,3 +188,19 @@ write_bytes(Path, Bytes) ->
         {error, R} ->
             {error, unicode:characters_to_binary(io_lib:format("~p", [R]))}
     end.
+
+%% The first RSA private key in Pem, PKCS#1 or PKCS#8, as an opaque term.
+rsa_key(Pem) ->
+    try public_key:pem_decode(Pem) of
+        [Entry | _] ->
+            case public_key:pem_entry_decode(Entry) of
+                Key when element(1, Key) =:= 'RSAPrivateKey' -> {ok, Key};
+                _ -> {error, nil}
+            end;
+        [] -> {error, nil}
+    catch _:_ -> {error, nil}
+    end.
+
+%% An RS256 signature of Data with Key (from rsa_key/1).
+rs256(Data, Key) ->
+    public_key:sign(Data, sha256, Key).

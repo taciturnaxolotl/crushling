@@ -45,9 +45,12 @@ pub type Thread {
   Thread(key: String, channel: String, thread_ts: String, model: String)
 }
 
-/// Where to answer a `!github` command: privately, in this thread.
+/// Where to answer about a connect: privately, in this thread. `respond`
+/// is the `response_url` of the message asking them to connect, when they
+/// pressed its button: answers then replace that message, so the ask, the
+/// code and the outcome are one message.
 pub type Place {
-  Place(channel: String, thread_ts: String)
+  Place(channel: String, thread_ts: String, respond: Option(String))
 }
 
 pub type Message {
@@ -58,6 +61,9 @@ pub type Message {
   Connect(user: String, from: Option(Place))
   /// Forget `user`'s account.
   Disconnect(user: String, from: Option(Place))
+  /// `user`'s GitHub access token, refreshed first when it's about to
+  /// expire; None when they haven't connected (or their connection lapsed).
+  Access(user: String, reply: Subject(Result(Option(String), String)))
   // From pollers and workers.
   CodeIssued(user: String, flow: Int, code: github.DeviceCode)
   Granted(user: String, flow: Int, tokens: Tokens, login: String)
@@ -135,21 +141,33 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       |> publish(user)
     Connect(user, from) -> connect(state, user, from)
     Disconnect(user, from) -> disconnect(state, user, from)
+    Access(user, reply) -> {
+      let #(state, answer) = access(state, user)
+      process.send(reply, answer)
+      state
+    }
     CodeIssued(user, flow, code) ->
       case current(state, user, flow) {
         Some(found) -> {
           reply(state, found.from, user, code_note(code))
-          let found = Flow(..found, code: Some(code), until: now() + code.expires_in)
+          let found =
+            Flow(..found, code: Some(code), until: now() + code.expires_in)
           State(..state, flows: dict.insert(state.flows, user, found))
           |> publish(user)
         }
         None -> state
       }
-    Granted(user, flow, tokens, login) -> granted(state, user, flow, tokens, login)
+    Granted(user, flow, tokens, login) ->
+      granted(state, user, flow, tokens, login)
     Failed(user, flow, reason) ->
       case current(state, user, flow) {
         Some(found) -> {
-          reply(state, found.from, user, "_Couldn't connect GitHub: " <> reason <> "._")
+          reply(
+            state,
+            found.from,
+            user,
+            "_Couldn't connect GitHub: " <> reason <> "._",
+          )
           end_flow(state, user)
           |> note(user, "Couldn't connect: " <> reason <> ".")
           |> publish(user)
@@ -159,7 +177,9 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     PollerDown(process.ProcessDown(pid:, reason:, ..)) ->
       // A poller that answered has already ended its flow; one that died
       // without answering ends it here.
-      case list.find(dict.to_list(state.flows), fn(pair) { { pair.1 }.pid == pid }) {
+      case
+        list.find(dict.to_list(state.flows), fn(pair) { { pair.1 }.pid == pid })
+      {
         Ok(#(user, found)) -> {
           sys.warn(
             "crushling: connecting GitHub for "
@@ -172,7 +192,12 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
               process.Abnormal(_) -> "it crashed"
             },
           )
-          reply(state, found.from, user, "_Connecting GitHub stopped unexpectedly._")
+          reply(
+            state,
+            found.from,
+            user,
+            "_Connecting GitHub stopped unexpectedly._",
+          )
           end_flow(state, user)
           |> note(user, "Connecting stopped unexpectedly; try again.")
           |> publish(user)
@@ -258,7 +283,12 @@ fn poll(
   let result = {
     use code <- result.try(github.device_code(config))
     process.send(self, CodeIssued(user, flow, code))
-    use tokens <- result.try(github.wait(config, code, now() + code.expires_in, now))
+    use tokens <- result.try(github.wait(
+      config,
+      code,
+      now() + code.expires_in,
+      now,
+    ))
     use login <- result.map(github.login(config, tokens))
     #(tokens, login)
   }
@@ -288,11 +318,21 @@ fn granted(
       let state = end_flow(state, user)
       case accounts.put(state.setup.store, account) {
         Ok(Nil) -> {
-          reply(state, found.from, user, "_GitHub connected as @" <> login <> "._")
+          reply(
+            state,
+            found.from,
+            user,
+            "_GitHub connected as @" <> login <> "._",
+          )
           publish(state, user)
         }
         Error(reason) -> {
-          reply(state, found.from, user, "_Couldn't save the GitHub connection._")
+          reply(
+            state,
+            found.from,
+            user,
+            "_Couldn't save the GitHub connection._",
+          )
           sys.warn("crushling: saving GitHub for " <> user <> ": " <> reason)
           note(state, user, "Couldn't save the connection.") |> publish(user)
         }
@@ -336,11 +376,66 @@ fn disconnect(state: State, user: String, from: Option(Place)) -> State {
     }
     Ok(Some(account)), Ok(Nil) -> {
       process.spawn_unlinked(fn() {
-        process.send(self, Revoked(user, from, revoke(setup.github, account.tokens)))
+        process.send(
+          self,
+          Revoked(user, from, revoke(setup.github, account.tokens)),
+        )
       })
       state
     }
   }
+}
+
+/// The person's access token. A refresh happens here, in the actor, so two
+/// requests at once refresh once and a disconnect can't race the save. It
+/// is rare (every few hours a person) and short.
+fn access(
+  state: State,
+  user: String,
+) -> #(State, Result(Option(String), String)) {
+  let setup = state.setup
+  case setup.github, accounts.get(setup.store, setup.team, user) {
+    None, _ -> #(state, Ok(None))
+    _, Error(reason) -> #(state, Error(reason))
+    _, Ok(None) -> #(state, Ok(None))
+    Some(config), Ok(Some(account)) ->
+      case github.stale(account.tokens, now()) {
+        False -> #(state, Ok(Some(account.tokens.access)))
+        True ->
+          case github.lapsed(account.tokens, now()) {
+            True -> lapse(state, user, "it expired")
+            False ->
+              case github.refresh(config, account.tokens, now()) {
+                Ok(tokens) ->
+                  case
+                    accounts.put(
+                      setup.store,
+                      accounts.Account(..account, tokens:),
+                    )
+                  {
+                    Ok(Nil) -> #(state, Ok(Some(tokens.access)))
+                    Error(reason) -> #(state, Error(reason))
+                  }
+                Error(github.Refused(reason)) -> lapse(state, user, reason)
+                Error(github.Unreachable(reason)) -> #(state, Error(reason))
+              }
+          }
+      }
+  }
+}
+
+/// Forget a connection GitHub no longer honours, and say so on the Home.
+fn lapse(
+  state: State,
+  user: String,
+  why: String,
+) -> #(State, Result(Option(String), String)) {
+  sys.warn("crushling: GitHub connection of " <> user <> " lapsed: " <> why)
+  let _ = accounts.delete(state.setup.store, state.setup.team, user)
+  let state =
+    note(state, user, "Your GitHub connection expired; connect again.")
+    |> publish(user)
+  #(state, Ok(None))
 }
 
 /// Revoke on GitHub, refreshing first if the token has expired: GitHub
@@ -363,17 +458,21 @@ fn revoke(config: Option(github.Config), tokens: Tokens) -> Revoke {
 }
 
 fn code_note(code: github.DeviceCode) -> String {
-  "_Enter *`"
+  "Enter *`"
   <> code.user_code
   <> "`* at "
   <> code.verification_uri
-  <> " to connect your GitHub account._"
+  <> " to connect your GitHub account."
 }
 
 /// Answer privately where a `!github` command was given.
 fn reply(state: State, from: Option(Place), user: String, text: String) -> Nil {
   case from {
-    Some(Place(channel:, thread_ts:)) -> {
+    Some(Place(respond: Some(url), ..)) -> {
+      process.spawn_unlinked(fn() { slack.replace_ephemeral(url, text) })
+      Nil
+    }
+    Some(Place(channel:, thread_ts:, respond: None)) -> {
       let client = state.setup.client
       process.spawn_unlinked(fn() {
         slack.whisper(client, channel, thread_ts, user, text)
@@ -406,7 +505,9 @@ fn publish(state: State, user: String) -> State {
       )
     Some(_), Error(Nil) ->
       case accounts.get(state.setup.store, state.setup.team, user) {
-        Ok(Some(account)) -> home.Connected(login: account.login, note:)
+        // Where the app is, filled in when the Home is drawn.
+        Ok(Some(account)) ->
+          home.Connected(login: account.login, note:, accounts: None)
         Ok(None) -> home.NotConnected(note:)
         Error(reason) -> {
           sys.warn("crushling: reading GitHub for " <> user <> ": " <> reason)
@@ -432,6 +533,11 @@ fn start_publisher(setup: Setup) -> Subject(Publish) {
 
 fn publish_forever(setup: Setup, inbox: Subject(Publish)) -> Nil {
   let Publish(user:, threads:, github:) = process.receive_forever(inbox)
+  let github = case github, setup.github {
+    home.Connected(..) as connected, Some(config) ->
+      home.Connected(..connected, accounts: config.accounts())
+    github, _ -> github
+  }
   let view = home.view(draw(setup, threads, github))
   case views.publish(user_id: user, view:) |> httpc.send(setup.client) {
     Ok(_) -> Nil
@@ -465,9 +571,9 @@ fn draw(
             home.Thread(
               channel: thread.channel,
               link: chat.get_permalink(
-                  channel: thread.channel,
-                  message_ts: thread.thread_ts,
-                )
+                channel: thread.channel,
+                message_ts: thread.thread_ts,
+              )
                 |> httpc.send(setup.client)
                 |> result.map(fn(found) { found.permalink })
                 |> option.from_result,
