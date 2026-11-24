@@ -21,6 +21,8 @@ pub type Sink {
     /// fallback, and return its ts. `update_blocks` replaces one.
     post_blocks: fn(String, List(block.Block)) -> Result(String, String),
     update_blocks: fn(String, String, List(block.Block)) -> Result(Nil, String),
+    /// Delete a message the bot posted, by its ts.
+    delete: fn(String) -> Result(Nil, String),
     /// Post a plan card and return its ts. `update_plan` changes it later.
     post_plan: fn(render.Plan) -> Result(String, String),
     update_plan: fn(String, render.Plan) -> Result(Nil, String),

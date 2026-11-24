@@ -289,6 +289,12 @@ pub fn sink(
     post: fn(markdown) { post(markdown, markdown_blocks(markdown)) },
     post_blocks: post,
     update_blocks: update,
+    delete: fn(ts) {
+      use <- send
+      chat.delete(channel:, ts:)
+      |> httpc.send(client)
+      |> result.replace(Nil)
+    },
     upload: fn(name, content) {
       case in_code_channel {
         // The Code tab shows the changes there.

@@ -144,6 +144,7 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
       post:,
       post_blocks: fn(text, _) { post(text) },
       update_blocks: fn(_, _, _) { Ok(Nil) },
+      delete: fn(_) { Ok(Nil) },
       post_plan: fn(plan) { post(render.plan_markdown(plan)) },
       update_plan: fn(_, _) { Ok(Nil) },
       reply: fn(_) {

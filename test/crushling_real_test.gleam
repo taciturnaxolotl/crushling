@@ -283,6 +283,7 @@ fn sink(calls: Subject(Call)) -> sink.Sink {
     post: progress,
     post_blocks: fn(text, _) { progress(text) },
     update_blocks: fn(_, _, _) { Ok(Nil) },
+    delete: fn(_) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
     branch: fn(_, _) { Error("no branches in this test") },
     open_code_channel: fn(_) { Error("no code channels in this test") },
@@ -729,6 +730,7 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> sink.Sink {
     post:,
     post_blocks: fn(text, _) { post(text) },
     update_blocks: fn(_, _, _) { Ok(Nil) },
+    delete: fn(_) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
     branch: fn(intro, title) {
       process.send(calls, Branched(intro, title))
@@ -860,6 +862,7 @@ fn code_sink(
     post:,
     post_blocks: fn(text, _) { post(text) },
     update_blocks: fn(_, _, _) { Ok(Nil) },
+    delete: fn(_) { Ok(Nil) },
     upload: fn(_, _) { Ok(Nil) },
     branch: fn(_, _) { Error("no branches in this test") },
     open_code_channel: fn(name) {

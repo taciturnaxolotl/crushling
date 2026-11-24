@@ -340,9 +340,16 @@ pub fn pick(
         }
         models.Confirm(choice) ->
           case pin(context, catalog, choice) |> result.map_error(describe) {
+            // The card has done its job. If it can't be deleted (it may
+            // be somewhere the sink can't reach), show the new model on it.
             Ok(after) -> {
-              let fallback = switched_note(user, after)
-              redraw(context, card_ts, catalog, after, after, "", fallback)
+              case context.sink.delete(card_ts) {
+                Ok(Nil) -> Nil
+                Error(_) -> {
+                  let fallback = switched_note(user, after)
+                  redraw(context, card_ts, catalog, after, after, "", fallback)
+                }
+              }
               Picked(choice)
             }
             Error(reason) -> {

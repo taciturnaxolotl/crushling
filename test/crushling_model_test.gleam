@@ -389,6 +389,7 @@ type Seen {
   Posted(String)
   Card(List(block.Block))
   CardUpdated(ts: String, blocks: List(block.Block))
+  Deleted(ts: String)
   Chosen(option.Option(meta.ModelChoice))
 }
 
@@ -423,6 +424,10 @@ fn start(
       },
       update_blocks: fn(ts, _, blocks) {
         process.send(seen, CardUpdated(ts, blocks))
+        Ok(Nil)
+      },
+      delete: fn(ts) {
+        process.send(seen, Deleted(ts))
         Ok(Nil)
       },
       post_plan: fn(plan) { post(render.plan_markdown(plan)) },
@@ -580,13 +585,8 @@ pub fn card_shows_and_switches_test() {
   let fields = pinned(expect("model"))
   let assert Ok("beta") = dict.get(fields, "model")
   let assert Error(Nil) = dict.get(fields, "think")
-  // The card now says Beta, with no "switched" note.
-  let assert CardUpdated("card", blocks) = receive(seen)
-  let assert True = string.contains(header(blocks), "*Beta*")
-  let assert [_, _, _, block.Actions(_)] = blocks
-  let assert [menu, reasoning] = menus(blocks)
-  let assert "beta" = initial(menu)
-  let assert "beta|think:off" = initial(reasoning)
+  // The card has done its job and goes.
+  let assert Deleted("card") = receive(seen)
   let assert Chosen(Some(ModelChoice("beta", DefaultReasoning))) = receive(seen)
   // Then its reasoning.
   process.send(
@@ -598,9 +598,7 @@ pub fn card_shows_and_switches_test() {
     ),
   )
   let assert Ok("True") = dict.get(pinned(expect("model")), "think")
-  let assert CardUpdated(_, blocks) = receive(seen)
-  let assert [_, reasoning] = menus(blocks)
-  let assert "beta|think:on" = initial(reasoning)
+  let assert Deleted("card") = receive(seen)
   let assert Chosen(Some(ModelChoice("beta", Thinking(True)))) = receive(seen)
   process.send(t, thread.Stop)
   stop_server(server)
