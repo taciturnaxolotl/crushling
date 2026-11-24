@@ -1,6 +1,7 @@
 //// Socket Mode: one WebSocket to Slack, reopened whenever Slack asks or the
 //// connection drops, with every event turned into a `msg.Incoming`.
 
+import crushling/home
 import crushling/models
 import crushling/registry
 import crushling/registry/incoming as msg
@@ -71,6 +72,9 @@ pub fn router(base: app.App, find: Find) -> app.App {
                 option.unwrap(user, ""),
               ),
             )
+          // The Messages tab opens it too; only the Home tab has a view.
+          event.AppHomeOpened(user: Some(user), tab: Some("home"), ..) ->
+            process.send(registry, registry.HomeOpened(user))
           _ ->
             case incoming(event, bot_user) {
               Ok(message) -> process.send(registry, registry.Received(message))
@@ -81,6 +85,29 @@ pub fn router(base: app.App, find: Find) -> app.App {
   })
   |> tailnet_buttons(find)
   |> model_menus(find)
+  |> home_buttons(find)
+}
+
+/// The GitHub buttons on the App Home.
+fn home_buttons(app: app.App, find: Find) -> app.App {
+  use app, action_id <- list.fold(
+    [home.connect_action, home.disconnect_action],
+    app,
+  )
+  use _, payload <- app.action(app, action_id)
+  let team = option.map(payload.team, fn(team) { team.id })
+  let enterprise = option.map(payload.enterprise, fn(org) { org.id })
+  case target(find, team, enterprise) {
+    Ok(Target(registry:, ..)) -> {
+      let user = payload.user.id
+      process.send(registry, case action_id == home.connect_action {
+        True -> registry.GitHubConnect(user)
+        False -> registry.GitHubDisconnect(user)
+      })
+    }
+    Error(Nil) -> Nil
+  }
+  app.ack()
 }
 
 /// The installation an event was delivered to: its `authorizations` name

@@ -168,16 +168,18 @@ fn start_wiring() -> Wiring {
   let started = process.new_subject()
   process.spawn_unlinked(fn() {
     let assert Ok(p) =
-      proxy.start(proxy.Config(
-        secret:,
-        org_key:,
-        upstream: proxy.upstream_from(api_key),
-        thread_cap: meter.unlimited,
-        instance_cap: meter.unlimited,
-        max_per_thread: proxy.default_max_per_thread,
-        max_uploads: proxy.default_max_uploads,
-        upload_timeout_ms: proxy.default_upload_timeout_ms,
-      ))
+      proxy.start(
+        proxy.Config(
+          secret:,
+          org_key:,
+          upstream: proxy.upstream_from(api_key),
+          thread_cap: meter.unlimited,
+          instance_cap: meter.unlimited,
+          max_per_thread: proxy.default_max_per_thread,
+          max_uploads: proxy.default_max_uploads,
+          upload_timeout_ms: proxy.default_upload_timeout_ms,
+          ),
+      )
     let assert Ok(tunnels) =
       tunnel.start(tunnel.config(
         secret,
@@ -581,6 +583,8 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       tailnet: None,
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root:,
+      github: None,
+      default_model: "prism",
     ))
   process.send(
     r,
@@ -678,6 +682,8 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       tailnet: None,
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root:,
+      github: None,
+      default_model: "prism",
     ))
   process.send(
     r,

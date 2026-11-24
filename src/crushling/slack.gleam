@@ -595,6 +595,8 @@ pub type Command {
   TailnetCommand(on: Bool)
   /// `!model` shows the model card; `!model <id> [level]` switches.
   ModelCommand(argument: String)
+  /// `!github connect` or `!github disconnect`; `!github` alone connects.
+  GitHubCommand(connect: Bool)
   /// A `##` aside meant for the people in the thread, not the agent.
   SideComment
   NotACommand
@@ -610,6 +612,8 @@ pub fn command(prompt: String) -> Command {
     "!done" | "!archive" -> DoneCommand
     "!tailnet" | "!tailscale" -> TailnetCommand(on: True)
     "!tailnet off" | "!tailscale off" -> TailnetCommand(on: False)
+    "!github" | "!github connect" -> GitHubCommand(connect: True)
+    "!github disconnect" -> GitHubCommand(connect: False)
     "!model" -> ModelCommand("")
     // Model ids keep their case: take the argument from the original.
     "!model " <> _ -> ModelCommand(string.trim(string.drop_start(trimmed, 7)))
@@ -619,7 +623,7 @@ pub fn command(prompt: String) -> Command {
 }
 
 pub const help =
-  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• `!model` shows the model and lets you pick another and its reasoning; `!model <id> [level]` switches directly, and `!model default` goes back.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
+  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• `!model` shows the model and lets you pick another and its reasoning; `!model <id> [level]` switches directly, and `!model default` goes back.\n• `!github` connects your GitHub account so agents can work in your repos as you; `!github disconnect` forgets it. The App Home has both too.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
 /// A file attached to a Slack message. `size` is what Slack says, if it
 /// says.

@@ -208,6 +208,8 @@ fn start_registry(
       tailnet: None,
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root: "/tmp/crushling-people-test",
+      github: None,
+      default_model: "prism",
     ))
   r
 }

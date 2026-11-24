@@ -241,6 +241,11 @@ pub fn totals(proxy: Proxy, key: String) -> Usage {
   meter.totals(proxy.meter, key)
 }
 
+/// What each thread spent since the last call, for keeping elsewhere.
+pub fn drain(proxy: Proxy) -> List(#(String, Usage)) {
+  meter.drain(proxy.meter)
+}
+
 /// What every thread together has spent since the bridge started.
 pub fn instance_totals(proxy: Proxy) -> Usage {
   meter.instance_totals(proxy.meter)

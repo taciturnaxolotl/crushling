@@ -12,6 +12,7 @@
 //// `CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`.
 
 import crushling/crush/client
+import crushling/github
 import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
 import crushling/registry
@@ -50,6 +51,9 @@ pub type Shared {
     tailnet: Option(tailnet.Setup),
     /// A Slack client for a bot token; `slackline.new` but in tests.
     client: fn(String) -> slackline.Client,
+    /// The GitHub App people connect their accounts through, if set up.
+    github: Option(github.Config),
+    default_model: String,
   )
 }
 
@@ -328,6 +332,8 @@ fn start_instance(
       },
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root: shared.root,
+      github: shared.github,
+      default_model: shared.default_model,
     ))
     |> result.map_error(fn(error) {
       "registry for " <> team.id <> ": " <> string.inspect(error)

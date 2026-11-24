@@ -114,6 +114,8 @@ fn shared(
         slackline.new(token) |> slackline.with_base_url(api)
       client
     },
+    github: None,
+    default_model: "prism",
   )
 }
 

@@ -4,7 +4,7 @@ display_information:
   background_color: "#6b50ff"
 features:
   app_home:
-    home_tab_enabled: false
+    home_tab_enabled: true
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
     agent_tasks_enabled: true

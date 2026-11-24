@@ -10,7 +10,8 @@
 //// These are soft limits held by one process:
 ////
 //// - totals, revocations and per-thread overrides live in memory and reset
-////   when the bridge restarts;
+////   when the bridge restarts (`drain` hands what was spent to something
+////   that keeps it);
 //// - usage is only known when a response finishes, so requests already in
 ////   flight when a cap is reached can overshoot it, each by at most its own
 ////   cost (and a thread has at most `max_per_thread` in flight).
@@ -95,6 +96,7 @@ pub type Message {
   Totals(key: String, reply: Subject(Usage))
   InstanceTotals(reply: Subject(Usage))
   AllTotals(reply: Subject(List(#(String, Usage))))
+  Drain(reply: Subject(List(#(String, Usage))))
   OwnerDown(owner: Pid)
 }
 
@@ -107,6 +109,8 @@ type State {
   State(
     limits: Limits,
     usage: Dict(String, Usage),
+    /// What was recorded since the last `drain`, by thread.
+    undrained: Dict(String, Usage),
     instance: Usage,
     revoked: Set(String),
     overrides: Dict(String, Cap),
@@ -129,6 +133,7 @@ pub fn start(limits: Limits) -> Result(Subject(Message), actor.StartError) {
     State(
       limits:,
       usage: dict.new(),
+      undrained: dict.new(),
       instance: zero,
       revoked: set.new(),
       overrides: dict.new(),
@@ -206,11 +211,13 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     }
     Record(key, usage, reply) -> {
       let thread = dict.get(state.usage, key) |> result.unwrap(zero)
+      let undrained = dict.get(state.undrained, key) |> result.unwrap(zero)
       process.send(reply, Nil)
       actor.continue(
         State(
           ..state,
           usage: dict.insert(state.usage, key, add(thread, usage)),
+          undrained: dict.insert(state.undrained, key, add(undrained, usage)),
           instance: add(state.instance, usage),
         ),
       )
@@ -238,6 +245,10 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     AllTotals(reply) -> {
       process.send(reply, dict.to_list(state.usage))
       actor.continue(state)
+    }
+    Drain(reply) -> {
+      process.send(reply, dict.to_list(state.undrained))
+      actor.continue(State(..state, undrained: dict.new()))
     }
   }
 }
@@ -314,4 +325,9 @@ pub fn instance_totals(meter: Subject(Message)) -> Usage {
 
 pub fn all_totals(meter: Subject(Message)) -> List(#(String, Usage)) {
   process.call(meter, timeout, AllTotals)
+}
+
+/// What each thread spent since the last drain, emptied as it is taken.
+pub fn drain(meter: Subject(Message)) -> List(#(String, Usage)) {
+  process.call(meter, timeout, Drain)
 }

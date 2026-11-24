@@ -8,6 +8,7 @@ import crushling/thread
 import crushling/venue
 import gleam/erlang/process.{type Subject}
 import gleam/option.{type Option, None, Some}
+import gleam/set.{type Set}
 
 pub type Agent {
   /// The agent is launching.
@@ -46,6 +47,9 @@ pub type Entry {
     held_since: Option(Int),
     /// Whether an idle check is waiting for the thread to count its jobs.
     counting: Bool,
+    /// Who has sent the agent a prompt here since it last woke, for their
+    /// App Home.
+    people: Set(String),
   )
 }
 
@@ -64,6 +68,7 @@ pub fn new(channel: String, thread_ts: String, meta: Meta) -> Entry {
     pending: [],
     held_since: None,
     counting: False,
+    people: set.new(),
   )
 }
 

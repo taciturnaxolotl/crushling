@@ -15,6 +15,8 @@
 //// | `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `CRUSHLING_PUBLIC_URL` | the OAuth install, on only when all three are set: `<public url>/slack/install` starts it and Slack returns to `<public url>/slack/oauth/callback` (add that redirect URL in the app's settings). Both are served on the events server. Until the app's public distribution is on, only its own workspace can install it |
 //// | `CRUSHLING_STORE_KEY` | 32 bytes, base64: the key bot tokens are encrypted with in the store, `<root>/crushling.db`. Unset, one is made at `<root>/store-key` (mode 0600), like `<root>/mcp-secret`; back it up, since stored tokens can't be read without it |
 //// | `CRUSHLING_HYPER_KEY` | required: the org's Charm Hyper API key; else `HYPER_API_KEY`, else `CRUSH_HYPER_API_KEY`. Agents use Hyper through the bridge's inference proxy at `/proxy/<thread>` and never see the key, nor the bridge's own `HYPER_*` settings |
+//// | `CRUSHLING_GITHUB_CLIENT_ID` | the client id of the GitHub App people connect their GitHub accounts through (in the App Home, or with `!github connect`); unset turns GitHub off. The app needs device flow on |
+//// | `CRUSHLING_GITHUB_CLIENT_SECRET` | optional: lets a disconnect revoke the token on GitHub too |
 //// | `CRUSHLING_LARGE`, `CRUSHLING_SMALL` | Hyper models; default `prism` and `prism-flash` |
 //// | `CRUSHLING_MODE` | `sysadmin` (default: no permission prompts and no blocked commands) or `yolo` |
 //// | `CRUSHLING_LAUNCHER` | `docker` (default) or `local`, which runs agents unsandboxed as you |
@@ -40,6 +42,7 @@
 import crushling/crush/client
 import crushling/events
 import crushling/files
+import crushling/github
 import crushling/install
 import crushling/instance
 import crushling/launcher
@@ -53,6 +56,7 @@ import crushling/sandbox_http
 import crushling/slack_tools
 import crushling/socket
 import crushling/store
+import crushling/store/usage
 import crushling/sys
 import crushling/tailscale
 import crushling/tunnel
@@ -117,6 +121,7 @@ fn start() -> Result(Nil, String) {
   use secret <- result.try(mcp_secret(root))
   use store <- result.try(open_store(root))
   use proxy <- result.try(proxy_from_settings(secret))
+  keep_spend(proxy, store)
   use tunnels <- result.try(tunnel.start(
     tunnel.Config(..tunnel.config(secret, root), on_event: log_tunnel_event),
   ))
@@ -144,8 +149,10 @@ fn start() -> Result(Nil, String) {
     option.Some(seeded) -> seeded.team.id
     option.None -> ""
   }
-  use launcher <- result.try(launcher_for(root, models(), bridge, own_team))
+  let models = models()
+  use launcher <- result.try(launcher_for(root, models, bridge, own_team))
   let tailnet = tailnet(launcher)
+  let github = github_from_settings()
 
   use install_on <- result.try(install_settings())
   use _ <- result.try(case env_team, install_on {
@@ -167,6 +174,8 @@ fn start() -> Result(Nil, String) {
       env_team: option.map(env_team, fn(seeded) { seeded.env }),
       tailnet:,
       client: slackline.new,
+      github:,
+      default_model: models.large,
     )),
   )
   use _ <- result.try(case env_team {
@@ -284,7 +293,10 @@ fn start() -> Result(Nil, String) {
   // Over HTTP the registries ignore new messages once they are draining.
   option.map(socket, process.kill)
   // One deadline for all of it, from the registries' own timers.
-  case instance.shutdown(teams, grace_s * 1000) {
+  let outcome = instance.shutdown(teams, grace_s * 1000)
+  // Turns that finished during the grace period spent too.
+  save_spend(proxy, store)
+  case outcome {
     registry.Clean -> {
       io.println("crushling: stopped")
       halt(0)
@@ -434,6 +446,50 @@ fn fallback(name: String, old: String, default: String) -> String {
   case getenv(name) {
     Ok(value) -> value
     Error(Nil) -> setting(old, default)
+  }
+}
+
+/// Every `spend_flush_ms`, move what the proxy counted into the store, so
+/// spend outlives the bridge.
+fn keep_spend(proxy: proxy.Proxy, store: store.Store) -> Nil {
+  process.spawn_unlinked(fn() { flush_spend_forever(proxy, store) })
+  Nil
+}
+
+const spend_flush_ms = 10_000
+
+fn flush_spend_forever(proxy: proxy.Proxy, store: store.Store) -> Nil {
+  process.sleep(spend_flush_ms)
+  save_spend(proxy, store)
+  flush_spend_forever(proxy, store)
+}
+
+fn save_spend(proxy: proxy.Proxy, store: store.Store) -> Nil {
+  case proxy.drain(proxy) {
+    [] -> Nil
+    spent ->
+      case usage.record(store, spent) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          sys.warn("crushling: saving spend failed, dropped: " <> reason)
+      }
+  }
+}
+
+/// The GitHub App people connect their accounts through: on when
+/// `CRUSHLING_GITHUB_CLIENT_ID` is set.
+fn github_from_settings() -> option.Option(github.Config) {
+  case setting("CRUSHLING_GITHUB_CLIENT_ID", "") {
+    "" -> option.None
+    client_id ->
+      option.Some(github.Config(
+        client_id:,
+        client_secret: case setting("CRUSHLING_GITHUB_CLIENT_SECRET", "") {
+          "" -> option.None
+          secret -> option.Some(secret)
+        },
+        send: github.http,
+      ))
   }
 }
 

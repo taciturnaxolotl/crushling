@@ -76,6 +76,8 @@ fn start_with(
       tailnet: None,
       stop_backoff_ms:,
       root: dir,
+      github: None,
+      default_model: "prism",
     ))
   r
 }

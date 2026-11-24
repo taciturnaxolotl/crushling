@@ -106,6 +106,27 @@ const migrations = [
   CREATE TABLE bridge (name TEXT PRIMARY KEY, value TEXT NOT NULL);",
   // The model picked with `!model`, as JSON, or NULL for the default.
   "ALTER TABLE threads ADD COLUMN model TEXT;",
+  // What the inference proxy spent, by thread and UTC day; and each
+  // person's GitHub connection, its tokens sealed under the store key.
+  "CREATE TABLE usage (
+    team_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    day TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    requests INTEGER NOT NULL,
+    PRIMARY KEY (key, day)
+  );
+  CREATE INDEX usage_team_day ON usage (team_id, day);
+  CREATE TABLE github_accounts (
+    team_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    login TEXT NOT NULL,
+    tokens_enc BLOB NOT NULL,
+    connected_at INTEGER NOT NULL,
+    PRIMARY KEY (team_id, user_id)
+  );",
 ]
 
 /// The schema version this code writes.
@@ -214,7 +235,8 @@ fn describe(error: sqlight.Error) -> String {
 }
 
 /// Run `job` on the store's actor and wait for its answer.
-fn run(
+@internal
+pub fn run(
   store: Store,
   job: fn(sqlight.Connection, BitArray) -> Result(a, String),
 ) -> Result(a, String) {
@@ -228,7 +250,8 @@ fn run(
   |> result.flatten
 }
 
-fn query(
+@internal
+pub fn query(
   connection: sqlight.Connection,
   sql: String,
   with: List(sqlight.Value),
@@ -238,7 +261,8 @@ fn query(
   |> result.map_error(describe)
 }
 
-fn exec(
+@internal
+pub fn exec(
   connection: sqlight.Connection,
   sql: String,
   with: List(sqlight.Value),

@@ -217,6 +217,8 @@ fn start_registry_as(
       tailnet:,
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root: "/tmp/crushling-registry-test",
+      github: None,
+      default_model: "prism",
     ))
   r
 }

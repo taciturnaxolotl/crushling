@@ -732,6 +732,8 @@ fn start_woken_registry(name: String) {
       tailnet: None,
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root: "/tmp/crushling-model-test",
+      github: None,
+      default_model: "prism",
     ))
   // `!model` on an asleep thread wakes it to show the card.
   process.send(

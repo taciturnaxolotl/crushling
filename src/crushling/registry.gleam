@@ -23,7 +23,9 @@
 //// stop has finished and the agent can start again. Shutdown waits for
 //// launches in flight and stops what they started.
 
+import crushling/connections
 import crushling/crush/client
+import crushling/github
 import crushling/launcher.{type Launcher}
 import crushling/meta.{type Link, type Meta, Link, Meta}
 import crushling/models
@@ -86,6 +88,10 @@ pub type Config {
     /// The instance root: each thread's attachments are kept under
     /// `<root>/<key>/files`.
     root: String,
+    /// The GitHub App people connect their accounts through, if set up.
+    github: Option(github.Config),
+    /// The model agents start on, for the App Home.
+    default_model: String,
   )
 }
 
@@ -142,6 +148,11 @@ pub type Message {
   Lookup(key: String, reply: Subject(Option(Subject(thread.Message))))
   /// Whether `user` is a member of the workspace, from lookup `id`.
   Member(user: String, id: Int, result: Result(Bool, String))
+  /// `user` opened the App Home.
+  HomeOpened(user: String)
+  /// Connect or disconnect `user`'s GitHub account, from the App Home.
+  GitHubConnect(user: String)
+  GitHubDisconnect(user: String)
   /// The thread didn't count its jobs for the idle check of `generation` in
   /// time.
   JobsUncounted(key: String, generation: Int)
@@ -161,6 +172,7 @@ pub type Message {
 type Waiting {
   WaitingMessage(Incoming)
   WaitingStop(channel: String, thread_ts: String, user: String)
+  WaitingHome(user: String, ask: HomeAsk)
   WaitingPick(
     home: #(String, String),
     pick: models.Pick,
@@ -199,6 +211,8 @@ type State {
     /// Lookups in flight, by user: the lookup's id and what waits for it,
     /// oldest first.
     looking_up: Dict(String, #(Int, List(Waiting))),
+    /// The workspace's GitHub connections and App Homes.
+    connections: Subject(connections.Message),
   )
 }
 
@@ -226,6 +240,17 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       process.new_selector()
       |> process.select(self)
       |> process.select_monitors(ThreadDown)
+    // Linked: it goes down with the registry, and comes back with it.
+    use connections <- result.try(
+      connections.start(connections.Setup(
+        client: config.client,
+        store: config.store,
+        team: config.team,
+        github: config.github,
+        default_model: config.default_model,
+      ))
+      |> result.replace_error("the App Home could not start"),
+    )
     State(
       config:,
       self:,
@@ -249,6 +274,7 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       ),
       members: people.new_cache(people.cache_ms),
       looking_up: dict.new(),
+      connections:,
     )
     |> actor.initialised
     |> actor.selecting(selector)
@@ -369,6 +395,7 @@ fn member_known(
               stop_requested(state, channel, thread_ts, user)
             WaitingPick(home, pick, card, user), None ->
               model_picked(state, home, pick, card, user)
+            WaitingHome(user, ask), None -> home_ask(state, user, ask)
           }
         })
       case result {
@@ -459,6 +486,12 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     }
     IdleCheck(key, generation) ->
       actor.continue(idle_check(state, key, generation))
+    HomeOpened(user) -> actor.continue(home_ask(state, user, ShowHome))
+    GitHubConnect(user) -> actor.continue(home_ask(state, user, Connect(None)))
+    GitHubDisconnect(user) -> {
+      process.send(state.connections, connections.Disconnect(user, None))
+      actor.continue(state)
+    }
     JobsUncounted(key, generation) ->
       case dict.get(state.threads, key) {
         Ok(Entry(counting: True, ..) as entry)
@@ -744,6 +777,19 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
   let config = state.config
   case command, route.known {
     slack.SideComment, _ -> state
+    // Works anywhere the bot hears it, with or without an agent.
+    slack.GitHubCommand(connect:), _ -> {
+      let user = route.incoming.user
+      let from =
+        Some(connections.Place(route.incoming.channel, route.incoming.thread_ts))
+      case connect {
+        True -> home_ask(state, user, Connect(from))
+        False -> {
+          process.send(state.connections, connections.Disconnect(user, from))
+          state
+        }
+      }
+    }
     slack.HelpCommand, _ -> {
       whisper(config, route.incoming, slack.help)
       state
@@ -842,7 +888,11 @@ fn queue(state: State, route: Route, known: Option(Entry)) -> State {
   case known {
     Some(entry) -> {
       let entry =
-        Entry(..entry, backlog: list.append(entry.backlog, [incoming]))
+        Entry(
+          ..entry,
+          backlog: list.append(entry.backlog, [incoming]),
+          people: set.insert(entry.people, incoming.user),
+        )
       case dict.has_key(state.threads, route.key) {
         True ->
           State(..state, threads: dict.insert(state.threads, route.key, entry))
@@ -857,6 +907,7 @@ fn queue(state: State, route: Route, known: Option(Entry)) -> State {
         Entry(
           ..new_entry(incoming.channel, incoming.thread_ts, meta.new(follow)),
           backlog: [incoming],
+          people: set.from_list([incoming.user]),
         )
       launch(state, route.key, entry)
     }
@@ -914,6 +965,73 @@ fn model_picked(
         _ -> refuse("_I'm not working in that thread anymore._")
       }
   }
+}
+
+// The App Home and GitHub ------------------------------------------------------
+
+/// What someone asked of the App Home or `!github`, waiting on whether they
+/// may use crushling.
+type HomeAsk {
+  ShowHome
+  Connect(from: Option(connections.Place))
+}
+
+/// Do what `user` asked once it's known whether they may use crushling.
+/// Disconnecting needs no permission: anyone may forget their own account.
+fn home_ask(state: State, user: String, ask: HomeAsk) -> State {
+  case may_use(state, user), unknown(state, user) {
+    False, True -> wait_for_member(state, user, WaitingHome(user, ask))
+    allowed, _ -> {
+      case ask, allowed {
+        Connect(from:), True ->
+          process.send(state.connections, connections.Connect(user, from))
+        Connect(from: Some(connections.Place(channel:, thread_ts:))), False -> {
+          let client = state.config.client
+          process.spawn_unlinked(fn() {
+            slack.whisper(
+              client,
+              channel,
+              thread_ts,
+              user,
+              "_You can't use crushling here._",
+            )
+          })
+          Nil
+        }
+        _, _ -> Nil
+      }
+      // Either way their Home shows where they stand.
+      process.send(
+        state.connections,
+        connections.Show(user, case allowed {
+          True -> Some(threads_of(state, user))
+          False -> None
+        }),
+      )
+      state
+    }
+  }
+}
+
+/// `user`'s threads with a running agent: ones they've sent a prompt in.
+fn threads_of(state: State, user: String) -> List(connections.Thread) {
+  dict.to_list(state.threads)
+  |> list.filter_map(fn(pair) {
+    let #(key, entry) = pair
+    case entry.agent, set.contains(entry.people, user) {
+      Live(..), True ->
+        Ok(connections.Thread(
+          key:,
+          channel: entry.channel,
+          thread_ts: entry.thread_ts,
+          model: case entry.meta.model {
+            Some(choice) -> choice.model
+            None -> state.config.default_model
+          },
+        ))
+      _, _ -> Error(Nil)
+    }
+  })
 }
 
 /// Change a thread's meta, from its entry in memory or, for a thread whose
