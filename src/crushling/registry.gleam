@@ -155,6 +155,9 @@ pub type Message {
   /// Connect or disconnect `user`'s GitHub account, from the App Home.
   GitHubConnect(user: String)
   GitHubDisconnect(user: String)
+  /// A slash command in a code channel, as the `!` command `text` from
+  /// `user`. Answered there, privately where it says anything.
+  Slash(channel: String, user: String, text: String)
   /// `user` pressed Connect on the note asking them, in a thread.
   GitHubConnectIn(user: String, place: connections.Place)
   /// Thread `key`'s agent couldn't read GitHub for want of a connection:
@@ -508,6 +511,19 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(idle_check(state, key, generation))
     HomeOpened(user) -> actor.continue(home_ask(state, user, ShowHome))
     GitHubConnect(user) -> actor.continue(home_ask(state, user, Connect(None)))
+    Slash(channel:, user:, text:) -> {
+      // Said at the top of the channel, now, and heard as if mentioned.
+      let ms = sys.system_ms()
+      let ts =
+        int.to_string(ms / 1000)
+        <> "."
+        <> string.pad_start(int.to_string(ms % 1000 * 1000), 6, "0")
+      actor.continue(received(
+        state,
+        Incoming(channel, "", ts, user, text, True, []),
+        0,
+      ))
+    }
     GitHubConnectIn(user, place) ->
       actor.continue(home_ask(state, user, Connect(Some(place))))
     GitHubNudge(key, want) -> {
@@ -850,6 +866,26 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       set_meta(state, route.key, entry, meta)
     }
     slack.DoneCommand, Some(entry) -> done(state, route, entry)
+    slack.InfoCommand, Some(Entry(agent: Live(thread:, ..), ..)) -> {
+      let incoming = route.incoming
+      process.spawn_unlinked(fn() {
+        let asked = process.new_subject()
+        process.send(thread, thread.Info(asked))
+        let text =
+          process.receive(asked, 15_000)
+          |> result.unwrap("_The agent didn't answer in time._")
+        whisper(config, incoming, text)
+      })
+      state
+    }
+    slack.InfoCommand, Some(_) -> {
+      whisper(
+        config,
+        route.incoming,
+        "_The agent is asleep; send a message to wake it, then ask again._",
+      )
+      state
+    }
     slack.StopCommand, Some(Entry(agent: Live(thread:, ..), ..) as entry)
       if entry.in_flight > 0 || entry.working
     -> {
@@ -905,6 +941,7 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
     slack.PauseCommand, None
     | slack.ResumeCommand, None
     | slack.DoneCommand, None
+    | slack.InfoCommand, None
     | slack.TailnetCommand(..), None
     | slack.ModelCommand(..), None
     -> {
@@ -1272,8 +1309,11 @@ fn launch(state: State, key: String, entry: Entry) -> State {
     let result = {
       use launched <- launcher.launch_then(config.launcher, key)
       let sink = case meta.venue {
-        venue.CodeChannel(channel: code, ..) ->
+        venue.CodeChannel(channel: code, ..) -> {
+          // Channels opened before commands existed get them now.
+          slack.set_code_commands(config.client, code)
           slack.sink(config.client, config.team, code, slack.InCodeChannel)
+        }
         _ ->
           slack.sink(
             config.client,

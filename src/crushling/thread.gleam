@@ -122,6 +122,8 @@ pub type Message {
   /// Who sent the prompt being worked on, or the last one: whose GitHub
   /// the agent uses. "" before anyone has.
   Requester(reply: Subject(String))
+  /// Where the work stands, for `!info`: a few lines of Slack markdown.
+  Info(reply: Subject(String))
   /// Post a message in the thread's current conversation, and reply with its
   /// ts. The agent's Slack tools use this.
   Say(text: String, reply: Subject(Result(String, String)))
@@ -323,6 +325,21 @@ fn step(state: State, message: Message) -> State {
       |> send_next
     Where(reply) -> {
       process.send(reply, Location(state.sink.conversation, state.config.root))
+      state
+    }
+    Info(reply) -> {
+      let dir = case state.venue {
+        venue.CodeChannel(repo:, ..)
+        | venue.ThreadOnly(repo:)
+        | venue.Archived(repo:) -> repo
+        venue.Thread -> ""
+      }
+      process.send(reply, case dir, state.connection {
+        "", _ -> "_No repository here yet._"
+        _, None ->
+          "_The agent is asleep; send a message to wake it, then ask again._"
+        dir, Some(_) -> repo.status(shell(state), dir)
+      })
       state
     }
     Requester(reply) -> {

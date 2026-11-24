@@ -112,6 +112,15 @@ pub fn repo_info(dir: String) -> String {
   <> " && git remote get-url origin 2>/dev/null; git rev-parse --abbrev-ref HEAD 2>/dev/null; git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||'"
 }
 
+/// Prints, one per line, for the repository in `dir`: how many files
+/// aren't committed, the branch it tracks (or nothing), and how many
+/// commits it is ahead of it.
+pub fn push_state(dir: String) -> String {
+  "cd "
+  <> quote(dir)
+  <> " && git status --porcelain 2>/dev/null | wc -l; u=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null); echo \"$u\"; [ -n \"$u\" ] && git rev-list --count '@{u}..HEAD' 2>/dev/null || echo"
+}
+
 pub type RepoInfo {
   RepoInfo(url: String, branch: String, base: String)
 }

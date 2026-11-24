@@ -87,6 +87,29 @@ pub fn router(base: app.App, find: Find) -> app.App {
   |> tailnet_buttons(find)
   |> model_menus(find)
   |> home_buttons(find)
+  |> code_commands(find)
+}
+
+/// The slash commands offered in code channels: each is its `!` command,
+/// said in the channel by whoever typed it.
+fn code_commands(app: app.App, find: Find) -> app.App {
+  use app, #(name, _, _) <- list.fold(slack.code_commands, app)
+  use command <- app.command(app, "/" <> name)
+  case target(find, command.team_id, command.enterprise_id) {
+    Ok(Target(registry:, ..)) ->
+      process.send(
+        registry,
+        registry.Slash(
+          channel: command.channel_id,
+          user: command.user_id,
+          text: string.trim(
+            "!" <> name <> " " <> option.unwrap(command.text, ""),
+          ),
+        ),
+      )
+    Error(Nil) -> Nil
+  }
+  app.ack()
 }
 
 /// The GitHub buttons on the App Home, and on the asks in threads.

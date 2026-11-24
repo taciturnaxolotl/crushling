@@ -336,6 +336,7 @@ pub fn sink(
             }),
           )
           let code = opened.channel_id
+          set_code_commands(client, code)
           let channel_sink = sink(client, team, code, InCodeChannel)
           channel_sink.title(name)
           Ok(#(channel_sink, code))
@@ -496,9 +497,47 @@ pub fn whisper(
 ) -> Nil {
   let _ =
     chat.post_ephemeral(channel:, user:, text:)
-    |> post_ephemeral.thread_ts(thread_ts)
+    |> fn(call) {
+      case thread_ts {
+        "" -> call
+        ts -> post_ephemeral.thread_ts(call, ts)
+      }
+    }
     |> httpc.send(client)
   Nil
+}
+
+/// The slash commands crushling offers in its code channels, by name
+/// without the slash, each standing for its `!` command. None may be one of
+/// Slack's own (`/status`, `/archive`…): a clash fails the whole set.
+pub const code_commands = [
+  #("info", "Show the branch, what changed, and whether it's pushed", ""),
+  #("done", "Wrap up: archive this channel", ""),
+  #("stop", "Stop the current run", ""),
+  #("model", "Show or switch the agent's model", "[model] [reasoning]"),
+]
+
+/// Offer `code_commands` in code channel `channel`. Best effort: the `!`
+/// commands work regardless.
+pub fn set_code_commands(client: slackline.Client, channel: String) -> Nil {
+  let commands =
+    list.map(code_commands, fn(command) {
+      let #(name, description, hint) = command
+      agents.AgentCommand(name:, description:, argument_hint: case hint {
+        "" -> None
+        hint -> Some(hint)
+      })
+    })
+  case
+    agents.conversations_set_commands(channel_id: channel, commands:)
+    |> httpc.send(client)
+  {
+    Ok(_) -> Nil
+    Error(error) ->
+      sys.warn(
+        "crushling: offering commands in " <> channel <> ": " <> describe(error),
+      )
+  }
 }
 
 /// Replace the ephemeral message an interaction came from, through its
@@ -601,6 +640,8 @@ pub type Command {
   ResumeCommand
   /// Archive the code channel: the work is done.
   DoneCommand
+  /// Where the work stands: branch, changes, pushed or not.
+  InfoCommand
   /// `!tailnet` asks to put the sandbox on the tailnet; `!tailnet off`
   /// takes it off.
   TailnetCommand(on: Bool)
@@ -621,6 +662,7 @@ pub fn command(prompt: String) -> Command {
     "!pause" -> PauseCommand
     "!resume" | "!unpause" -> ResumeCommand
     "!done" | "!archive" -> DoneCommand
+    "!info" -> InfoCommand
     "!tailnet" | "!tailscale" -> TailnetCommand(on: True)
     "!tailnet off" | "!tailscale off" -> TailnetCommand(on: False)
     "!github" | "!github connect" -> GitHubCommand(connect: True)
@@ -634,7 +676,7 @@ pub fn command(prompt: String) -> Command {
 }
 
 pub const help =
-  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!done` in a code channel archives it.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• `!model` shows the model and lets you pick another and its reasoning; `!model <id> [level]` switches directly, and `!model default` goes back.\n• `!github` connects your GitHub account so agents can work in your repos as you; `!github disconnect` forgets it. The App Home has both too.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
+  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!info` shows the branch, what changed, and whether it's pushed.\n• `!done` in a code channel archives it. In a code channel these are slash commands too: `/info`, `/done`, `/stop`, `/model`.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• `!model` shows the model and lets you pick another and its reasoning; `!model <id> [level]` switches directly, and `!model default` goes back.\n• `!github` connects your GitHub account so agents can work in your repos as you; `!github disconnect` forgets it. The App Home has both too.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
 /// A file attached to a Slack message. `size` is what Slack says, if it
 /// says.

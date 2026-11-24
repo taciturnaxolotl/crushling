@@ -538,6 +538,39 @@ fn next_call(
   }
 }
 
+/// Calls until one of each method in `want` has come, the code-bearing
+/// Home counting only once it shows the code.
+fn calls_until(
+  calls: process.Subject(#(String, String)),
+  want: List(String),
+  got: List(#(String, String)),
+  ms: Int,
+) -> List(#(String, String)) {
+  case want {
+    [] -> got
+    _ ->
+      case process.receive(calls, ms) {
+        Error(Nil) -> got
+        Ok(#(method, body)) ->
+          case
+            list.contains(want, method)
+            && {
+              method != "views.publish" || string.contains(body, "ABCD-1234")
+            }
+          {
+            True ->
+              calls_until(
+                calls,
+                list.filter(want, fn(m) { m != method }),
+                [#(method, body), ..got],
+                ms,
+              )
+            False -> calls_until(calls, want, got, ms)
+          }
+      }
+  }
+}
+
 /// The next Home published within `ms` whose JSON contains `text`.
 fn home_with(
   calls: Subject(#(String, String)),
@@ -628,10 +661,15 @@ pub fn only_allowed_people_connect_test() {
     ),
   )
   let assert True = asked_github(seen, "/login/device/code", 2000)
-  let assert Ok(said) = next_call(calls, "respond", 2000)
+  // The reply and the Home come in either order.
+  let got = calls_until(calls, ["respond", "views.publish"], [], 3000)
+  let assert Ok(said) = list.key_find(got, "respond")
   let assert True = string.contains(said, "ABCD-1234")
   let assert True = string.contains(said, "\"replace_original\":true")
-  let assert Ok(_) = home_with(calls, "ABCD-1234", 2000)
+  let assert True =
+    list.any(got, fn(call) {
+      call.0 == "views.publish" && string.contains(call.1, "ABCD-1234")
+    })
   process.send(r, registry.GitHubDisconnect("U1"))
   stop(slack_pid)
   store.close(s)
