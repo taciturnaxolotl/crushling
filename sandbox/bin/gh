@@ -2,18 +2,33 @@
 # gh, through the crushling bridge. The sandbox holds no GitHub token: gh
 # speaks plain HTTP over a unix socket (its http_unix_socket setting) that
 # socat forwards to the bridge, with the thread's bridge token as GH_TOKEN.
-# The bridge adds the GitHub token of the person the agent works for, and
-# lets only reads through.
+# The bridge adds the GitHub token of the person the agent works for.
 #
-# Installed ahead of the real gh in PATH. Without the bridge's settings it
-# is plain gh.
+# Installed ahead of the real gh in PATH; the image moves the real one out
+# of PATH, to /usr/lib/crushling/gh. Without the bridge's settings it is
+# plain gh.
 set -eu
-real=/usr/bin/gh
+real=/usr/lib/crushling/gh
+[ -x "$real" ] || real=/usr/bin/gh
 fail() { echo "gh (crushling): $*" >&2; exit 1; }
 
 base=${CRUSHLING_BRIDGE_URL:-}
-if [ -z "${GH_TOKEN:-}" ] || [ -z "$base" ]; then
-  exec "$real" "$@"
+[ -n "$base" ] || exec "$real" "$@"
+
+# Logging in here would put a token in the sandbox and go around the
+# person's connection, so it isn't possible.
+case "${1:-} ${2:-}" in
+  "auth login"* | "auth refresh"* | "auth setup-git"* | "auth token"* | \
+  "auth switch"* | "auth logout"*)
+    fail "you can't log in to GitHub here: crushling already connects gh and git to GitHub as the person you're working for. If a read or push is refused, the error says why; tell them, and never ask anyone to enter a code." ;;
+esac
+
+# The thread's bridge token: from the environment, or the one the sandbox
+# started with, should a command have unset it.
+if [ -z "${GH_TOKEN:-}" ]; then
+  GH_TOKEN=$(tr '\0' '\n' </proc/1/environ 2>/dev/null | sed -n 's/^GH_TOKEN=//p')
+  [ -n "$GH_TOKEN" ] || fail "GH_TOKEN, crushling's token for gh, isn't set"
+  export GH_TOKEN
 fi
 command -v socat >/dev/null || fail "socat is missing from the image"
 
