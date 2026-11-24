@@ -7,6 +7,7 @@ import crushling/registry/incoming as msg
 import crushling/registry/tailnet
 import crushling/slack
 import crushling/sys
+import gleam/dict
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/list
@@ -19,6 +20,7 @@ import slackline/app
 import slackline/event
 import slackline/httpc
 import slackline/interaction
+import slackline/view
 import stratus
 
 /// The registry that serves one Slack workspace, with what routing needs
@@ -169,11 +171,11 @@ pub fn pressed(
   )
 }
 
-/// The menus on a `!model` card. The thread does the switching; Slack only
-/// needs to hear that the pick arrived.
+/// The model menu and Confirm button on a `!model` card. The thread does
+/// the switching; Slack only needs to hear that the action arrived.
 fn model_menus(app: app.App, find: Find) -> app.App {
   use app, action_id <- list.fold(
-    [models.model_action, models.reasoning_action],
+    [models.model_action, models.confirm_action],
     app,
   )
   use action, payload <- app.action(app, action_id)
@@ -186,30 +188,65 @@ fn model_menus(app: app.App, find: Find) -> app.App {
   app.ack()
 }
 
-/// A pick on a model card, as a registry message. The card's block id names
-/// the thread it belongs to, which may not be where the card is (a code
-/// channel's card sits at the top of the channel).
+/// An action on a model card, as a registry message. The block id names
+/// the thread the card belongs to, which may not be where the card is (a
+/// code channel's card sits at the top of the channel).
 pub fn picked(
   action: interaction.BlockAction,
   payload: interaction.BlockActionsPayload,
 ) -> Result(registry.Message, Nil) {
-  use #(action_id, block_id, value) <- result.try(case action {
+  use #(block_id, pick) <- result.try(case action {
+    // The model menu changed.
     interaction.StaticSelectAction(
       action_id:,
       block_id: Some(block_id),
       selected_option: Some(option),
       ..,
-    ) -> Ok(#(action_id, block_id, option.value))
+    )
+      if action_id == models.model_action
+    -> Ok(#(block_id, models.Preview(option.value)))
+    // Confirm: what the menus hold now is in the payload's state.
+    interaction.ButtonAction(action_id:, block_id: Some(block_id), ..)
+      if action_id == models.confirm_action
+    -> {
+      let value = fn(of) { menu_value(payload.state, of) }
+      let model =
+        option.or(value(models.model_action), models.confirm_model(block_id))
+      use pick <- result.map(models.read_confirm(
+        model,
+        value(models.reasoning_action),
+      ))
+      #(block_id, pick)
+    }
     _ -> Error(Nil)
   })
   use home <- result.try(models.read_block_id(block_id))
-  use pick <- result.try(models.read_pick(action_id, value))
   use card <- result.map(case payload.container {
     Some(interaction.MessageContainer(message_ts:, channel_id:, thread_ts:, ..)) ->
       tailnet.card(channel_id, message_ts, thread_ts)
     _ -> Error(Nil)
   })
   registry.ModelPicked(home:, pick:, card:, user: payload.user.id)
+}
+
+/// The value picked in the card's menu `action_id`, whichever block it is in.
+fn menu_value(
+  state: Option(view.ViewState),
+  action_id: String,
+) -> Option(String) {
+  case state {
+    None -> None
+    Some(state) ->
+      dict.values(state.values)
+      |> list.find_map(fn(block) {
+        case dict.get(block, action_id) {
+          Ok(view.StateStaticSelect(selected_option: Some(option))) ->
+            Ok(option.value)
+          _ -> Error(Nil)
+        }
+      })
+      |> option.from_result
+  }
 }
 
 /// The messages worth routing: mentions, thread replies, direct messages,

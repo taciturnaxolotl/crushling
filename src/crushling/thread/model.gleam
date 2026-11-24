@@ -269,7 +269,7 @@ fn show(context: Context) -> Done {
     use current <- result.try(current(context))
     context.sink.post_blocks(
       "Model: " <> current.model.name,
-      models.card(current, catalog, context.home, ""),
+      models.card(current, current, catalog, context.home, ""),
     )
   }
   case shown {
@@ -308,9 +308,9 @@ fn set(
   }
 }
 
-/// Someone picked on the card posted as `card_ts`. Whatever happens, the
-/// card ends up showing what the session runs: Slack already shows the pick
-/// in the menu, so a refused pick has to be put back.
+/// Someone used the card posted as `card_ts`. Changing the model menu only
+/// redraws the card for that model; Confirm switches. Whatever happens, the
+/// card ends up true: a refused confirm puts the menus back.
 pub fn pick(
   context: Context,
   pick: models.Pick,
@@ -326,56 +326,57 @@ pub fn pick(
       failed(reason)
       Keep
     }
-    Ok(before) -> {
-      let switched = {
-        use choice <- result.try(models.choose(before, pick))
-        use after <- result.map(
-          pin(context, catalog, choice) |> result.map_error(describe),
-        )
-        #(choice, after)
-      }
-      case switched {
-        Ok(#(choice, after)) -> {
-          redraw(
-            context,
-            card_ts,
-            catalog,
-            after,
-            "<@" <> user <> "> switched to this. It applies from the next turn.",
-            switched_note(user, after),
-          )
-          Picked(choice)
-        }
-        Error(reason) -> {
-          let note = "couldn't switch: " <> reason <> "."
-          redraw(context, card_ts, catalog, before, note, "_" <> note <> "_")
+    Ok(before) ->
+      case pick {
+        models.Preview(id) -> {
+          let shown =
+            models.find(catalog, id)
+            |> result.map(fn(model) {
+              models.after(model, ModelChoice(id, DefaultReasoning))
+            })
+            |> result.unwrap(before)
+          redraw(context, card_ts, catalog, before, shown, "", "")
           Keep
         }
+        models.Confirm(choice) ->
+          case pin(context, catalog, choice) |> result.map_error(describe) {
+            Ok(after) -> {
+              let fallback = switched_note(user, after)
+              redraw(context, card_ts, catalog, after, after, "", fallback)
+              Picked(choice)
+            }
+            Error(reason) -> {
+              let note = "couldn't switch: " <> reason <> "."
+              let fallback = "_" <> note <> "_"
+              redraw(context, card_ts, catalog, before, before, note, fallback)
+              Keep
+            }
+          }
       }
-    }
   }
 }
 
-/// Show `current` on the card. The card may be somewhere the thread's sink
-/// can't update, such as a conversation the work has left; then `fallback`
-/// goes in the thread instead.
+/// Redraw the card. The card may be somewhere the thread's sink can't
+/// update, such as a conversation the work has left; then `fallback`, if
+/// any, goes in the thread instead.
 fn redraw(
   context: Context,
   card_ts: String,
   catalog: List(Model),
   current: Current,
+  shown: Current,
   note: String,
   fallback: String,
 ) -> Nil {
-  case
+  let updated =
     context.sink.update_blocks(
       card_ts,
       "Model: " <> current.model.name,
-      models.card(current, catalog, context.home, note),
+      models.card(current, shown, catalog, context.home, note),
     )
-  {
-    Ok(Nil) -> Nil
-    Error(_) -> say(context, fallback)
+  case updated, fallback {
+    Ok(Nil), _ | Error(_), "" -> Nil
+    Error(_), fallback -> say(context, fallback)
   }
 }
 

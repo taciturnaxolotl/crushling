@@ -13,8 +13,6 @@ import crushling/meta.{
   Thinking,
 }
 import gleam/dynamic/decode.{type Decoder}
-import gleam/float
-import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -22,11 +20,13 @@ import gleam/result
 import gleam/string
 import slackline/block
 import slackline/block/actions
+import slackline/block/input
 import slackline/element
+import slackline/element/button
 import slackline/element/static_select
 
 pub type Model {
-  Model(id: String, name: String, input: Float, output: Float, kind: Kind)
+  Model(id: String, name: String, kind: Kind)
 }
 
 /// How a model can reason.
@@ -44,11 +44,12 @@ pub type Current {
   Current(model: Model, reasoning: Reasoning)
 }
 
-/// What someone picked on a card. A reasoning pick names the model the card
-/// showed, so it can't land on a model that changed since.
+/// What someone did on a card.
 pub type Pick {
-  ModelPick(id: String)
-  ReasoningPick(model: String, reasoning: Reasoning)
+  /// The model menu changed: show that model's reasoning, switch nothing.
+  Preview(model: String)
+  /// Confirm, with the menus as they were.
+  Confirm(ModelChoice)
 }
 
 /// The provider id the agents use.
@@ -57,6 +58,8 @@ pub const provider = "hyper"
 pub const model_action = "crushling_model"
 
 pub const reasoning_action = "crushling_reasoning"
+
+pub const confirm_action = "crushling_confirm"
 
 /// Slack's limit on options in one menu.
 const max_options = 100
@@ -69,13 +72,8 @@ const max_label = 75
 fn model_decoder() -> Decoder(Model) {
   use id <- decode.field("id", decode.string)
   use name <- decode.optional_field("name", id, decode.string)
-  use #(input, output) <- decode.optional_field("pricing", #(0.0, 0.0), {
-    use input <- decode.optional_field("input", 0.0, number())
-    use output <- decode.optional_field("output", 0.0, number())
-    decode.success(#(input, output))
-  })
   use kind <- decode.optional_field("reasoning", NoReasoning, kind_decoder())
-  decode.success(Model(id:, name:, input:, output:, kind:))
+  decode.success(Model(id:, name:, kind:))
 }
 
 /// As catwalk's `ReasoningEffortLevels` and `CanReason`: levels win, then a
@@ -107,11 +105,6 @@ fn kind_decoder() -> Decoder(Kind) {
     [], "toggleable" -> Toggle
     [], _ -> NoReasoning
   })
-}
-
-/// JSON numbers may come without a fraction.
-fn number() -> Decoder(Float) {
-  decode.one_of(decode.float, [decode.map(decode.int, int.to_float)])
 }
 
 /// The agents' provider's models, from crush's `/providers`. A provider
@@ -227,20 +220,6 @@ pub fn after(model: Model, choice: ModelChoice) -> Current {
   Current(model:, reasoning:)
 }
 
-/// What a pick on a card asks for. A reasoning pick for a model the session
-/// no longer runs is refused, with the reason.
-pub fn choose(current: Current, pick: Pick) -> Result(ModelChoice, String) {
-  case pick {
-    ModelPick(id:) -> Ok(ModelChoice(model: id, reasoning: DefaultReasoning))
-    ReasoningPick(model:, reasoning:) if model == current.model.id ->
-      Ok(ModelChoice(model:, reasoning:))
-    ReasoningPick(..) ->
-      Error(
-        "the thread switched to " <> current.model.name <> " since this card",
-      )
-  }
-}
-
 /// What `!model` asks for. `default` puts the thread back on the bridge's
 /// default model.
 pub type Request {
@@ -279,27 +258,12 @@ fn reasoning_word(word: String) -> Reasoning {
 
 // The card ---------------------------------------------------------------------
 
-/// Dollars, with cents only when there are any.
-pub fn dollars(amount: Float) -> String {
-  let cents = float.round(amount *. 100.0)
-  let whole = int.to_string(cents / 100)
-  case cents % 100 {
-    0 -> "$" <> whole
-    rest -> "$" <> whole <> "." <> string.pad_start(int.to_string(rest), 2, "0")
-  }
-}
-
-/// The model, its price, and how it reasons, in words.
+/// The model and how it reasons, in words.
 pub fn summary(current: Current) -> String {
-  let model = current.model
   "*"
-  <> model.name
-  <> "* · "
-  <> dollars(model.input)
-  <> " in / "
-  <> dollars(model.output)
-  <> " out per 1M tokens"
-  <> case reasoning_label(model.kind, current.reasoning) {
+  <> current.model.name
+  <> "*"
+  <> case reasoning_label(current.model.kind, current.reasoning) {
     Some(label) -> " · reasoning " <> label
     None -> ""
   }
@@ -315,17 +279,18 @@ fn reasoning_label(kind: Kind, reasoning: Reasoning) -> Option(String) {
   }
 }
 
-/// The block id that carries the thread the card belongs to.
-pub fn block_id(home: #(String, String)) -> String {
-  "crushling_model|" <> home.0 <> "|" <> home.1
-}
-
-/// The thread a card's block id names.
+/// The thread a card's model menu or confirm button names: `<what>|channel|
+/// ts`, with more after it on the model menu.
 pub fn read_block_id(block_id: String) -> Result(#(String, String), Nil) {
   case string.split(block_id, "|") {
-    ["crushling_model", channel, thread_ts] -> Ok(#(channel, thread_ts))
+    ["crushling_model", channel, thread_ts, ..]
+    | ["crushling_confirm", channel, thread_ts, ..] -> Ok(#(channel, thread_ts))
     _ -> Error(Nil)
   }
+}
+
+fn home_id(prefix: String, home: #(String, String)) -> String {
+  prefix <> "|" <> home.0 <> "|" <> home.1
 }
 
 /// A reasoning option's value: the model it's for, and the reasoning.
@@ -340,20 +305,37 @@ fn reasoning_value(model: String, reasoning: Reasoning) -> String {
   }
 }
 
-/// Read a menu pick from its action id and the chosen option's value.
-pub fn read_pick(action_id: String, value: String) -> Result(Pick, Nil) {
-  case action_id == model_action, action_id == reasoning_action {
-    True, _ -> Ok(ModelPick(value))
-    _, True ->
-      case string.split_once(value, "|") {
-        Ok(#(model, "effort:" <> level)) ->
-          Ok(ReasoningPick(model, Effort(level)))
-        Ok(#(model, "think:on")) -> Ok(ReasoningPick(model, Thinking(True)))
-        Ok(#(model, "think:off")) -> Ok(ReasoningPick(model, Thinking(False)))
-        _ -> Error(Nil)
-      }
-    _, _ -> Error(Nil)
+fn read_reasoning(value: String) -> Result(#(String, Reasoning), Nil) {
+  case string.split_once(value, "|") {
+    Ok(#(model, "effort:" <> level)) -> Ok(#(model, Effort(level)))
+    Ok(#(model, "think:on")) -> Ok(#(model, Thinking(True)))
+    Ok(#(model, "think:off")) -> Ok(#(model, Thinking(False)))
+    _ -> Error(Nil)
   }
+}
+
+/// The model a card's Confirm button was drawn for, from its block id.
+pub fn confirm_model(block_id: String) -> Option(String) {
+  case string.split(block_id, "|") {
+    ["crushling_confirm", _, _, model, ..] -> Some(model)
+    _ -> None
+  }
+}
+
+/// What Confirm asks for, from the card's menus: the model menu's value, and
+/// the reasoning menu's if it has one. A reasoning value for another model
+/// (left over from before the model menu changed) means the new model's
+/// default.
+pub fn read_confirm(
+  model: Option(String),
+  reasoning: Option(String),
+) -> Result(Pick, Nil) {
+  use model <- result.map(option.to_result(model, Nil))
+  let reasoning = case option.map(reasoning, read_reasoning) {
+    Some(Ok(#(for, reasoning))) if for == model -> reasoning
+    _ -> DefaultReasoning
+  }
+  Confirm(ModelChoice(model:, reasoning:))
 }
 
 fn fit(text: String, room: Int) -> String {
@@ -363,21 +345,16 @@ fn fit(text: String, room: Int) -> String {
   }
 }
 
-fn option_label(model: Model) -> String {
-  let price = " · " <> dollars(model.input) <> "/" <> dollars(model.output)
-  fit(model.name, max_label - string.length(price)) <> price
-}
-
 /// The models the menu offers: the catalog, up to Slack's limit, with the
-/// current model kept in when the catalog has it.
-fn offered(catalog: List(Model), current: Model) -> List(Model) {
-  let listed = list.any(catalog, fn(model) { model.id == current.id })
+/// shown model kept in when the catalog has it.
+fn offered(catalog: List(Model), shown: Model) -> List(Model) {
+  let listed = list.any(catalog, fn(model) { model.id == shown.id })
   case list.length(catalog) > max_options, listed {
     False, _ -> catalog
     True, False -> list.take(catalog, max_options)
     True, True -> {
-      let rest = list.filter(catalog, fn(model) { model.id != current.id })
-      [current, ..list.take(rest, max_options - 1)]
+      let rest = list.filter(catalog, fn(model) { model.id != shown.id })
+      [shown, ..list.take(rest, max_options - 1)]
     }
   }
 }
@@ -394,25 +371,38 @@ fn reasoning_options(model: Model) -> List(#(String, Reasoning)) {
   }
 }
 
-/// The card: the session's model and reasoning, a menu of models, and a menu
-/// of reasoning when the model takes any. `note` goes under them, or nowhere
-/// when it is "". `home` is the thread the card belongs to.
+/// The card: what the session runs, full-width menus set to `shown`, and a
+/// Confirm button. `shown` is `current` unless someone changed the model menu
+/// and hasn't confirmed. `note` goes under, or nowhere when it is "". `home`
+/// is the thread the card belongs to.
+///
+/// Slack keeps what someone picked in an input across updates of a block
+/// with the same id, so each menu's block id names the model it was drawn
+/// for: a redraw for another model starts clean.
 pub fn card(
   current: Current,
+  shown: Current,
   catalog: List(Model),
   home: #(String, String),
   note: String,
 ) -> List(block.Block) {
-  let model = current.model
+  let model = shown.model
   let model_options =
     offered(catalog, model)
-    |> list.map(fn(model) { block.option(option_label(model), model.id) })
+    |> list.map(fn(model) { block.option(fit(model.name, max_label), model.id) })
   let model_menu =
-    element.static_select(action_id: model_action, with: [
-      static_select.options(model_options),
-      static_select.placeholder("Pick a model"),
-      ..selected(model_options, model.id)
-    ])
+    block.input(
+      label: "Model",
+      element: element.static_select(action_id: model_action, with: [
+        static_select.options(model_options),
+        static_select.placeholder("Pick a model"),
+        ..selected(model_options, model.id)
+      ]),
+      with: [
+        input.block_id(home_id("crushling_model", home) <> "|" <> model.id),
+        input.dispatch_action(True),
+      ],
+    )
   let reasoning_menu = case reasoning_options(model) {
     [] -> []
     choices -> {
@@ -424,23 +414,44 @@ pub fn card(
           )
         })
       [
-        element.static_select(action_id: reasoning_action, with: [
-          static_select.options(options),
-          static_select.placeholder("Reasoning"),
-          ..selected(options, reasoning_value(model.id, current.reasoning))
-        ]),
+        block.input(
+          label: "Reasoning",
+          element: element.static_select(action_id: reasoning_action, with: [
+            static_select.options(options),
+            static_select.placeholder("Reasoning"),
+            ..selected(options, reasoning_value(model.id, shown.reasoning))
+          ]),
+          with: [input.block_id("crushling_reasoning|" <> model.id)],
+        ),
       ]
     }
   }
+  let confirm =
+    block.actions(
+      elements: [
+        element.button(text: "Confirm", action_id: confirm_action, with: [
+          button.style(block.Primary),
+        ]),
+      ],
+      // The model shown, in case Slack leaves an untouched menu out of the
+      // state it sends.
+      with: [
+        actions.block_id(home_id("crushling_confirm", home) <> "|" <> model.id),
+      ],
+    )
   [
     block.section(text: block.mrkdwn("Model: " <> summary(current)), with: []),
-    block.actions(elements: [model_menu, ..reasoning_menu], with: [
-      actions.block_id(block_id(home)),
-    ]),
-    ..case note {
-      "" -> []
-      note -> [block.context(elements: [block.context_mrkdwn(note)], with: [])]
-    }
+    model_menu,
+    ..list.flatten([
+      reasoning_menu,
+      [confirm],
+      case note {
+        "" -> []
+        note -> [
+          block.context(elements: [block.context_mrkdwn(note)], with: []),
+        ]
+      },
+    ])
   ]
 }
 

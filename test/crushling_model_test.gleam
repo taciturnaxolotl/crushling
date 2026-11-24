@@ -57,8 +57,6 @@ pub fn catalog_reads_the_hyper_models_test() {
     list.map(catalog(), fn(model) { model.id })
   let assert models.Model(
     name: "Alpha",
-    input: 1.0,
-    output: 2.5,
     kind: models.Levels([#("low", "Low"), #("high", "High")], "high"),
     ..,
   ) = model("alpha")
@@ -138,17 +136,6 @@ pub fn after_mirrors_crush_test() {
     models.after(model("alpha"), ModelChoice("alpha", Effort("low")))
 }
 
-pub fn choose_test() {
-  let current = models.Current(model("alpha"), Effort("high"))
-  let assert Ok(ModelChoice("beta", DefaultReasoning)) =
-    models.choose(current, models.ModelPick("beta"))
-  let assert Ok(ModelChoice("alpha", Effort("low"))) =
-    models.choose(current, models.ReasoningPick("alpha", Effort("low")))
-  // A reasoning pick from a card for another model is refused.
-  let assert Error("the thread switched to Alpha since this card") =
-    models.choose(current, models.ReasoningPick("beta", Thinking(True)))
-}
-
 pub fn argument_test() {
   let assert Ok(models.ShowCard) = models.parse_argument("")
   let assert Ok(models.UseDefault) = models.parse_argument(" Default ")
@@ -173,13 +160,6 @@ pub fn command_test() {
   let assert True = string.contains(slack.help, "`!model`")
 }
 
-pub fn dollars_test() {
-  let assert "$1" = models.dollars(1.0)
-  let assert "$2.50" = models.dollars(2.5)
-  let assert "$0.05" = models.dollars(0.05)
-  let assert "$11" = models.dollars(11.0)
-}
-
 pub fn choice_survives_the_store_json_test() {
   let round = fn(choice) {
     let text = json.to_string(meta.model_choice_to_json(choice))
@@ -196,18 +176,14 @@ pub fn choice_survives_the_store_json_test() {
 
 // The card.
 
-/// The menus on a card's actions block.
+/// The menus on a card, from its input blocks, in order.
 fn menus(blocks: List(block.Block)) -> List(block.StaticSelectElement) {
-  let assert Ok(block.Actions(actions)) =
-    list.find(blocks, fn(block) {
-      case block {
-        block.Actions(_) -> True
-        _ -> False
-      }
-    })
-  list.map(actions.elements, fn(element) {
-    let assert block.StaticSelect(menu) = element
-    menu
+  list.filter_map(blocks, fn(block) {
+    case block {
+      block.Input(block.InputBlock(element: block.StaticSelect(menu), ..)) ->
+        Ok(menu)
+      _ -> Error(Nil)
+    }
   })
 }
 
@@ -217,30 +193,36 @@ fn initial(menu: block.StaticSelectElement) -> String {
 }
 
 fn card(current: models.Current, catalog, note) {
-  models.card(current, catalog, #("C1", "1.5"), note)
+  models.card(current, current, catalog, #("C1", "1.5"), note)
+}
+
+fn header(blocks: List(block.Block)) -> String {
+  let assert [block.Section(block.SectionBlock(text: Some(text), ..)), ..] =
+    blocks
+  string.inspect(text)
 }
 
 pub fn card_test() {
   let blocks =
     card(models.Current(model("alpha"), Effort("low")), catalog(), "")
-  let assert [block.Section(section), block.Actions(actions)] = blocks
-  let assert Some(text) = section.text
-  let assert True =
-    string.contains(
-      string.inspect(text),
-      "*Alpha* · $1 in / $2.50 out per 1M tokens · reasoning Low",
-    )
-  let assert Some(id) = actions.block_id
+  // The model and reasoning in words; no prices.
+  let assert True = string.contains(header(blocks), "*Alpha* · reasoning Low")
+  let assert False = string.contains(header(blocks), "$")
+  let assert [_, block.Input(m), block.Input(_), block.Actions(confirm)] =
+    blocks
+  // The model menu dispatches on change, so the reasoning menu can follow;
+  // Confirm names the thread.
+  let assert Some(True) = m.dispatch_action
+  let assert Some(id) = confirm.block_id
   let assert Ok(#("C1", "1.5")) = models.read_block_id(id)
+  let assert [block.Button(button)] = confirm.elements
+  let assert Some(block.Primary) = button.style
   let assert [menu, reasoning] = menus(blocks)
   let assert Some(options) = menu.options
   let assert ["alpha", "beta", "gamma"] =
     list.map(options, fn(option) { option.value })
   let assert "alpha" = initial(menu)
-  // Reasoning options name the model they're for.
   let assert "alpha|effort:low" = initial(reasoning)
-  let assert Ok(models.ReasoningPick("alpha", Effort("low"))) =
-    models.read_pick(models.reasoning_action, initial(reasoning))
   // A toggle model offers on and off.
   let blocks =
     card(models.Current(model("beta"), Thinking(False)), catalog(), "")
@@ -251,10 +233,20 @@ pub fn card_test() {
     card(
       models.Current(model("gamma"), DefaultReasoning),
       catalog(),
-      "switched",
+      "couldn't",
     )
-  let assert [_, _, block.Context(_)] = blocks
+  let assert [_, _, block.Actions(_), block.Context(_)] = blocks
   let assert [_] = menus(blocks)
+}
+
+pub fn a_preview_shows_another_model_under_the_current_one_test() {
+  let current = models.Current(model("alpha"), Effort("high"))
+  let shown = models.Current(model("beta"), Thinking(False))
+  let blocks = models.card(current, shown, catalog(), #("C1", "1.5"), "")
+  let assert True = string.contains(header(blocks), "*Alpha*")
+  let assert [menu, reasoning] = menus(blocks)
+  let assert "beta" = initial(menu)
+  let assert "beta|think:off" = initial(reasoning)
 }
 
 pub fn card_menus_stay_inside_slacks_limits_test() {
@@ -266,8 +258,6 @@ pub fn card_menus_stay_inside_slacks_limits_test() {
       models.Model(
         id: "m" <> int.to_string(i),
         name: string.repeat("Long name ", 20),
-        input: 1.0,
-        output: 2.0,
         kind: models.NoReasoning,
       )
     })
@@ -290,43 +280,92 @@ pub fn card_survives_json_test() {
   let blocks =
     card(models.Current(model("beta"), Thinking(True)), catalog(), "")
   let encoded = json.to_string(json.array(blocks, block.block_to_json))
-  let assert True = string.contains(encoded, "crushling_model|C1|1.5")
+  let assert True = string.contains(encoded, "crushling_confirm|C1|1.5|beta")
+  let assert Some("beta") =
+    models.confirm_model("crushling_confirm|C1|1.5|beta")
   let assert True = string.contains(encoded, "\"crushling_reasoning\"")
 }
 
-pub fn read_pick_test() {
-  let assert Ok(models.ModelPick("beta")) =
-    models.read_pick(models.model_action, "beta")
-  let assert Ok(models.ReasoningPick("beta", Thinking(True))) =
-    models.read_pick(models.reasoning_action, "beta|think:on")
-  let assert Error(Nil) = models.read_pick(models.reasoning_action, "low")
-  let assert Error(Nil) = models.read_pick("tailnet_deny", "x")
+pub fn read_confirm_test() {
+  let assert Ok(models.Confirm(ModelChoice("beta", Thinking(True)))) =
+    models.read_confirm(Some("beta"), Some("beta|think:on"))
+  // A reasoning value left over from another model means the default.
+  let assert Ok(models.Confirm(ModelChoice("beta", DefaultReasoning))) =
+    models.read_confirm(Some("beta"), Some("alpha|effort:low"))
+  let assert Ok(models.Confirm(ModelChoice("gamma", DefaultReasoning))) =
+    models.read_confirm(Some("gamma"), None)
+  let assert Error(Nil) = models.read_confirm(None, Some("beta|think:on"))
   let assert Error(Nil) = models.read_block_id("crushling_model|C1")
   let assert Error(Nil) = models.read_block_id("other|C1|1.5")
+  let assert Ok(#("C1", "1.5")) =
+    models.read_block_id("crushling_model|C1|1.5|alpha")
 }
 
-/// A `block_actions` payload as Slack sends it for a pick on a card posted
-/// at the top of a code channel, for the thread C1/1.5.
-const picked_payload =
+fn payload(action: String, state: String) -> String {
   "{\"type\":\"block_actions\",
   \"user\":{\"id\":\"U1\",\"username\":\"k\",\"team_id\":\"T1\"},
   \"api_app_id\":\"A1\",\"token\":\"x\",\"trigger_id\":\"t\",
   \"team\":{\"id\":\"T1\",\"domain\":\"d\"},
   \"container\":{\"type\":\"message\",\"message_ts\":\"9.9\",\"channel_id\":\"CCODE\",\"is_ephemeral\":false},
   \"channel\":{\"id\":\"CCODE\",\"name\":\"code\"},
-  \"actions\":[{\"type\":\"static_select\",\"action_id\":\"crushling_reasoning\",
-    \"block_id\":\"crushling_model|C1|1.5\",\"action_ts\":\"9.91\",
-    \"selected_option\":{\"text\":{\"type\":\"plain_text\",\"text\":\"Low\"},\"value\":\"alpha|effort:low\"}}]}"
+  \"state\":{\"values\":" <> state <> "},
+  \"actions\":[" <> action <> "]}"
+}
 
-pub fn socket_reads_a_pick_test() {
+/// Confirm on a card at the top of a code channel, for the thread C1/1.5,
+/// with the menus' state as Slack sends it.
+const confirm_action =
+  "{\"type\":\"button\",\"action_id\":\"crushling_confirm\",
+  \"block_id\":\"crushling_confirm|C1|1.5|alpha\",\"action_ts\":\"9.91\",
+  \"text\":{\"type\":\"plain_text\",\"text\":\"Confirm\"}}"
+
+const menu_state =
+  "{
+  \"crushling_model|C1|1.5|alpha\":{\"crushling_model\":{\"type\":\"static_select\",
+    \"selected_option\":{\"text\":{\"type\":\"plain_text\",\"text\":\"Alpha\"},\"value\":\"alpha\"}}},
+  \"crushling_reasoning|alpha\":{\"crushling_reasoning\":{\"type\":\"static_select\",
+    \"selected_option\":{\"text\":{\"type\":\"plain_text\",\"text\":\"Low\"},\"value\":\"alpha|effort:low\"}}}}"
+
+const change_action =
+  "{\"type\":\"static_select\",\"action_id\":\"crushling_model\",
+  \"block_id\":\"crushling_model|C1|1.5|alpha\",\"action_ts\":\"9.91\",
+  \"selected_option\":{\"text\":{\"type\":\"plain_text\",\"text\":\"Beta\"},\"value\":\"beta\"}}"
+
+fn picked(action: String) {
   let assert Ok(payload) =
-    json.parse(picked_payload, interaction.block_actions_payload_decoder())
+    json.parse(
+      payload(action, menu_state),
+      interaction.block_actions_payload_decoder(),
+    )
   let assert Some([action]) = payload.actions
+  socket.picked(action, payload)
+}
+
+pub fn socket_reads_card_actions_test() {
+  let card = meta.Card(channel: "CCODE", ts: "9.9", thread_ts: "")
   let assert Ok(registry.ModelPicked(
     home: #("C1", "1.5"),
-    pick: models.ReasoningPick("alpha", Effort("low")),
-    card: meta.Card(channel: "CCODE", ts: "9.9", thread_ts: ""),
+    pick: models.Confirm(ModelChoice("alpha", Effort("low"))),
+    card: c,
     user: "U1",
+  )) = picked(confirm_action)
+  let assert True = c == card
+  let assert Ok(registry.ModelPicked(
+    home: #("C1", "1.5"),
+    pick: models.Preview("beta"),
+    ..,
+  )) = picked(change_action)
+  // With no menu state at all, Confirm falls back to the model it was drawn
+  // for.
+  let assert Ok(payload) =
+    json.parse(
+      payload(confirm_action, "{}"),
+      interaction.block_actions_payload_decoder(),
+    )
+  let assert Some([action]) = payload.actions
+  let assert Ok(registry.ModelPicked(
+    pick: models.Confirm(ModelChoice("alpha", DefaultReasoning)),
+    ..,
   )) = socket.picked(action, payload)
 }
 
@@ -521,13 +560,30 @@ pub fn card_shows_and_switches_test() {
   let assert [menu, reasoning] = menus(blocks)
   let assert "alpha" = initial(menu)
   let assert "alpha|effort:high" = initial(reasoning)
-  // Pick another model on the card: thinking stays off, as in crush.
-  process.send(t, thread.CardPicked(models.ModelPick("beta"), "card", "U1"))
+  // Changing the model menu only redraws the card for it...
+  process.send(t, thread.CardPicked(models.Preview("beta"), "card", "U1"))
+  let assert CardUpdated("card", blocks) = receive(seen)
+  let assert True = string.contains(header(blocks), "*Alpha*")
+  let assert [menu, reasoning] = menus(blocks)
+  let assert "beta" = initial(menu)
+  let assert "beta|think:off" = initial(reasoning)
+  no("model")
+  // ...and Confirm switches: thinking stays off, as in crush.
+  process.send(
+    t,
+    thread.CardPicked(
+      models.Confirm(ModelChoice("beta", DefaultReasoning)),
+      "card",
+      "U1",
+    ),
+  )
   let fields = pinned(expect("model"))
   let assert Ok("beta") = dict.get(fields, "model")
   let assert Error(Nil) = dict.get(fields, "think")
+  // The card now says Beta, with no "switched" note.
   let assert CardUpdated("card", blocks) = receive(seen)
-  let assert [_, _, block.Context(_)] = blocks
+  let assert True = string.contains(header(blocks), "*Beta*")
+  let assert [_, _, _, block.Actions(_)] = blocks
   let assert [menu, reasoning] = menus(blocks)
   let assert "beta" = initial(menu)
   let assert "beta|think:off" = initial(reasoning)
@@ -536,7 +592,7 @@ pub fn card_shows_and_switches_test() {
   process.send(
     t,
     thread.CardPicked(
-      models.ReasoningPick("beta", Thinking(True)),
+      models.Confirm(ModelChoice("beta", Thinking(True))),
       "card",
       "U1",
     ),
@@ -550,24 +606,25 @@ pub fn card_shows_and_switches_test() {
   stop_server(server)
 }
 
-pub fn a_refused_pick_puts_the_card_back_test() {
-  let #(server, t, seen) = start("stale-card", None)
+pub fn a_refused_confirm_puts_the_card_back_test() {
+  let #(server, t, seen) = start("refused", None)
   let _ = expect("events")
-  // A reasoning pick from a card for a model the session doesn't run.
+  // `alpha` doesn't take thinking on: refused before crush hears of it.
   process.send(
     t,
     thread.CardPicked(
-      models.ReasoningPick("beta", Thinking(True)),
+      models.Confirm(ModelChoice("alpha", Thinking(True))),
       "card",
       "U1",
     ),
   )
   let assert CardUpdated("card", blocks) = receive(seen)
-  let assert [_, _, block.Context(note)] = blocks
+  let assert [_, _, _, _, block.Context(note)] = blocks
   let assert True =
-    string.contains(string.inspect(note), "switched to Alpha since this card")
-  let assert [menu, _] = menus(blocks)
+    string.contains(string.inspect(note), "`alpha` takes low, high")
+  let assert [menu, reasoning] = menus(blocks)
   let assert "alpha" = initial(menu)
+  let assert "alpha|effort:high" = initial(reasoning)
   no("model")
   process.send(t, thread.Stop)
   stop_server(server)
