@@ -35,6 +35,9 @@ wait_closed(Socket) when is_port(Socket) ->
     case gen_tcp:recv(Socket, 0) of
         {ok, _} -> wait_closed(Socket);
         {error, einval} -> receive after infinity -> nil end;
+        %% Another watcher of this socket was killed mid-recv (a request
+        %% sent again); the recv it left settles shortly.
+        {error, ealready} -> timer:sleep(50), wait_closed(Socket);
         {error, _} -> nil
     end;
 wait_closed(_) ->

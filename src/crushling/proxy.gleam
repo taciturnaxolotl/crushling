@@ -30,16 +30,16 @@
 //// override `<NAME>`, so a sandbox must not also get `CRUSH_HYPER_API_KEY`
 //// or `CRUSH_HYPER_URL`.
 
-import crushling/gun
 import crushling/proxy/meter.{type Cap, type Usage}
 import crushling/proxy/usage
+import crushling/relay
 import crushling/sandbox_http
 import crushling/sys
 import crushling/token as bearer
 import gleam/bit_array
 import gleam/bool
-import gleam/bytes_tree
-import gleam/erlang/process.{type Pid, type Subject}
+
+import gleam/erlang/process.{type Subject}
 import gleam/float
 import gleam/http
 import gleam/http/request.{type Request}
@@ -291,14 +291,6 @@ pub fn route(proxy: Proxy) -> sandbox_http.Route {
 
 const max_body = 64_000_000
 
-/// How long upstream may take to answer, and to send each next chunk.
-const head_timeout_ms = 600_000
-
-const idle_timeout_ms = 300_000
-
-/// Body messages gun may deliver ahead of what has been written out.
-const flow_window = 8
-
 fn serve(
   proxy: Proxy,
   req: Request(mist.Connection),
@@ -325,7 +317,7 @@ fn serve(
   use <- bool.guard(
     chunked,
     error_reply(411, "invalid_request_error", "Send a Content-Length.")
-      |> closing,
+      |> relay.closing,
   )
   let length =
     request.get_header(req, "content-length")
@@ -333,7 +325,8 @@ fn serve(
     |> result.unwrap(0)
   use <- bool.guard(
     length > max_body,
-    error_reply(413, "invalid_request_error", "Request too large.") |> closing,
+    error_reply(413, "invalid_request_error", "Request too large.")
+      |> relay.closing,
   )
   forward(proxy, req, key, path)
 }
@@ -397,39 +390,6 @@ fn error_reply(
   |> response.set_header("content-type", "application/json")
 }
 
-/// Close the connection after this response: its request may not have been
-/// read in full, or the client-close watcher has used the socket.
-fn closing(resp: Response(a)) -> Response(a) {
-  response.set_header(resp, "connection", "close")
-}
-
-const hop_by_hop = [
-  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-  "proxy-connection", "te", "trailer", "trailers", "transfer-encoding",
-  "upgrade",
-]
-
-/// Headers without hop-by-hop ones (including any `Connection` names) or
-/// any in `drop`. Used on responses.
-pub fn end_to_end(
-  headers: List(#(String, String)),
-  drop: List(String),
-) -> List(#(String, String)) {
-  let named =
-    list.flat_map(headers, fn(header) {
-      case string.lowercase(header.0) {
-        "connection" ->
-          string.split(header.1, ",")
-          |> list.map(fn(name) { string.lowercase(string.trim(name)) })
-        _ -> []
-      }
-    })
-  let dropped = list.flatten([hop_by_hop, named, drop])
-  list.filter(headers, fn(header) {
-    !list.contains(dropped, string.lowercase(header.0))
-  })
-}
-
 /// The request headers sent to Hyper.
 pub fn upstream_headers(
   headers: List(#(String, String)),
@@ -445,193 +405,91 @@ pub fn upstream_headers(
   ]
 }
 
-/// What the relay tells the request handler once upstream answers.
-type Head {
-  Head(status: Int, headers: List(#(String, String)), body: Option(Body))
-  Failed(status: Int)
-  /// Revoked or over a cap by the time the request was ready to go.
-  Refused(denial: meter.Denial)
-}
-
-/// Where the handler sends the writer it started, and where the writer
-/// acknowledges each chunk.
-type Body {
-  Body(writer_to: Subject(Subject(Piece)), ack: Subject(Nil))
-}
-
-/// A piece of the response body, for the process writing it out.
-type Piece {
-  Piece(data: BitArray, fin: Bool)
-  Cut(denial: meter.Denial)
-  Broken
-  /// The client has gone; stop.
-  Gone
-}
-
-type Socket
-
-@external(erlang, "crushling_proxy_ffi", "socket")
-fn socket(connection: mist.Connection) -> Socket
-
-@external(erlang, "crushling_proxy_ffi", "wait_closed")
-fn wait_closed(socket: Socket) -> Nil
-
-type Job {
-  Job(
-    upstream: Upstream,
-    meter: Subject(meter.Message),
-    org_key: String,
-    key: String,
-    method: String,
-    path: String,
-    headers: List(#(String, String)),
-    handler: Pid,
-    socket: Socket,
-  )
-}
-
 fn forward(
   proxy: Proxy,
   req: Request(mist.Connection),
   key: String,
   path: String,
 ) -> Response(mist.ResponseData) {
-  let job =
-    Job(
-      upstream: proxy.upstream,
-      meter: proxy.meter,
-      org_key: proxy.org_key,
-      key:,
-      method: http.method_to_string(req.method),
-      path: proxy.upstream.prefix <> path,
-      headers: upstream_headers(req.headers, proxy.org_key, key),
-      handler: process.self(),
-      socket: socket(req.body),
+  let hooks = hooks(proxy, key)
+  let upstream = proxy.upstream
+  let relay =
+    relay.start(
+      relay.Upstream(upstream.host, upstream.port, upstream.tls),
+      relay.Outgoing(
+        method: http.method_to_string(req.method),
+        path: upstream.prefix <> path,
+        headers: upstream_headers(req.headers, proxy.org_key, key),
+      ),
+      req,
+      hooks,
     )
-  let started = process.new_subject()
-  let reply = process.new_subject()
   // The relay holds the request's admission until it exits.
-  let relay = process.spawn_unlinked(fn() { relay(job, started, reply) })
-  let assert Ok(go) = process.receive(started, 5000)
-  case meter.admit(proxy.meter, key, relay) {
+  case meter.admit(proxy.meter, key, relay.pid(relay)) {
     Error(denial) -> {
-      process.kill(relay)
+      relay.cancel(relay)
       denied(denial)
     }
     Ok(Nil) ->
       // The relay holds the upload slot, so it is only killed once the read
       // has stopped.
-      case read_body(req, proxy.upload_timeout_ms) {
-        Error(TooSlow) -> {
-          process.kill(relay)
+      case relay.read_body(req, max_body, proxy.upload_timeout_ms) {
+        Error(relay.TooSlow) -> {
+          relay.cancel(relay)
           error_reply(
             408,
             "invalid_request_error",
             "The request body was too slow.",
           )
-          |> closing
+          |> relay.closing
         }
-        Error(Unreadable) -> {
-          process.kill(relay)
+        Error(relay.Unreadable) -> {
+          relay.cancel(relay)
           error_reply(400, "invalid_request_error", "Could not read the body.")
-          |> closing
+          |> relay.closing
         }
         Ok(body) -> {
-          meter.uploaded(proxy.meter, relay)
-          process.send(go, body)
-          respond(req, relay, reply)
+          meter.uploaded(proxy.meter, relay.pid(relay))
+          relay.send(relay, req, body, hooks)
         }
       }
   }
 }
 
-type ReadFailure {
-  TooSlow
-  Unreadable
-}
-
-/// Read the request body within `timeout_ms` in all. The read runs in its
-/// own process, which is killed at the deadline; this returns only once it
-/// has stopped.
-fn read_body(
-  req: Request(mist.Connection),
-  timeout_ms: Int,
-) -> Result(BitArray, ReadFailure) {
-  let done = process.new_subject()
-  let reader =
-    process.spawn_unlinked(fn() {
-      process.send(
-        done,
-        mist.read_body(req, max_body) |> result.map(fn(read) { read.body }),
-      )
-    })
-  let monitor = process.monitor(reader)
-  case process.receive(done, timeout_ms) {
-    Ok(Ok(body)) -> {
-      process.demonitor_process(monitor)
-      Ok(body)
-    }
-    Ok(Error(_)) -> {
-      process.demonitor_process(monitor)
-      Error(Unreadable)
-    }
-    Error(Nil) -> {
-      process.kill(reader)
-      let _ =
-        process.new_selector()
-        |> process.select_specific_monitor(monitor, fn(_) { Nil })
-        |> process.selector_receive(5000)
-      Error(TooSlow)
-    }
-  }
-}
-
-fn respond(
-  req: Request(mist.Connection),
-  relay: Pid,
-  reply: Subject(Head),
-) -> Response(mist.ResponseData) {
-  case process.receive(reply, head_timeout_ms + 15_000) {
-    Error(Nil) -> {
-      process.kill(relay)
-      failed(504)
-    }
-    Ok(Failed(status)) -> failed(status)
-    Ok(Refused(denial)) -> denied(denial)
-    Ok(Head(status:, headers:, body: None)) ->
-      response.Response(
-        status:,
-        headers: end_to_end(headers, ["content-length"]),
-        body: mist.Bytes(bytes_tree.new()),
-      )
-      |> closing
-    Ok(Head(status:, headers:, body: Some(body))) -> {
-      let headers = end_to_end(headers, ["content-length"])
-      let content_type =
-        list.key_find(headers, "content-type") |> result.unwrap("")
-      let writer = process.new_subject()
-      let resp =
-        mist.chunked(
-          req,
-          response.Response(status:, headers:, body: Nil),
-          fn(pieces) {
-            process.send(writer, pieces)
-            Writing(
-              ack: body.ack,
-              sse: string.contains(content_type, "text/event-stream"),
-            )
-          },
-          write,
-        )
-      // The body may only flow once mist has handed the socket to the
-      // writer, or a short body could finish before that.
-      case process.receive(writer, 0) {
-        Ok(pieces) -> process.send(body.writer_to, pieces)
-        Error(Nil) -> process.kill(relay)
+/// The meter decides whether a request goes on, and the usage Hyper
+/// reports is recorded once the response ends.
+fn hooks(proxy: Proxy, key: String) -> relay.Hooks(usage.Scanner) {
+  relay.Hooks(
+    check: fn() {
+      meter.check_key(proxy.meter, key)
+      |> result.map_error(fn(denial) {
+        relay.Stop(answer: denied(denial), tail: fn(content_type) {
+          // Tell crush why, in the shape Hyper uses for errors in the
+          // middle of a stream.
+          case string.contains(content_type, "text/event-stream") {
+            True -> {
+              let #(_, kind, message) = describe(denial)
+              bit_array.from_string(
+                "data: " <> error_body(kind, message) <> "\n\n",
+              )
+            }
+            False -> <<>>
+          }
+        })
+      })
+    },
+    scan: usage.new,
+    feed: usage.feed,
+    finish: fn(scanner) {
+      case usage.finish(scanner) {
+        Some(found) -> meter.record(proxy.meter, key, found)
+        None -> Nil
       }
-      resp
-    }
-  }
+    },
+    head: fn(_, headers) { Ok(headers) },
+    failed:,
+    log: fn(what) { log(proxy.org_key, key, what) },
+  )
 }
 
 /// A fixed answer for upstream trouble; the details are in the bridge's
@@ -641,333 +499,16 @@ fn failed(status: Int) -> Response(mist.ResponseData) {
     504 -> error_reply(504, "server_error", "Hyper did not answer in time.")
     _ -> error_reply(502, "server_error", "Could not reach Hyper.")
   }
-  |> closing
-}
-
-type Writing {
-  Writing(ack: Subject(Nil), sse: Bool)
-}
-
-fn write(
-  state: Writing,
-  piece: Piece,
-  conn: mist.Connection,
-) -> mist.ChunkNext(Writing) {
-  case piece {
-    // No final chunk, so the client sees a truncated body, not an end.
-    Broken -> mist.ChunkAbort("upstream broke off")
-    // Stopping closes the socket the writer owns.
-    Gone -> mist.ChunkStop
-    Cut(denial) -> {
-      // Tell crush why, in the shape Hyper uses for errors in the middle of
-      // a stream.
-      case state.sse {
-        True -> {
-          let #(_, kind, message) = describe(denial)
-          let _ =
-            mist.send_chunk(
-              conn,
-              bit_array.from_string(
-                "data: " <> error_body(kind, message) <> "\n\n",
-              ),
-            )
-          Nil
-        }
-        False -> Nil
-      }
-      mist.ChunkStop
-    }
-    Piece(data:, fin:) -> {
-      let sent = case data {
-        <<>> -> Ok(Nil)
-        _ -> mist.send_chunk(conn, data)
-      }
-      case sent, fin {
-        Error(Nil), _ -> mist.ChunkStop
-        Ok(Nil), True -> mist.ChunkStop
-        Ok(Nil), False -> {
-          process.send(state.ack, Nil)
-          mist.ChunkContinue(state)
-        }
-      }
-    }
-  }
-}
-
-@external(erlang, "crushling_proxy_ffi", "request")
-fn upstream_request(
-  conn: gun.Conn,
-  method: String,
-  path: String,
-  headers: List(#(String, String)),
-  body: BitArray,
-  flow: Int,
-) -> gun.StreamRef
-
-@external(erlang, "crushling_proxy_ffi", "update_flow")
-fn update_flow(conn: gun.Conn, stream: gun.StreamRef, flow: Int) -> Nil
-
-type Relayed {
-  Go(body: BitArray)
-  FromGun(gun.Message)
-  ClientGone
-  DownstreamDown
-  WriterReady(Subject(Piece))
-  Written
-}
-
-/// Runs in its own process, which holds the request's admission: waits for
-/// the request body, makes the upstream request, reports the response head,
-/// then passes body pieces to the writer one flow window at a time, and
-/// records usage when upstream finishes or the client goes away.
-fn relay(
-  job: Job,
-  started: Subject(Subject(BitArray)),
-  reply: Subject(Head),
-) -> Nil {
-  let go = process.new_subject()
-  process.send(started, go)
-  let handler = process.monitor(job.handler)
-  let waiting =
-    process.new_selector()
-    |> process.select_map(go, Go)
-    |> process.select_specific_monitor(handler, fn(_) { DownstreamDown })
-  case process.selector_receive(waiting, head_timeout_ms) {
-    Ok(Go(body)) -> {
-      // The body has been read, so the socket is quiet until the client
-      // closes it.
-      let gone = process.new_subject()
-      let watcher =
-        process.spawn(fn() {
-          wait_closed(job.socket)
-          process.send(gone, Nil)
-        })
-      // Revocation or a cap may have come while the body was arriving.
-      case meter.check_key(job.meter, job.key) {
-        Error(denial) -> process.send(reply, Refused(denial))
-        Ok(Nil) -> run(job, body, reply, handler, gone)
-      }
-      process.unlink(watcher)
-      process.kill(watcher)
-    }
-    _ -> Nil
-  }
-}
-
-fn run(
-  job: Job,
-  body: BitArray,
-  reply: Subject(Head),
-  handler: process.Monitor,
-  gone: Subject(Nil),
-) -> Nil {
-  let upstream = job.upstream
-  case gun.connect_tcp(upstream.host, upstream.port, upstream.tls, 15_000) {
-    Error(reason) -> {
-      log(job, "could not connect: " <> reason)
-      process.send(reply, Failed(502))
-    }
-    Ok(conn) ->
-      // Check again after the connect: the client may have left, or the
-      // thread been revoked, meanwhile.
-      case process.receive(gone, 0), meter.check_key(job.meter, job.key) {
-        Ok(Nil), _ -> {
-          process.send(reply, Failed(502))
-          gun.close(conn)
-        }
-        Error(Nil), Error(denial) -> {
-          process.send(reply, Refused(denial))
-          gun.close(conn)
-        }
-        Error(Nil), Ok(Nil) -> dispatch(job, conn, body, reply, handler, gone)
-      }
-  }
-}
-
-fn dispatch(
-  job: Job,
-  conn: gun.Conn,
-  body: BitArray,
-  reply: Subject(Head),
-  handler: process.Monitor,
-  gone: Subject(Nil),
-) -> Nil {
-  let stream =
-    upstream_request(conn, job.method, job.path, job.headers, body, flow_window)
-  let base =
-    process.new_selector()
-    |> gun.select(FromGun)
-    |> process.select_map(gone, fn(_) { ClientGone })
-  let before =
-    base
-    |> process.select_specific_monitor(handler, fn(_) { DownstreamDown })
-  case await_head(before, conn, stream) {
-    Error(#(status, reason)) -> {
-      log(job, reason)
-      process.send(reply, Failed(status))
-    }
-    Ok(#(status, headers, True)) ->
-      process.send(reply, Head(status, headers, None))
-    Ok(#(status, headers, False)) -> {
-      let writer_to = process.new_subject()
-      let ack = process.new_subject()
-      process.send(reply, Head(status, headers, Some(Body(writer_to, ack))))
-      // Body messages wait in the mailbox (at most a flow window of
-      // them) until the writer is ready.
-      let ready =
-        process.new_selector()
-        |> process.select_map(writer_to, WriterReady)
-        |> process.select_map(gone, fn(_) { ClientGone })
-        |> process.select_specific_monitor(handler, fn(_) { DownstreamDown })
-      case await_writer(ready, False) {
-        Error(Nil) -> Nil
-        Ok(pieces) -> {
-          process.demonitor_process(handler)
-          let after = case process.subject_owner(pieces) {
-            Ok(writer) ->
-              base
-              |> process.select_specific_monitor(process.monitor(writer), fn(_) {
-                DownstreamDown
-              })
-            Error(Nil) -> base
-          }
-          let after = after |> process.select_map(ack, fn(_) { Written })
-          let #(scanner, last) =
-            pump(
-              after,
-              job,
-              conn,
-              stream,
-              pieces,
-              usage.new(
-                list.key_find(headers, "content-type") |> result.unwrap(""),
-              ),
-            )
-          // Settle before the last piece goes out, so the totals are
-          // current by the time the client sees the end.
-          case usage.finish(scanner) {
-            Some(found) -> meter.record(job.meter, job.key, found)
-            None -> Nil
-          }
-          case last {
-            Some(piece) -> process.send(pieces, piece)
-            None -> Nil
-          }
-        }
-      }
-    }
-  }
-  gun.close(conn)
-}
-
-fn await_head(
-  selector: process.Selector(Relayed),
-  conn: gun.Conn,
-  stream: gun.StreamRef,
-) -> Result(#(Int, List(#(String, String)), Bool), #(Int, String)) {
-  case process.selector_receive(selector, head_timeout_ms) {
-    Error(Nil) -> Error(#(504, "upstream did not answer in time"))
-    Ok(ClientGone) | Ok(DownstreamDown) ->
-      Error(#(502, "client went away before upstream answered"))
-    Ok(FromGun(gun.StreamResponse(conn: c, stream: s, status:, headers:, fin:)))
-      if c == conn && s == stream
-    ->
-      case status < 200 {
-        // An informational response; the real one follows.
-        True -> await_head(selector, conn, stream)
-        False -> Ok(#(status, headers, fin))
-      }
-    Ok(FromGun(gun.StreamError(conn: c, stream: s, reason:)))
-      if c == conn && s == stream
-    -> Error(#(502, "upstream request failed: " <> reason))
-    Ok(FromGun(gun.ConnDown(conn: c, reason:))) if c == conn ->
-      Error(#(502, "upstream connection closed: " <> reason))
-    Ok(_) -> await_head(selector, conn, stream)
-  }
-}
-
-/// Wait for the writer mist started. If the client goes away meanwhile,
-/// keep waiting for the writer anyway, to stop it.
-fn await_writer(
-  selector: process.Selector(Relayed),
-  client_gone: Bool,
-) -> Result(Subject(Piece), Nil) {
-  case process.selector_receive(selector, 15_000) {
-    Ok(WriterReady(pieces)) if client_gone -> {
-      process.send(pieces, Gone)
-      Error(Nil)
-    }
-    Ok(WriterReady(pieces)) -> Ok(pieces)
-    Ok(ClientGone) -> await_writer(selector, True)
-    Ok(FromGun(_)) | Ok(Written) | Ok(Go(_)) ->
-      await_writer(selector, client_gone)
-    Ok(DownstreamDown) | Error(Nil) -> Error(Nil)
-  }
-}
-
-/// Pass body pieces on until the stream ends. Returns what was scanned and
-/// the last piece to send once usage is settled, if any.
-fn pump(
-  selector: process.Selector(Relayed),
-  job: Job,
-  conn: gun.Conn,
-  stream: gun.StreamRef,
-  pieces: Subject(Piece),
-  scanner: usage.Scanner,
-) -> #(usage.Scanner, Option(Piece)) {
-  let next = fn(scanner) { pump(selector, job, conn, stream, pieces, scanner) }
-  case process.selector_receive(selector, idle_timeout_ms) {
-    Error(Nil) -> {
-      log(job, "upstream went quiet")
-      #(scanner, Some(Broken))
-    }
-    Ok(ClientGone) -> #(scanner, Some(Gone))
-    // The writer is already gone.
-    Ok(DownstreamDown) -> #(scanner, None)
-    Ok(Written) -> {
-      update_flow(conn, stream, 1)
-      next(scanner)
-    }
-    Ok(FromGun(gun.Data(conn: c, stream: s, data:, fin:)))
-      if c == conn && s == stream
-    -> {
-      // Scan first, so usage that has arrived is recorded even if the
-      // stream is cut here.
-      let scanner = usage.feed(scanner, data)
-      case meter.check_key(job.meter, job.key), fin {
-        Error(denial), _ -> #(scanner, Some(Cut(denial)))
-        Ok(Nil), True -> #(scanner, Some(Piece(data, True)))
-        Ok(Nil), False -> {
-          process.send(pieces, Piece(data, False))
-          next(scanner)
-        }
-      }
-    }
-    // Trailers end the stream; they are not passed on.
-    Ok(FromGun(gun.Trailers(conn: c, stream: s, ..)))
-      if c == conn && s == stream
-    -> #(scanner, Some(Piece(<<>>, True)))
-    Ok(FromGun(gun.StreamError(conn: c, stream: s, reason:)))
-      if c == conn && s == stream
-    -> {
-      log(job, "upstream stream failed: " <> reason)
-      #(scanner, Some(Broken))
-    }
-    Ok(FromGun(gun.ConnDown(conn: c, reason:))) if c == conn -> {
-      log(job, "upstream connection closed: " <> reason)
-      #(scanner, Some(Broken))
-    }
-    Ok(_) -> next(scanner)
-  }
+  |> relay.closing
 }
 
 /// Log upstream trouble on the bridge, never with the org's key in it.
-fn log(job: Job, what: String) -> Nil {
-  let what = case job.org_key {
+fn log(org_key: String, key: String, what: String) -> Nil {
+  let what = case org_key {
     "" -> what
-    key -> string.replace(what, key, "<org key>")
+    org_key -> string.replace(what, org_key, "<org key>")
   }
-  sys.warn("crushling: proxy for " <> job.key <> ": " <> what)
+  sys.warn("crushling: proxy for " <> key <> ": " <> what)
 }
 
 pub type CapError {
