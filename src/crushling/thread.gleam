@@ -208,8 +208,8 @@ type State {
     retries: Int,
     /// Whether the Slack session has its title.
     titled: Bool,
-    /// What the thread is about: its first prompt's first line, cut short.
-    /// A code channel opened without a name is named after it.
+    /// What the thread is about, as crush titled its session: a code
+    /// channel opened without a name is named after it.
     topic: String,
     /// The busy state last sent to the registry.
     reported_busy: Bool,
@@ -582,13 +582,9 @@ fn send_prompt(state: State, connection: Connection, next: Queued) -> State {
   case sent {
     Ok(Nil) -> {
       state.sink.working(True)
-      let state = case state.titled {
-        True -> state
-        False -> {
-          let topic = session_title(next.text)
-          state.sink.title(topic)
-          State(..state, topic:)
-        }
+      case state.titled {
+        True -> Nil
+        False -> state.sink.title(session_title(next.text))
       }
       process.send_after(state.self, watchdog_ms, Watchdog)
       let active =
@@ -699,6 +695,14 @@ fn reconnect_soon(state: State) -> State {
 }
 
 fn on_event(state: State, event: event.Event) -> State {
+  let state = case event {
+    event.SessionEvent(id:, title:, ..)
+      if Some(id) == state.session_id
+      && title != ""
+      && title != "New Agent Session"
+    -> State(..state, topic: title)
+    _ -> state
+  }
   let state =
     State(..state, subs: subagents.track(state.subs, parent(state), event))
     |> adopt_report_turn(event)
@@ -717,7 +721,7 @@ fn on_event(state: State, event: event.Event) -> State {
       }
       let active = Active(..active, run:, last_event_ms: now)
       State(..state, active: Some(active))
-      |> move_on_clone(event)
+      |> move_on_change(event)
       |> finish_if_done
     }
   }
@@ -748,25 +752,31 @@ fn adopt_report_turn(state: State, event: event.Event) -> State {
   }
 }
 
-/// When a bash call that cloned a repository succeeds in a plain thread,
-/// move the work to a code channel for that repository.
-fn move_on_clone(state: State, event: event.Event) -> State {
+/// When the agent first changes a repository in a plain thread (edits a
+/// file in it, or commits), move the work to a code channel for it.
+/// Cloning to read, as for a review, keeps the work in the thread.
+fn move_on_change(state: State, event: event.Event) -> State {
   case state.venue, state.active, event {
     venue.Thread, Some(active), event.MessageEvent(message:, ..)
       if message.role == event.Tool
     -> {
-      let cloned =
+      let changing =
         list.any(message.tool_results, fn(result) {
           !result.is_error
           && list.any(active.run.tools, fn(tool) {
             tool.id == result.tool_call_id
-            && tool.name == "bash"
-            && snapshot.is_clone(tool.input)
+            && list.contains(["bash", "edit", "multiedit", "write"], tool.name)
           })
         })
-      case cloned {
-        True -> move(state, "", "").0
+      case changing {
         False -> state
+        True ->
+          case
+            shell(state)(snapshot.changed_repo()) |> result.map(string.trim)
+          {
+            Ok("") | Error(Nil) -> state
+            Ok(dir) -> move(state, dir, "").0
+          }
       }
     }
     _, _, _ -> state

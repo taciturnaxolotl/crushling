@@ -129,6 +129,7 @@ pub fn real_server_test_() -> Dynamic {
         with_timeout(600, fn() { shutdown_cancels_and_stops(wiring) }),
         with_timeout(600, fn() { subagents_get_their_own_threads(wiring) }),
         with_timeout(600, fn() { cloning_moves_to_a_code_channel(wiring) }),
+        with_timeout(600, fn() { reading_stays_in_the_thread(wiring) }),
         with_timeout(600, fn() { failed_code_channel_keeps_the_diff(wiring) }),
         with_timeout(600, fn() { agent_uses_slack_tools(wiring) }),
         with_timeout(600, fn() { prompts_carry_images(wiring) }),
@@ -915,6 +916,62 @@ fn collect_code_calls(
   }
 }
 
+fn opened(seen: List(CodeCall)) -> Bool {
+  list.any(seen, fn(call) {
+    case call {
+      Opened(name) -> name != ""
+      _ -> False
+    }
+  })
+}
+
+/// Reading a cloned repository, as for a review, keeps the work in the
+/// thread.
+fn reading_stays_in_the_thread(wiring: Wiring) -> Nil {
+  use env <- with_env("code-channel-read", wiring)
+  let source = env.dir <> "/source"
+  let _ =
+    sh(
+      "/tmp",
+      "mkdir -p '"
+        <> source
+        <> "' && cd '"
+        <> source
+        <> "' && git init -q -b main && printf 'one\\n' > notes.txt && git add . && git -c user.name=t -c user.email=t@t commit -qm init",
+    )
+  let calls = process.new_subject()
+  let assert Ok(t) =
+    thread.start(
+      thread.Config(
+        socket: env.socket,
+        root: env.work,
+        title: "crushling read test",
+        venue: venue.Thread,
+        sink: code_sink(calls, False, True),
+        flush_ms: 250,
+        mode: client.Sysadmin,
+        notify: on_finished(fn(finished) {
+          process.send(calls, CodeFinished(finished.changes, finished.patch))
+        }),
+        on_connect: fn(_) { Nil },
+        model: None,
+        home: #("C", "1.0"),
+      ),
+    )
+  process.send(
+    t,
+    prompt(
+      "Use the bash tool to run exactly `git clone "
+      <> source
+      <> " demo`. Then read demo/notes.txt and reply with its first word.",
+    ),
+  )
+  let seen = collect_code_calls(calls, [])
+  process.send(t, thread.Stop)
+  let assert False = opened(seen)
+  Nil
+}
+
 /// Clone a repository and change it, with a sink that can or can't open
 /// a code channel. What the sinks saw, up to the run's end.
 fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
@@ -960,12 +1017,13 @@ fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
   seen
 }
 
-/// Cloning a repository moves the work to a code channel, whose Code tab
-/// shows the repository's changes instead of an attached patch.
+/// Changing a cloned repository moves the work to a code channel, named
+/// after the session, whose Code tab shows the changes instead of an
+/// attached patch.
 fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
   use env <- with_env("code-channel", wiring)
   let seen = clone_and_edit(env, True)
-  let assert True = list.contains(seen, Opened("source"))
+  let assert True = opened(seen)
   let assert True =
     list.any(seen, fn(call) {
       case call {
@@ -1008,7 +1066,7 @@ fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
 fn failed_code_channel_keeps_the_diff(wiring: Wiring) -> Nil {
   use env <- with_env("code-channel-refused", wiring)
   let seen = clone_and_edit(env, False)
-  let assert True = list.contains(seen, Opened("source"))
+  let assert True = opened(seen)
   let assert False =
     list.any(seen, fn(call) {
       case call {

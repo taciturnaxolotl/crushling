@@ -153,7 +153,7 @@ fn common_tools() -> List(mcp.Tool) {
     ),
     mcp.Tool(
       "open_code_channel",
-      "Move this work into a Slack code channel: its own channel for a task that changes a repository, where people can follow along and see the diff in a Code tab. Use it once the repository is cloned and the work will take more than one message. Your replies go to the channel from then on.",
+      "Move this work into a Slack code channel: its own channel for a task that changes a repository, where people can follow along and see the diff in a Code tab. Only for changing code: reviewing, reading or answering questions about a repository stays in the thread. Changing a repository's files moves the work there anyway; call this first to give the channel a good name. Your replies go to the channel from then on.",
       schema(
         [
           #(

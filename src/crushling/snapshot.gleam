@@ -97,6 +97,13 @@ fn quote(text: String) -> String {
   "'" <> string.replace(text, "'", "'\\''") <> "'"
 }
 
+/// Prints the first repository in the workspace with work of the agent's
+/// in it: files changed, or commits that aren't on any remote branch.
+pub fn changed_repo() -> String {
+  list_repos()
+  <> " | while read -r d; do if [ -n \"$(git -C \"$d\" status --porcelain 2>/dev/null | head -n 1)\" ] || [ \"$(git -C \"$d\" rev-list --count HEAD --not --remotes 2>/dev/null)\" != 0 ]; then echo \"$d\"; break; fi; done"
+}
+
 /// Prints "yes" when `dir` is the top of a git repository.
 pub fn is_repo(dir: String) -> String {
   "cd "
