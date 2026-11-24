@@ -42,7 +42,6 @@ import slackline/interaction
 import slackline/message
 import slackline/stream
 import slackline/stream/httpc as reply
-import slackline/value
 
 /// Notifications and old clients show `text`; keep it short.
 const fallback_length = 200
@@ -418,29 +417,10 @@ pub fn sink(
   )
 }
 
-/// A Slack error for logs and the agent, with the detail Slack gives for
-/// vague codes like `invalid_arguments` in `response_metadata.messages`.
+/// A Slack error for logs and the agent; slackline includes the detail
+/// Slack gives for vague codes like `invalid_arguments`.
 pub fn describe(error: slackline.Error) -> String {
-  let base = slackline.describe_error(error)
-  case error {
-    slackline.ApiError(response:, ..) ->
-      case value.at(response, ["response_metadata", "messages"]) {
-        Ok(value.Array(messages)) ->
-          case
-            list.filter_map(messages, fn(message) {
-              case message {
-                value.String(text) -> Ok(text)
-                _ -> Error(Nil)
-              }
-            })
-          {
-            [] -> base
-            details -> base <> " (" <> string.join(details, "; ") <> ")"
-          }
-        _ -> base
-      }
-    _ -> base
-  }
+  slackline.describe_error(error)
 }
 
 /// Archive a code channel once its work is done, keeping `summary_ts` (a
