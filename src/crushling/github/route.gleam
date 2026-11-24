@@ -121,7 +121,7 @@ fn git_base(bridge_url: String) -> String {
 
 /// What the agent is told about GitHub, with its Slack tools.
 pub const instructions =
-  "GitHub: `git` and `gh` work as usual for reading. crushling sends them to GitHub as the person whose message you're working on, with their access and no more; the sandbox holds no token, so don't log in or set one. For now only reads go through: clone, fetch, `gh pr view`/`diff`/`checks`, `gh issue view`, `gh api` GETs and GraphQL queries. Pushing, opening PRs, commenting and other writes are refused; say what you'd change instead. If a read needs them to connect GitHub, or to add crushling's GitHub App to an account, crushling asks them in the thread and the command waits until they do (it may move to the background; wait for it). If a read is still refused, the error says why."
+  "GitHub: `git` and `gh` work as usual. crushling sends them to GitHub as the person whose message you're working on, with their access and no more; the sandbox holds no token, so don't log in or set one. Reads go through: clone, fetch, `gh pr view`/`diff`/`checks`, `gh issue view`, `gh api` GETs and GraphQL queries. You may push, but only to branches named `crushling/<what>`, like `git push origin HEAD:crushling/fix-flaky-test`; force-pushing such a branch is fine, deleting one or pushing anywhere else is refused. Opening PRs, commenting and other writes through `gh` are refused for now; push a branch and say so, with what you changed and the branch name. If a read needs them to connect GitHub, or to add crushling's GitHub App to an account, crushling asks them in the thread and the command waits until they do (it may move to the background; wait for it). If a read is still refused, the error says why."
 
 /// The route for `/git/...` and for requests to `api.github.com`.
 pub fn route(setup: Setup) -> sandbox_http.Route {
@@ -208,17 +208,20 @@ fn git(
         False -> plain(404, "crushling: that isn't a GitHub repository")
         True -> fetch(setup, req, thread, owner, repo)
       }
-    [_, _, "info", "refs"], _, "git-receive-pack"
-    | [_, _, "git-receive-pack"], _, _
-    ->
-      plain(
-        403,
-        "crushling: pushing to GitHub isn't possible from here yet; only cloning and fetching are.",
-      )
+    [owner, repo, "info", "refs"], http.Get, "git-receive-pack" ->
+      case valid(owner) && valid(repo) {
+        False -> plain(404, "crushling: that isn't a GitHub repository")
+        True -> fetch(setup, req, thread, owner, repo)
+      }
+    [owner, repo, "git-receive-pack"], http.Post, _ ->
+      case valid(owner) && valid(repo) {
+        False -> plain(404, "crushling: that isn't a GitHub repository")
+        True -> push(setup, req, thread, owner, repo)
+      }
     _, _, _ ->
       plain(
         404,
-        "crushling: only cloning and fetching go through to GitHub (no LFS)",
+        "crushling: only cloning, fetching and pushing go through to GitHub (no LFS)",
       )
   }
 }
@@ -243,18 +246,141 @@ fn fetch(
   owner: String,
   repo: String,
 ) -> Response(mist.ResponseData) {
+  use body <- read(req, max_git_body)
+  forward_git(setup, req, thread, owner, repo, body, False)
+}
+
+/// Pushes as the person, only to `crushling/…` branches, the bridge
+/// reading the push's ref updates before any of it reaches GitHub.
+/// Overwriting such a branch is fine; deleting one, or touching any other
+/// ref, is refused.
+fn push(
+  setup: Setup,
+  req: Request(mist.Connection),
+  thread: Thread,
+  owner: String,
+  repo: String,
+) -> Response(mist.ResponseData) {
+  use body <- read(req, max_push_body)
+  case pushable(option.unwrap(body, <<>>)) {
+    Error(why) -> plain(403, "crushling: " <> why)
+    Ok(Nil) -> forward_git(setup, req, thread, owner, repo, body, True)
+  }
+}
+
+/// Packs pushed can be large; a pack past this goes in pieces.
+const max_push_body = 256_000_000
+
+pub const branch_prefix = "refs/heads/crushling/"
+
+/// Whether a push only updates `crushling/…` branches: its commands, the
+/// pkt-lines before the first flush, each `<old> <new> <ref>`.
+@internal
+pub fn pushable(body: BitArray) -> Result(Nil, String) {
+  use commands <- result.try(
+    commands(body, [])
+    |> result.replace_error("couldn't read the push"),
+  )
+  let refused =
+    list.filter_map(commands, fn(command) {
+      case string.split(command, " ") {
+        [_, new, ref] ->
+          case string.starts_with(ref, branch_prefix), zero(new) {
+            _, True -> Ok(ref <> " (deleting a branch)")
+            True, False if ref != branch_prefix -> Error(Nil)
+            _, _ -> Ok(ref)
+          }
+        _ -> Ok(command)
+      }
+    })
+  case commands, refused {
+    [], _ -> Error("couldn't read the push")
+    _, [] -> Ok(Nil)
+    _, refused ->
+      Error(
+        "agents may only push to branches named crushling/…, and not delete them; refused: "
+        <> string.join(refused, ", ")
+        <> ". Push to a branch like crushling/fix-the-thing instead, e.g. `git push origin HEAD:crushling/fix-the-thing`.",
+      )
+  }
+}
+
+fn zero(oid: String) -> Bool {
+  oid != "" && string.replace(oid, "0", "") == ""
+}
+
+/// The commands at the start of a receive-pack request: each pkt-line's
+/// text up to its NUL (capabilities) or newline, until a flush. `shallow`
+/// lines are skipped; a push certificate isn't understood, so it's refused.
+fn commands(body: BitArray, found: List(String)) -> Result(List(String), Nil) {
+  case body {
+    <<"0000":utf8, _:bits>> -> Ok(list.reverse(found))
+    <<length:bytes-size(4), rest:bits>> -> {
+      use length <- result.try(
+        bit_array.to_string(length) |> result.try(int.base_parse(_, 16)),
+      )
+      let size = length - 4
+      case size > 0, rest {
+        True, <<line:bytes-size(size), rest:bits>> -> {
+          use line <- result.try(bit_array.to_string(line))
+          let line = case string.split_once(line, "\u{0}") {
+            Ok(#(command, _)) -> command
+            Error(Nil) -> line
+          }
+          let line = string.trim_end(line)
+          case line {
+            "shallow " <> _ -> commands(rest, found)
+            "push-cert" <> _ -> Error(Nil)
+            line -> commands(rest, [line, ..found])
+          }
+        }
+        _, _ -> Error(Nil)
+      }
+    }
+    _ -> Error(Nil)
+  }
+}
+
+/// Send a git request on as the person, or, for a read nobody connected
+/// for, with the app's token on a public repo or none. `writes` (a push)
+/// only ever goes as the person.
+fn forward_git(
+  setup: Setup,
+  req: Request(mist.Connection),
+  thread: Thread,
+  owner: String,
+  repo: String,
+  body: Option(BitArray),
+  writes: Bool,
+) -> Response(mist.ResponseData) {
   let repo = string.replace(repo, ".git", "")
   let name = owner <> "/" <> repo
   let path =
     string.drop_start(req.path, string.length("/git"))
     <> option.map(req.query, fn(q) { "?" <> q }) |> option.unwrap("")
-  use body <- read(req, max_git_body)
   let method = http.method_to_string(req.method)
-  let first = case thread.access {
-    Some(access) -> Some(access)
-    None -> setup.app_token(owner, repo)
+  let first = case thread.access, writes {
+    Some(access), _ -> Some(access)
+    None, True -> None
+    None, False -> setup.app_token(owner, repo)
   }
-  let say = fn(missing) { plain(403, "crushling: " <> refused(missing, name)) }
+  let say = fn(missing) {
+    plain(
+      403,
+      "crushling: "
+        <> case writes, missing {
+        True, NoAccess ->
+          "the GitHub account of the person you're working for can't push to "
+          <> name
+          <> ". They may not have write access to it."
+        True, NotConnected ->
+          "pushing to "
+          <> name
+          <> " needs the GitHub account of the person you're working for, and they haven't connected it. crushling asked them in this thread and waited, but they didn't connect in time. Tell them; it works once they connect."
+        _, missing -> refused(missing, name)
+      },
+    )
+  }
   use token, refuse <- reading(setup, thread, Some(#(owner, repo)), first, say)
   let auth = case token {
     Some(token) -> [

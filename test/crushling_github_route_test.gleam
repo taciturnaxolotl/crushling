@@ -152,6 +152,8 @@ fn fake_github(arrivals: Subject(Arrival), flags: Flags) -> Int {
       "/octo/private/info/refs", True -> #(200, [], "refs")
       "/octo/private/info/refs", False -> #(401, [], "no")
       "/octo/gone/info/refs", _ -> #(404, [], "no")
+      "/octo/private/git-receive-pack", True -> #(200, [], "pushed")
+      "/octo/private/git-receive-pack", False -> #(401, [], "no")
       "/octo/elsewhere/info/refs", True ->
         case has(flags, "installed") {
           True -> #(200, [], "refs")
@@ -464,23 +466,136 @@ pub fn git_streams_a_fetch_test() {
   let assert Error(Nil) = header(arrival, "cookie")
 }
 
-pub fn git_pushes_and_lfs_are_refused_test() {
+/// A receive-pack request: its commands, a flush, then the pack.
+fn push_body(commands: List(String)) -> BitArray {
+  let lines =
+    list.index_map(commands, fn(command, i) {
+      let line = case i {
+        0 -> command <> "\u{0} report-status side-band-64k\n"
+        _ -> command <> "\n"
+      }
+      let length = string.byte_size(line) + 4
+      string.pad_start(int.to_base16(length), 4, "0")
+      |> string.lowercase
+      <> line
+    })
+  bit_array.from_string(string.concat(lines) <> "0000PACK....")
+}
+
+const old = "1111111111111111111111111111111111111111"
+
+const new = "2222222222222222222222222222222222222222"
+
+const none = "0000000000000000000000000000000000000000"
+
+pub fn pushable_test() {
+  let assert Ok(Nil) =
+    route.pushable(
+      push_body([old <> " " <> new <> " refs/heads/crushling/fix"]),
+    )
+  // A new branch, and a force push, are both fine.
+  let assert Ok(Nil) =
+    route.pushable(
+      push_body([
+        none <> " " <> new <> " refs/heads/crushling/a",
+        old <> " " <> new <> " refs/heads/crushling/b/c",
+      ]),
+    )
+  let assert Error(why) =
+    route.pushable(push_body([old <> " " <> new <> " refs/heads/main"]))
+  let assert True = string.contains(why, "refs/heads/main")
+  let assert True = string.contains(why, "HEAD:crushling/")
+  // One bad ref refuses the whole push.
+  let assert Error(_) =
+    route.pushable(
+      push_body([
+        old <> " " <> new <> " refs/heads/crushling/ok",
+        old <> " " <> new <> " refs/tags/v1",
+      ]),
+    )
+  let assert Error(why) =
+    route.pushable(push_body([old <> " " <> none <> " refs/heads/crushling/x"]))
+  let assert True = string.contains(why, "deleting")
+  let assert Error(_) =
+    route.pushable(push_body([old <> " " <> new <> " refs/heads/crushling/"]))
+  let assert Error(_) =
+    route.pushable(push_body([old <> " " <> new <> " refs/heads/crushlingx"]))
+  let assert Error(_) = route.pushable(<<"garbage">>)
+  let assert Error(_) = route.pushable(<<"0000">>)
+}
+
+pub fn pushes_go_as_the_person_test() {
   let s = setup()
+  // The ref advertisement, then the push.
   let resp =
-    git_get(s, connected, "/git/octo/public/info/refs?service=git-receive-pack")
-  let assert 403 = resp.status
-  let assert True = string.contains(text(resp), "pushing")
+    git_get(
+      s,
+      connected,
+      "/git/octo/private/info/refs?service=git-receive-pack",
+    )
+  let assert 200 = resp.status
+  let _ = arrived(s)
+  let body = push_body([old <> " " <> new <> " refs/heads/crushling/fix"])
   let resp =
     ask(
       s,
       http.Post,
-      "/git/octo/public/git-receive-pack",
+      "/git/octo/private/git-receive-pack",
+      [
+        as_thread(connected),
+        #("content-type", "application/x-git-receive-pack-request"),
+      ],
+      body,
+    )
+  let assert 200 = resp.status
+  let assert "pushed" = text(resp)
+  let arrival = arrived(s)
+  let assert True = arrival.body == body
+  let basic = bit_array.base64_encode(<<"x-access-token:ghu_a":utf8>>, True)
+  let assert Ok(auth) = header(arrival, "authorization")
+  let assert True = auth == "Basic " <> basic
+}
+
+pub fn pushes_elsewhere_never_reach_github_test() {
+  let s = setup()
+  let resp =
+    ask(
+      s,
+      http.Post,
+      "/git/octo/private/git-receive-pack",
       [as_thread(connected)],
-      <<
-        "x",
-      >>,
+      push_body([old <> " " <> new <> " refs/heads/main"]),
     )
   let assert 403 = resp.status
+  let assert True = string.contains(text(resp), "crushling/")
+  let assert True = nothing_arrived(s)
+}
+
+/// Without a connection, a push waits for one rather than going to GitHub
+/// with the app's token or none.
+pub fn pushes_wait_for_the_connection_test() {
+  let s = setup()
+  let body = push_body([old <> " " <> new <> " refs/heads/crushling/fix"])
+  let resp =
+    ask(
+      s,
+      http.Post,
+      "/git/octo/private/git-receive-pack",
+      [as_thread(late)],
+      body,
+    )
+  let assert 200 = resp.status
+  let assert Error(Nil) = header(arrived(s), "authorization")
+  let again = arrived(s)
+  let basic = bit_array.base64_encode(<<"x-access-token:ghu_late":utf8>>, True)
+  let assert Ok(auth) = header(again, "authorization")
+  let assert True = auth == "Basic " <> basic
+  let assert Ok(route.Connection(Some("octo/private"))) =
+    process.receive(s.nudged, 0)
+}
+
+pub fn lfs_and_odd_paths_are_refused_test() {
+  let s = setup()
   let resp = git_get(s, connected, "/git/octo/public/info/lfs/objects/batch")
   let assert 404 = resp.status
   let resp =

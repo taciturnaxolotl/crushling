@@ -20,8 +20,9 @@ connection and sees what crushling is doing.
   which adds the token. Nothing in the sandbox can read it or send it
   elsewhere.
 - **Pushes are fenced.** The bridge refuses pushes to anything but
-  `crushling/*` branches, branch deletions and force pushes. `main` and other
-  people's branches can't be touched, even by a misbehaving agent.
+  `crushling/*` branches, and deleting those. Force-pushing one is fine: an
+  agent reworks its own branch. `main` and everyone's other branches can't
+  be touched, even by a misbehaving agent.
 - **The agent stages pull requests; a person opens them.** The agent proposes
   a PR. A card in the thread shows it, and someone presses **Open PR** or
   **Open as draft**. The PR is opened as that person.
@@ -76,10 +77,11 @@ bridge knows whose GitHub to use. It forwards to GitHub with that person's
 token:
 
 - **upload-pack** (clone, fetch): streamed through as is.
-- **receive-pack** (push): refused for now. Step 3 lets it through after
-  reading the pkt-line command list at the start of the request: every ref
-  must be `refs/heads/crushling/*`, none a deletion, none a force push (the
-  old id must match what GitHub has).
+- **receive-pack** (push): the bridge reads the pkt-line command list at
+  the start of the request before any of it reaches GitHub. Every ref must
+  be `refs/heads/crushling/<something>` and none a deletion, or the whole
+  push is refused, with words git shows the agent. A push only ever goes as
+  the person: without a connection it waits for one, like a read.
 - **LFS**: refused.
 - A redirect to another GitHub URL (a renamed repo) is rewritten to stay
   on the bridge. An error is answered in plain text, which git shows the
@@ -158,7 +160,7 @@ Each step is usable on its own:
    flow, token storage and refresh, `!github connect`/`disconnect`.
 2. **Reads through the bridge.** Done: the git proxy's upload-pack, the
    read-only `gh` wrapper. Private clones and PR reviews work.
-3. **Fenced pushes.** receive-pack with the ref checks.
+3. **Fenced pushes.** Done: receive-pack with the ref checks.
 4. **Staged PRs.** `propose_pr` and the card.
 5. **Later: MCP servers** in the App Home.
 
