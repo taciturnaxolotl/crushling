@@ -54,13 +54,25 @@ pub fn sandbox_env_test() {
   let env = route.env("http://172.30.0.1:7469", secret, connected)
   let bound = token.bound(secret, token.GitHub, connected)
   let assert True = list.contains(env, "GH_TOKEN=" <> bound)
-  let assert True = list.contains(env, "GIT_CONFIG_COUNT=4")
+  // Not GIT_CONFIG_COUNT: crush's shell replaces that with its own.
+  let assert False =
+    list.any(env, fn(pair) { string.starts_with(pair, "GIT_CONFIG_COUNT=") })
+  let assert Ok("GIT_CONFIG_PARAMETERS=" <> params) =
+    list.find(env, fn(pair) {
+      string.starts_with(pair, "GIT_CONFIG_PARAMETERS=")
+    })
   let base = "url.http://172.30.0.1:7469/git/.insteadOf"
-  let assert True = list.contains(env, "GIT_CONFIG_KEY_0=" <> base)
-  let assert True = list.contains(env, "GIT_CONFIG_VALUE_0=https://github.com/")
-  let assert True = list.contains(env, "GIT_CONFIG_VALUE_1=git@github.com:")
   let assert True =
-    list.contains(env, "GIT_CONFIG_VALUE_3=Authorization: Bearer " <> bound)
+    string.contains(params, "'" <> base <> "'='https://github.com/'")
+  let assert True =
+    string.contains(params, "'" <> base <> "'='git@github.com:'")
+  let assert True =
+    string.contains(
+      params,
+      "'http.http://172.30.0.1:7469/git/.extraHeader'='Authorization: Bearer "
+        <> bound
+        <> "'",
+    )
 }
 
 pub fn only_reads_test() {
@@ -755,6 +767,10 @@ fn real_clone() -> Nil {
     "PATH=/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
     "HOME=" <> dir,
     "GIT_TERMINAL_PROMPT=0",
+    // What crush's shell sets for its gpg wrapper, which must not undo ours.
+    "GIT_CONFIG_COUNT=1",
+    "GIT_CONFIG_KEY_0=gpg.program",
+    "GIT_CONFIG_VALUE_0=/bin/false",
     ..route.env(bridge, secret, anonymous)
   ]
   let #(status, out) =

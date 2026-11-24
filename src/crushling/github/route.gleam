@@ -89,6 +89,10 @@ pub fn github_api() -> relay.Upstream {
 /// What a thread's sandbox needs: git sends GitHub URLs, https and ssh, to
 /// the bridge with the thread's token, and gh (through the image's wrapper)
 /// uses the token as its own.
+///
+/// The git settings go in `GIT_CONFIG_PARAMETERS`, the variable `git -c`
+/// uses, not `GIT_CONFIG_COUNT`/`KEY_n`: crush's shell sets those for its
+/// own gpg wrapper and would replace ours, sending git straight to GitHub.
 pub fn env(bridge_url: String, secret: String, key: String) -> List(String) {
   let base = git_base(bridge_url)
   let bound = token.bound(secret, token.GitHub, key)
@@ -100,16 +104,16 @@ pub fn env(bridge_url: String, secret: String, key: String) -> List(String) {
   ]
   [
     "GH_TOKEN=" <> bound,
-    "GIT_CONFIG_COUNT=" <> int.to_string(list.length(config)),
-    ..list.index_map(config, fn(pair, i) {
-      let n = int.to_string(i)
-      [
-        "GIT_CONFIG_KEY_" <> n <> "=" <> pair.0,
-        "GIT_CONFIG_VALUE_" <> n <> "=" <> pair.1,
-      ]
-    })
-    |> list.flatten
+    "GIT_CONFIG_PARAMETERS="
+      <> list.map(config, fn(pair) { quote(pair.0) <> "=" <> quote(pair.1) })
+    |> string.join(" "),
   ]
+}
+
+/// Quoted the way git reads `GIT_CONFIG_PARAMETERS`: in single quotes, a
+/// quote inside as `'\''`.
+fn quote(text: String) -> String {
+  "'" <> string.replace(text, "'", "'\\''") <> "'"
 }
 
 fn git_base(bridge_url: String) -> String {
