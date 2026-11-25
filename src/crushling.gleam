@@ -693,6 +693,22 @@ fn launcher_for(
           },
           bridge_url: bridge.url,
         )
+      // Every deploy restarts the bridge: a good time to drop sandbox
+      // images nothing uses anymore.
+      process.spawn_unlinked(fn() {
+        case sandbox.prune_images(policy) {
+          Ok([]) -> Nil
+          Ok(removed) ->
+            io.println(
+              "crushling: removed unused sandbox images "
+              <> string.join(removed, ", "),
+            )
+          Error(error) ->
+            sys.warn(
+              "crushling: pruning sandbox images: " <> string.inspect(error),
+            )
+        }
+      })
       Ok(launcher.docker(policy, bridge))
     }
     other -> Error("CRUSHLING_LAUNCHER is " <> other <> "; use docker or local")

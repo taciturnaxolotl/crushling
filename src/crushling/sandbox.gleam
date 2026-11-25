@@ -272,6 +272,76 @@ pub type Error {
   Filesystem(reason: String)
 }
 
+/// Remove sandbox images nothing will run again. Old images are what fill
+/// the disk: containers are only kilobytes over theirs. First the stopped
+/// sandbox containers on an image other than `policy.image`: their next
+/// launch recreates them anyway (the image is in their fingerprint), and
+/// their workspaces are kept. Then the repository's tags that are neither
+/// the image in use nor run by any container left. Returns the images
+/// removed.
+pub fn prune_images(policy: Policy) -> Result(List(String), Error) {
+  use stopped <- result.try(
+    docker(policy, [
+      "ps",
+      "--all",
+      "--filter",
+      "label=" <> label <> "=1",
+      "--filter",
+      "status=exited",
+      "--format",
+      "{{.Names}} {{.Image}}",
+    ]),
+  )
+  string.split(stopped, "\n")
+  |> list.each(fn(line) {
+    case string.split(string.trim(line), " ") {
+      [name, image] if image != policy.image -> {
+        let _ = docker(policy, ["rm", name])
+        Nil
+      }
+      _ -> Nil
+    }
+  })
+  let repository = case string.split_once(policy.image, ":") {
+    Ok(#(repository, _)) -> repository
+    Error(Nil) -> policy.image
+  }
+  use tags <- result.try(
+    docker(policy, [
+      "image", "ls", repository, "--format", "{{.Repository}}:{{.Tag}}",
+    ]),
+  )
+  use used <- result.try(
+    docker(policy, ["ps", "--all", "--format", "{{.Image}}"]),
+  )
+  let used = string.split(used, "\n") |> list.map(string.trim)
+  let stale = unused_images(string.split(tags, "\n"), used, policy.image)
+  list.filter(stale, fn(image) {
+    case docker(policy, ["image", "rm", image]) {
+      Ok(_) -> True
+      Error(_) -> False
+    }
+  })
+  |> Ok
+}
+
+/// Of `tags`, those that aren't `current` and that no container in `used`
+/// runs.
+pub fn unused_images(
+  tags: List(String),
+  used: List(String),
+  current: String,
+) -> List(String) {
+  tags
+  |> list.map(string.trim)
+  |> list.filter(fn(tag) {
+    tag != ""
+    && tag != current
+    && !string.ends_with(tag, ":<none>")
+    && !list.contains(used, tag)
+  })
+}
+
 fn docker(policy: Policy, args: List(String)) -> Result(String, Error) {
   case exec(policy.docker, args, docker_timeout_ms) {
     Ok(#(0, output)) -> Ok(output)

@@ -212,3 +212,16 @@ fn file_exists(path: String) -> Bool
 
 @external(erlang, "erlang", "unique_integer")
 fn unique() -> Int
+
+pub fn unused_images_test() {
+  let tags = [
+    "crushling-sandbox:new", "crushling-sandbox:old", "crushling-sandbox:pinned",
+    "crushling-sandbox:<none>", "",
+  ]
+  let assert ["crushling-sandbox:old"] =
+    sandbox.unused_images(
+      tags,
+      ["crushling-sandbox:pinned", "erlang:27"],
+      "crushling-sandbox:new",
+    )
+}
