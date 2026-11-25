@@ -56,7 +56,12 @@ pub fn plan(run: Run, root: String) -> Option(Plan) {
 pub fn progress_title(run: Run) -> String {
   let count = list.length(run.tools)
   case run.outcome {
-    None -> "Working"
+    // What the agent says it's doing, on one line, else "Working".
+    None ->
+      case run.narration(run) |> first_line |> string.trim {
+        "" -> "Working"
+        said -> clip(said)
+      }
     Some(run.Completed(_)) -> "Done · " <> steps(count)
     Some(run.Errored(_)) -> "Failed · " <> steps(count)
     Some(run.Cancelled) -> "Stopped · " <> steps(count)

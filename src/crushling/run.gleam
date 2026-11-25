@@ -6,9 +6,12 @@ import crushling/crush/event.{type Event}
 import crushling/diff
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
+import gleam/set.{type Set}
 import gleam/string
 
 pub type ToolStatus {
@@ -45,6 +48,9 @@ pub type Run {
     run_id: String,
     order: List(String),
     texts: Dict(String, String),
+    /// Messages that call tools: what they say is narration ("Building it
+    /// now."), shown as the run's status rather than in its reply.
+    acting: Set(String),
     tools: List(Tool),
     baseline: Dict(String, Option(String)),
     latest: Dict(String, String),
@@ -63,6 +69,7 @@ pub fn new(session_id: String, run_id: String) -> Run {
     run_id:,
     order: [],
     texts: dict.new(),
+    acting: set.new(),
     tools: [],
     baseline: dict.new(),
     latest: dict.new(),
@@ -104,11 +111,15 @@ fn apply_message(run: Run, message: event.Message) -> Run {
         False -> list.append(run.order, [message.id])
       }
       let texts = dict.insert(run.texts, message.id, message.text)
+      let acting = case message.tool_calls {
+        [] -> run.acting
+        _ -> set.insert(run.acting, message.id)
+      }
       let tools =
         list.fold(message.tool_calls, run.tools, fn(tools, call) {
           upsert_tool(tools, call)
         })
-      Run(..run, order:, texts:, tools:)
+      Run(..run, order:, texts:, acting:, tools:)
     }
     event.Tool -> {
       let tools =
@@ -232,11 +243,28 @@ pub fn remember(known: Known, run: Run) -> Known {
   dict.merge(known, run.latest)
 }
 
+/// What the run says to the person: its messages, without narration
+/// between tool calls. While it runs, the latest message is held back,
+/// since a tool call may yet make it narration.
 pub fn text(run: Run) -> String {
-  list.filter_map(run.order, fn(id) { dict.get(run.texts, id) })
+  let order = case run.outcome {
+    None -> list.take(run.order, int.max(list.length(run.order) - 1, 0))
+    Some(_) -> run.order
+  }
+  list.filter(order, fn(id) { !set.contains(run.acting, id) })
+  |> list.filter_map(fn(id) { dict.get(run.texts, id) })
   |> list.map(string.trim)
   |> list.filter(fn(text) { text != "" })
   |> string.join("\n\n")
+}
+
+/// What the agent last said it's doing: the latest message's text while
+/// the run goes, or "".
+pub fn narration(run: Run) -> String {
+  case run.outcome, list.last(run.order) {
+    None, Ok(id) -> dict.get(run.texts, id) |> result.unwrap("") |> string.trim
+    _, _ -> ""
+  }
 }
 
 /// The assistant's messages so far as id and text, without empty ones.

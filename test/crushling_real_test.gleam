@@ -1045,6 +1045,7 @@ fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
         _ -> False
       }
     })
+    as string.inspect(seen)
   // The run moved mid-turn, and the channel's Code tab lists the changes:
   // no line naming them, and no patch.
   let assert False =

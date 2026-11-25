@@ -61,7 +61,40 @@ pub fn text_accumulates_across_messages_test() {
       assistant("m2", "Fixed.", []),
       assistant("m1", "Looking at it.", []),
     ])
+  // While the run goes, the latest message waits: it may be narration.
+  let assert "Looking at it." = run.text(r)
+  let r = run.apply(r, dict.new(), done("Fixed.", "", False))
   let assert "Looking at it.\n\nFixed." = run.text(r)
+}
+
+/// What the agent says while it calls tools is its status, not its reply.
+pub fn narration_is_status_not_reply_test() {
+  let call = event.ToolCall("c1", "bash", "{\"command\":\"ls\"}", False)
+  let r =
+    feed([
+      assistant("m1", "Building crush from source first.", [call]),
+      tool_result("c1", False),
+    ])
+  let assert "Building crush from source first." = run.narration(r)
+  let assert "Building crush from source first." = render.progress_title(r)
+  let assert "" = run.text(r)
+  let r =
+    run.apply(
+      r,
+      dict.new(),
+      assistant(
+        "m2",
+        "Crush starts in 2s; most of it waits on the network.",
+        [],
+      ),
+    )
+  // Not shown until the run ends: a tool call could still follow.
+  let assert "" = run.text(r)
+  let r = run.apply(r, dict.new(), done("", "", False))
+  let assert "Crush starts in 2s; most of it waits on the network." =
+    run.text(r)
+  let assert "" = run.narration(r)
+  let assert True = string.starts_with(render.progress_title(r), "Done")
 }
 
 pub fn other_sessions_and_runs_ignored_test() {
@@ -165,7 +198,8 @@ pub fn plan_render_test() {
       tool_result("c1", False),
       tool_result("c3", False),
     ])
-  let assert Some(render.Plan("Working", [one, two, three])) =
+  // Its narration is the card's title.
+  let assert Some(render.Plan("Working on it.", [one, two, three])) =
     render.plan(r, "/workspace")
   // Successful output stays out of the card.
   let assert render.Task(
@@ -209,7 +243,10 @@ pub fn streamed_text_test() {
     ])
   let assert [#("m1", "Looking at it."), #("m3", "Fixed.")] =
     run.messages(r, True)
-  let assert "Working" = render.progress_title(r)
+  // The latest message is the status until the run ends.
+  let assert "Fixed." = render.progress_title(r)
+  let assert "Looking at it." = render.reply(r)
+  let r = run.apply(r, dict.new(), done("", "", False))
   let assert "Looking at it.\n\nFixed." = render.reply(r)
   let assert ["Looking at it.\n\nFixed."] = render.answer(r)
 }
@@ -231,7 +268,8 @@ pub fn done_title_test() {
         ),
       ),
     ])
-  let assert "Working" = render.progress_title(r)
+  let assert "On it." = render.progress_title(r)
+  let assert "Working" = render.progress_title(feed([]))
   let assert "Done · 0 steps" =
     render.progress_title(run.apply(r, dict.new(), done("On it.", "", False)))
   let assert "Stopped · 0 steps" =
