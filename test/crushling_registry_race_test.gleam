@@ -43,6 +43,7 @@ fn blocking_launcher(calls: Subject(Call)) -> launcher.Launcher {
       result
     },
     exists: fn(_) { False },
+    forget: fn(_) { Ok(Nil) },
     rekey: fn(_, _) { Ok(Nil) },
     run_in_sandbox: None,
   )

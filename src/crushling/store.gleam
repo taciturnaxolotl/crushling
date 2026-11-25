@@ -605,6 +605,30 @@ fn read_thread(
   |> result.map(fn(rows) { list.first(rows) |> option.from_result })
 }
 
+/// A workspace's threads whose meta last changed before `before` (Unix
+/// seconds), with when. Meta changes with every message the agent reads,
+/// so this is when each thread last saw work.
+pub fn quiet_threads(
+  store: Store,
+  team: String,
+  before: Int,
+) -> Result(List(#(Thread, Int)), String) {
+  use connection, _ <- run(store)
+  let decoder = {
+    use thread <- decode.then(thread_decoder())
+    use updated_at <- decode.field(10, decode.int)
+    decode.success(#(thread, updated_at))
+  }
+  query(
+    connection,
+    "SELECT key, team_id, channel, thread_ts, follow, paused, cursor, venue,
+       tailnet, model, updated_at FROM threads
+     WHERE team_id = ? AND updated_at < ?",
+    [sqlight.text(team), sqlight.int(before)],
+    decoder,
+  )
+}
+
 /// Move a thread's row from `old` to `new`, setting its team, unless `new`
 /// already has one, in one transaction. True when a row moved.
 pub fn rename_thread(

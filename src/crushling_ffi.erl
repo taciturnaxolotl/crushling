@@ -4,7 +4,7 @@
          hmac_sha256_hex/2, equal_constant_time/2,
          file_exists/1, is_socket/1, file_stamp/1, mkdir_p/1, write_private/2, getenv/1, expand_home/1,
          read_file/1, write_bytes/2, list_dir/1, delete_file/1, is_loopback/1,
-         rsa_key/1, rs256/2]).
+         rsa_key/1, rs256/2, delete_tree/1]).
 
 line_at(Lines, Index) ->
     element(Index + 1, Lines).
@@ -204,3 +204,11 @@ rsa_key(Pem) ->
 %% An RS256 signature of Data with Key (from rsa_key/1).
 rs256(Data, Key) ->
     public_key:sign(Data, sha256, Key).
+
+%% Remove a directory and everything in it. Ok when it was already gone.
+delete_tree(Path) ->
+    case file:del_dir_r(Path) of
+        ok -> {ok, nil};
+        {error, enoent} -> {ok, nil};
+        {error, Reason} -> {error, unicode:characters_to_binary(io_lib:format("~p", [Reason]))}
+    end.

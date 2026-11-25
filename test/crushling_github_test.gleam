@@ -791,6 +791,7 @@ fn start_registry(
         launch: fn(_) { Error("no agents in this test") },
         stop: fn(_) { Ok(Nil) },
         exists: fn(_) { False },
+        forget: fn(_) { Ok(Nil) },
         rekey: fn(_, _) { Ok(Nil) },
         run_in_sandbox: None,
       ),

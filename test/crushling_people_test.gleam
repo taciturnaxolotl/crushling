@@ -178,6 +178,7 @@ fn launcher_reporting(launches: Subject(String)) -> launcher.Launcher {
     },
     stop: fn(_) { Ok(Nil) },
     exists: fn(_) { False },
+    forget: fn(_) { Ok(Nil) },
     rekey: fn(_, _) { Ok(Nil) },
     run_in_sandbox: None,
   )

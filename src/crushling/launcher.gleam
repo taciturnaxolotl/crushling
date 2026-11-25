@@ -43,6 +43,9 @@ pub type Launcher {
     /// stop and remove whatever runs under the old key, and rename its
     /// directory. The next launch starts it afresh under the new key.
     rekey: fn(String, String) -> Result(Nil, String),
+    /// Remove a stopped thread's sandbox and workspace for good. Its row
+    /// in the store stays, so the thread can start again, from nothing.
+    forget: fn(String) -> Result(Nil, String),
     /// Run a script in a thread's sandbox, with extra `NAME=value` pairs.
     /// The local launcher has no sandbox.
     run_in_sandbox: Option(
@@ -244,6 +247,18 @@ pub fn docker(policy: sandbox.Policy, bridge: Bridge) -> Launcher {
       })
       move_dir(policy.root, old, new)
     },
+    forget: fn(key) {
+      use _ <- result.try(case sandbox.remove(policy, key) {
+        Ok(Nil) -> Ok(Nil)
+        Error(sandbox.DockerFailed(output:, ..)) ->
+          case string.contains(string.lowercase(output), "no such container") {
+            True -> Ok(Nil)
+            False -> Error("docker rm: " <> string.trim(output))
+          }
+        Error(error) -> Error("docker rm: " <> string.inspect(error))
+      })
+      delete_thread_dir(policy.root, key)
+    },
     run_in_sandbox: Some(fn(key, env, script) {
       sandbox.run_in(policy, key, env, script)
       |> result.map_error(string.inspect)
@@ -278,6 +293,20 @@ fn rename(from: String, to: String) -> Result(Nil, String)
 
 /// Rename `root/old` to `root/new`, unless there's nothing to move or the
 /// new one already exists.
+@external(erlang, "crushling_ffi", "delete_tree")
+fn delete_tree(path: String) -> Result(Nil, String)
+
+/// Delete `<root>/<key>`, for a key that can only name a thread's own
+/// directory.
+fn delete_thread_dir(root: String, key: String) -> Result(Nil, String) {
+  case key, string.contains(key, "/") {
+    "", _ | ".", _ | "..", _ | _, True -> Error("not a thread key: " <> key)
+    key, False ->
+      delete_tree(root <> "/" <> key)
+      |> result.map_error(fn(reason) { "deleting the workspace: " <> reason })
+  }
+}
+
 pub fn move_dir(root: String, old: String, new: String) -> Result(Nil, String) {
   let from = root <> "/" <> old
   let to = root <> "/" <> new
@@ -379,6 +408,13 @@ pub fn local(
         |> result.map_error(fn(reason) { "crush server: " <> reason }),
       )
       move_dir(root, old, new)
+    },
+    forget: fn(key) {
+      use _ <- result.try(
+        stop_server(pid_file(key))
+        |> result.map_error(fn(reason) { "crush server: " <> reason }),
+      )
+      delete_thread_dir(root, key)
     },
     run_in_sandbox: None,
   )

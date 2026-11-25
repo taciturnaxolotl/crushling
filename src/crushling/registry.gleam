@@ -40,6 +40,7 @@ import crushling/registry/entry.{
 import crushling/registry/incoming.{type Incoming, Incoming, is_dm}
 import crushling/registry/links.{type Links}
 import crushling/registry/prompt
+import crushling/registry/sweep
 import crushling/registry/tailnet
 import crushling/sandbox
 import crushling/slack
@@ -167,6 +168,9 @@ pub type Message {
     choice: String,
     respond: Option(String),
   )
+  /// Archive quiet code channels and clear out long-quiet workspaces;
+  /// hourly.
+  Sweep
   /// A PR card was opened; forget it.
   PrSettled(card_ts: String)
   /// A slash command in a code channel, as the `!` command `text` from
@@ -279,6 +283,8 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       process.new_selector()
       |> process.select(self)
       |> process.select_monitors(ThreadDown)
+    // The first sweep a minute in, once the bridge has settled.
+    process.send_after(self, 60_000, Sweep)
     // Linked: it goes down with the registry, and comes back with it.
     use connections <- result.try(
       connections.start(connections.Setup(
@@ -531,6 +537,10 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     GitHubConnect(user) -> actor.continue(home_ask(state, user, Connect(None)))
     PrPressed(user:, card_ts:, choice:, respond:) ->
       actor.continue(pr_pressed(state, user, card_ts, choice, respond))
+    Sweep -> {
+      process.send_after(state.self, sweep.every_ms, Sweep)
+      actor.continue(sweep_quiet(state))
+    }
     PrSettled(card_ts) ->
       actor.continue(
         State(..state, proposals: dict.delete(state.proposals, card_ts)),
@@ -1123,6 +1133,66 @@ fn home_ask(state: State, user: String, ask: HomeAsk) -> State {
         }),
       )
       state
+    }
+  }
+}
+
+/// Archive code channels quiet for a week and forget workspaces quiet for
+/// a month (`registry/sweep`). Slack and the disk are touched off the
+/// registry; the thread's meta changes here.
+fn sweep_quiet(state: State) -> State {
+  let config = state.config
+  let now = sys.system_ms() / 1000
+  case
+    store.quiet_threads(config.store, config.team, now - sweep.archive_after_s)
+  {
+    Error(reason) -> {
+      sys.warn("crushling: sweeping quiet threads: " <> reason)
+      state
+    }
+    Ok(threads) -> {
+      let busy = fn(key) {
+        case dict.get(state.threads, key) {
+          Ok(Entry(agent: Live(..), ..))
+          | Ok(Entry(agent: Starting, ..))
+          | Ok(Entry(agent: Stopping(..), ..)) -> True
+          _ -> False
+        }
+      }
+      sweep.plan(threads, now, busy, config.launcher.exists)
+      |> list.fold(state, fn(state, action) {
+        case action {
+          sweep.Archive(key:, channel:, repo:) -> {
+            sys.info("crushling: archiving quiet code channel " <> channel)
+            let client = config.client
+            process.spawn_unlinked(fn() {
+              slack.say(client, channel, "", sweep.archive_note)
+              case slack.archive_code_channel(client, channel, "") {
+                Ok(Nil) -> Nil
+                Error(reason) ->
+                  sys.warn(
+                    "crushling: archiving " <> channel <> " failed: " <> reason,
+                  )
+              }
+            })
+            update_meta(state, key, fn(meta) {
+              Meta(..meta, venue: venue.Archived(repo), tailnet: None)
+            })
+          }
+          sweep.Forget(key) -> {
+            sys.info("crushling: clearing out " <> key <> ", quiet for a month")
+            let forget = config.launcher.forget
+            process.spawn_unlinked(fn() {
+              case forget(key) {
+                Ok(Nil) -> Nil
+                Error(reason) ->
+                  sys.warn("crushling: clearing out " <> key <> ": " <> reason)
+              }
+            })
+            state
+          }
+        }
+      })
     }
   }
 }

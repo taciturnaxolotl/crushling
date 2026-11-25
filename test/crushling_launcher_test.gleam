@@ -386,6 +386,7 @@ fn launching(calls: Subject(String)) -> launcher.Launcher {
       Ok(Nil)
     },
     exists: fn(_) { False },
+    forget: fn(_) { Ok(Nil) },
     rekey: fn(_, _) { Ok(Nil) },
     run_in_sandbox: None,
   )
@@ -688,4 +689,25 @@ pub fn local_rekey_moves_the_directory_test() {
   let assert Ok(Nil) = mkdir_p(dir <> "/C3-1.0/work")
   let assert Ok(Nil) = mkdir_p(dir <> "/T1-C3-1.0/work")
   let assert Error(_) = l.rekey("C3-1.0", "T1-C3-1.0")
+}
+
+/// Forgetting a thread removes its directory and only that: a key that
+/// could reach outside the instance root is refused.
+pub fn forget_removes_only_the_threads_dir_test() {
+  let dir = tmp("forget")
+  let bridge = recording_bridge(dir, process.new_subject(), fn(_) { Ok("") })
+  let l =
+    launcher.local(dir, "/usr/bin/false", provider.Models("a", "b"), bridge)
+  let assert Ok(Nil) = mkdir_p(dir <> "/T1-C1-1.0/work/.home")
+  let assert Ok(Nil) = mkdir_p(dir <> "/T1-C2-1.0/work")
+  let assert True = l.exists("T1-C1-1.0")
+  let assert Ok(Nil) = l.forget("T1-C1-1.0")
+  let assert False = l.exists("T1-C1-1.0")
+  let assert True = l.exists("T1-C2-1.0")
+  // Gone already is fine.
+  let assert Ok(Nil) = l.forget("T1-C1-1.0")
+  let assert Error(_) = l.forget("../T1-C2-1.0")
+  let assert Error(_) = l.forget("..")
+  let assert Error(_) = l.forget("")
+  let assert True = l.exists("T1-C2-1.0")
 }

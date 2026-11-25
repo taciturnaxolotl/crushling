@@ -701,6 +701,7 @@ fn start_woken_registry(name: String) {
         Ok(Nil)
       },
       exists: fn(_) { True },
+      forget: fn(_) { Ok(Nil) },
       rekey: fn(_, _) { Ok(Nil) },
       run_in_sandbox: None,
     )

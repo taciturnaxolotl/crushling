@@ -175,6 +175,7 @@ fn start_registry_in(
         Ok(Nil)
       },
       exists: fn(key) { key == k("C9", "1.0") || key == k("C7", "1.0") },
+      forget: fn(_) { Ok(Nil) },
       rekey: fn(_, _) { Ok(Nil) },
       run_in_sandbox: None,
     )
@@ -765,6 +766,7 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
       },
       stop: fn(_) { Ok(Nil) },
       exists: fn(key) { file_exists(root <> "/" <> key <> "/work") },
+      forget: fn(_) { Ok(Nil) },
       rekey: fn(old, new) {
         process.send(rekeys, #(old, new))
         launcher.move_dir(root, old, new)
@@ -837,6 +839,7 @@ fn migrating_registry(
       },
       stop: fn(_) { Ok(Nil) },
       exists: fn(key) { file_exists(root <> "/" <> key <> "/work") },
+      forget: fn(_) { Ok(Nil) },
       rekey: fn(old, new) {
         process.send(rekeys, #(old, new))
         case rekey_fails {

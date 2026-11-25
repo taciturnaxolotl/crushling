@@ -554,6 +554,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
         result
       },
       exists: local.exists,
+      forget: local.forget,
       rekey: local.rekey,
       run_in_sandbox: local.run_in_sandbox,
     )
@@ -653,6 +654,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
         result
       },
       exists: local.exists,
+      forget: local.forget,
       rekey: local.rekey,
       run_in_sandbox: local.run_in_sandbox,
     )
