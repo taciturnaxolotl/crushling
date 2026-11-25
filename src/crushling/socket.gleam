@@ -4,6 +4,7 @@
 import crushling/connections
 import crushling/home
 import crushling/models
+import crushling/pr
 import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/registry/tailnet
@@ -88,6 +89,32 @@ pub fn router(base: app.App, find: Find) -> app.App {
   |> model_menus(find)
   |> home_buttons(find)
   |> code_commands(find)
+  |> pr_buttons(find)
+}
+
+/// The buttons on PR cards.
+fn pr_buttons(app: app.App, find: Find) -> app.App {
+  use app, action_id <- list.fold(pr.actions(), app)
+  use action, payload <- app.action(app, action_id)
+  let team = option.map(payload.team, fn(team) { team.id })
+  let enterprise = option.map(payload.enterprise, fn(org) { org.id })
+  case target(find, team, enterprise), action, payload.container {
+    Ok(Target(registry:, ..)),
+      interaction.ButtonAction(value: Some(choice), ..),
+      Some(interaction.MessageContainer(message_ts: Some(message_ts), ..))
+    ->
+      process.send(
+        registry,
+        registry.PrPressed(
+          user: payload.user.id,
+          card_ts: message_ts,
+          choice:,
+          respond: payload.response_url,
+        ),
+      )
+    _, _, _ -> Nil
+  }
+  app.ack()
 }
 
 /// The slash commands offered in code channels: each is its `!` command,

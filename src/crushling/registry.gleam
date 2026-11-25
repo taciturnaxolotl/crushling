@@ -32,6 +32,7 @@ import crushling/launcher.{type Launcher}
 import crushling/meta.{type Link, type Meta, Link, Meta}
 import crushling/models
 import crushling/people.{type People}
+import crushling/pr
 import crushling/registry/entry.{
   type Entry, Entry, Live, Starting, Stopping, already_read, has_waiting,
   is_quiet, new as new_entry, tailnet_view,
@@ -56,6 +57,9 @@ import gleam/result
 import gleam/set.{type Set}
 import gleam/string
 import slackline
+import slackline/api/chat
+import slackline/api/chat/update
+import slackline/httpc
 
 pub type Config {
   Config(
@@ -155,6 +159,16 @@ pub type Message {
   /// Connect or disconnect `user`'s GitHub account, from the App Home.
   GitHubConnect(user: String)
   GitHubDisconnect(user: String)
+  /// Someone pressed a PR card's button: open it (as a draft or not), or
+  /// dismiss it. `respond` answers them privately.
+  PrPressed(
+    user: String,
+    card_ts: String,
+    choice: String,
+    respond: Option(String),
+  )
+  /// A PR card was opened; forget it.
+  PrSettled(card_ts: String)
   /// A slash command in a code channel, as the `!` command `text` from
   /// `user`. Answered there, privately where it says anything.
   Slash(channel: String, user: String, text: String)
@@ -232,6 +246,9 @@ type State {
     /// When each person was last asked to connect GitHub in each thread,
     /// by thread and user, in monotonic ms.
     nudged: Dict(#(String, String, String), Int),
+    /// PR cards waiting for a press, by their message ts: in which channel,
+    /// and what they propose. Lost on restart; `/pr` posts a new one.
+    proposals: Dict(String, #(String, pr.Proposal)),
   )
 }
 
@@ -298,6 +315,7 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       looking_up: dict.new(),
       connections:,
       nudged: dict.new(),
+      proposals: dict.new(),
     )
     |> actor.initialised
     |> actor.selecting(selector)
@@ -511,6 +529,12 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(idle_check(state, key, generation))
     HomeOpened(user) -> actor.continue(home_ask(state, user, ShowHome))
     GitHubConnect(user) -> actor.continue(home_ask(state, user, Connect(None)))
+    PrPressed(user:, card_ts:, choice:, respond:) ->
+      actor.continue(pr_pressed(state, user, card_ts, choice, respond))
+    PrSettled(card_ts) ->
+      actor.continue(
+        State(..state, proposals: dict.delete(state.proposals, card_ts)),
+      )
     Slash(channel:, user:, text:) -> {
       // Said at the top of the channel, now, and heard as if mentioned.
       let ms = sys.system_ms()
@@ -866,6 +890,21 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       set_meta(state, route.key, entry, meta)
     }
     slack.DoneCommand, Some(entry) -> done(state, route, entry)
+    slack.PrCommand(title), Some(entry) -> {
+      let incoming = route.incoming
+      deliver(
+        state,
+        route.key,
+        entry,
+        thread.Propose(title, "", fn(result) {
+          case result {
+            Ok(_) -> Nil
+            Error(why) ->
+              whisper(config, incoming, "_No PR card: " <> why <> "._")
+          }
+        }),
+      )
+    }
     slack.InfoCommand, Some(Entry(agent: Live(thread:, ..), ..)) -> {
       let incoming = route.incoming
       process.spawn_unlinked(fn() {
@@ -942,6 +981,7 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
     | slack.ResumeCommand, None
     | slack.DoneCommand, None
     | slack.InfoCommand, None
+    | slack.PrCommand(..), None
     | slack.TailnetCommand(..), None
     | slack.ModelCommand(..), None
     -> {
@@ -1083,6 +1123,101 @@ fn home_ask(state: State, user: String, ask: HomeAsk) -> State {
         }),
       )
       state
+    }
+  }
+}
+
+/// A press on a PR card. Only someone who may use crushling may press;
+/// the PR opens as them, with their GitHub connection.
+fn pr_pressed(
+  state: State,
+  user: String,
+  card_ts: String,
+  choice: String,
+  respond: Option(String),
+) -> State {
+  let say = fn(text) {
+    case respond {
+      Some(url) -> {
+        process.spawn_unlinked(fn() { slack.reply_ephemeral(url, text) })
+        Nil
+      }
+      None -> Nil
+    }
+  }
+  case
+    dict.get(state.proposals, card_ts),
+    may_use(state, user),
+    state.config.github
+  {
+    Error(Nil), _, _ -> {
+      say("_This card has expired; `/pr` posts a new one._")
+      state
+    }
+    _, False, _ -> {
+      say("_You can't use crushling here._")
+      state
+    }
+    _, _, None -> {
+      say("_GitHub isn't set up for this crushling._")
+      state
+    }
+    Ok(#(channel, proposal)), True, Some(config) -> {
+      let client = state.config.client
+      let settle = fn(outcome) {
+        let #(text, blocks) = pr.settled(proposal, outcome)
+        let _ =
+          chat.update(channel:, ts: card_ts)
+          |> update.text(text)
+          |> update.blocks(blocks)
+          |> httpc.send(client)
+        Nil
+      }
+      case choice {
+        "dismiss" -> {
+          process.spawn_unlinked(fn() {
+            settle("Dismissed by <@" <> user <> ">")
+          })
+          State(..state, proposals: dict.delete(state.proposals, card_ts))
+        }
+        _ -> {
+          let connections = state.connections
+          let draft = choice == "draft"
+          let self = state.self
+          process.spawn_unlinked(fn() {
+            let asked = process.new_subject()
+            process.send(connections, connections.Access(user, asked))
+            case process.receive(asked, github_access_ms) {
+              Ok(Ok(Some(token))) ->
+                case pr.open(config, token, proposal, draft) {
+                  Ok(#(number, url)) -> {
+                    settle(
+                      "<@"
+                      <> user
+                      <> "> opened <"
+                      <> url
+                      <> "|#"
+                      <> int.to_string(number)
+                      <> ">"
+                      <> case draft {
+                        True -> " as a draft"
+                        False -> ""
+                      },
+                    )
+                    process.send(self, PrSettled(card_ts))
+                  }
+                  Error(why) -> say("_Couldn't open the PR: " <> why <> "._")
+                }
+              Ok(Ok(None)) ->
+                say(
+                  "_Connect your GitHub account first, from crushling's Home tab or with `!github`, then press again: the PR opens as you._",
+                )
+              _ -> say("_Couldn't get your GitHub connection; try again._")
+            }
+          })
+          state
+        }
+      }
     }
   }
 }
@@ -1701,6 +1836,11 @@ fn from_thread(state: State, key: String, notice: thread.Notice) -> State {
       idle_soon(state, key, Entry(..entry, working: busy))
     thread.JobsRunning(generation:, running:), Ok(entry) ->
       jobs_counted(state, key, entry, generation, running)
+    thread.Proposed(card_ts:, channel:, proposal:), _ ->
+      State(
+        ..state,
+        proposals: dict.insert(state.proposals, card_ts, #(channel, proposal)),
+      )
     thread.Lost, Ok(_) -> {
       sys.warn("crushling: lost the agent of " <> key <> "; stopping it")
       stop_agent(state, key)

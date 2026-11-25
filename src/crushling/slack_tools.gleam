@@ -152,6 +152,25 @@ fn common_tools() -> List(mcp.Tool) {
       schema([#("text", "string", "The message.")], ["text"]),
     ),
     mcp.Tool(
+      "propose_pr",
+      "Propose a pull request for the branch you pushed (a `crushling/…` branch): posts a card in the conversation, and a person opens the PR from it, as themselves. You can't open one yourself. Push first. The base is the branch you started from.",
+      schema(
+        [
+          #(
+            "title",
+            "string",
+            "The PR's title, like \"Fix the flaky checkout test\".",
+          ),
+          #(
+            "body",
+            "string",
+            "The PR's description, in GitHub markdown: what changed and why, and how it was checked.",
+          ),
+        ],
+        ["title", "body"],
+      ),
+    ),
+    mcp.Tool(
       "open_code_channel",
       "Move this work into a Slack code channel: its own channel for a task that changes a repository, where people can follow along and see the diff in a Code tab. Only for changing code: reviewing, reading or answering questions about a repository stays in the thread. Changing a repository's files moves the work there anyway; call this first to give the channel a good name. Your replies go to the channel from then on.",
       schema(
@@ -242,6 +261,20 @@ pub fn call(
         "" -> Error("say which machines you need and why")
         reason -> context.ask_tailnet(key, reason)
       }
+    "propose_pr" -> {
+      let answered = process.new_subject()
+      process.send(
+        thread,
+        thread.Propose(
+          string_arg(arguments, "title"),
+          string_arg(arguments, "body"),
+          fn(result) { process.send(answered, result) },
+        ),
+      )
+      process.receive(answered, timeout_ms)
+      |> result.replace_error("the thread didn't answer in time")
+      |> result.flatten
+    }
     "open_code_channel" -> {
       use opened <- result.try(
         ask(thread, thread.OpenCodeChannel(

@@ -17,6 +17,7 @@ import crushling/crush/event
 import crushling/gun
 import crushling/meta.{type ModelChoice}
 import crushling/models
+import crushling/pr
 import crushling/render
 import crushling/run.{type Run}
 import crushling/sink.{type Reply, type Sink}
@@ -75,6 +76,9 @@ pub type Notice {
   /// How many background jobs the agent has running, for the registry's
   /// idle check of `generation`.
   JobsRunning(generation: Int, running: Int)
+  /// A card proposing `proposal` was posted in `channel` at `card_ts`; its
+  /// buttons come to the registry.
+  Proposed(card_ts: String, channel: String, proposal: pr.Proposal)
   /// The agent is gone (its sandbox died, say of running out of memory) and
   /// reconnecting gave up. The registry stops what's left of it, so the
   /// next message starts a new one.
@@ -124,6 +128,13 @@ pub type Message {
   Requester(reply: Subject(String))
   /// Where the work stands, for `!info`: a few lines of Slack markdown.
   Info(reply: Subject(String))
+  /// Post a card proposing a PR for the pushed branch (`/pr`, or the
+  /// agent's `propose_pr`). `answer` gets what was done, or why not.
+  Propose(
+    title: String,
+    body: String,
+    answer: fn(Result(String, String)) -> Nil,
+  )
   /// Post a message in the thread's current conversation, and reply with its
   /// ts. The agent's Slack tools use this.
   Say(text: String, reply: Subject(Result(String, String)))
@@ -340,6 +351,10 @@ fn step(state: State, message: Message) -> State {
           "_The agent is asleep; send a message to wake it, then ask again._"
         dir, Some(_) -> repo.status(shell(state), dir)
       })
+      state
+    }
+    Propose(title:, body:, answer:) -> {
+      answer(propose(state, title, body))
       state
     }
     Requester(reply) -> {
@@ -852,6 +867,36 @@ fn open_code_channel(
       #(state, Ok(channel))
     }
   }
+}
+
+/// Post a card proposing a PR for the repository's pushed branch.
+fn propose(
+  state: State,
+  title: String,
+  body: String,
+) -> Result(String, String) {
+  let shell = shell(state)
+  use dir <- result.try(case state.venue {
+    venue.CodeChannel(repo:, ..)
+      | venue.ThreadOnly(repo:)
+      | venue.Archived(repo:)
+      if repo != ""
+    -> Ok(repo)
+    _ -> repo.find(shell, "") |> result.map(fn(found) { found.dir })
+  })
+  use facts <- result.try(
+    shell(pr.facts(dir))
+    |> result.replace_error("couldn't read the repository; is the agent awake?"),
+  )
+  use proposal <- result.try(pr.from_facts(facts, title, body))
+  let #(text, blocks) = pr.card(proposal)
+  use ts <- result.map(state.sink.post_blocks(text, blocks))
+  state.config.notify(Proposed(ts, state.sink.conversation.channel, proposal))
+  "Posted a card proposing `"
+  <> proposal.head
+  <> "` → `"
+  <> proposal.base
+  <> "`; a person opens the PR from it."
 }
 
 /// Re-render the in-progress run if it changed since it was last shown.
