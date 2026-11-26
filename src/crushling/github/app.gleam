@@ -182,13 +182,29 @@ fn installed_for(
     _ -> {
       let auth = "Bearer " <> jwt(state.config.client_id, state.key, now)
       let path = "/repos/" <> owner <> "/" <> repo <> "/installation"
-      case status(state.config, path, auth) {
-        Ok(200) -> #(remember(state, name, True, now + installed_s), Some(True))
-        Ok(404) -> #(
-          remember(state, name, False, now + not_installed_s),
-          Some(False),
+      // GitHub says 404 both for a repo the app can't see and for one that
+      // doesn't exist. Installed on the whole account, it's the latter:
+      // nothing to install.
+      let installed = case status(state.config, path, auth) {
+        Ok(200) -> Some(True)
+        Ok(404) ->
+          case account_selection(state.config, owner, auth) {
+            Ok("all") -> Some(True)
+            Ok(_) -> Some(False)
+            Error(Nil) -> None
+          }
+        _ -> None
+      }
+      case installed {
+        Some(True) -> #(
+          remember(state, name, True, now + installed_s),
+          installed,
         )
-        _ -> #(state, None)
+        Some(False) -> #(
+          remember(state, name, False, now + not_installed_s),
+          installed,
+        )
+        None -> #(state, None)
       }
     }
   }
@@ -360,6 +376,34 @@ fn is_public(
   })
   // Private, missing, or unknown: not used.
   == Ok(False)
+}
+
+/// How the app is installed on account `owner`: "all" repositories,
+/// "selected" ones, or "" when it isn't. Error when GitHub can't be asked.
+fn account_selection(
+  config: github.Config,
+  owner: String,
+  auth: String,
+) -> Result(String, Nil) {
+  let ask = fn(path) {
+    call(config, http.Get, path, auth)
+    |> result.try(fn(text) {
+      json.parse(text, decode.at(["repository_selection"], decode.string))
+      |> result.replace_error("")
+    })
+  }
+  case ask("/users/" <> owner <> "/installation") {
+    Ok(selection) -> Ok(selection)
+    Error(_) ->
+      case ask("/orgs/" <> owner <> "/installation") {
+        Ok(selection) -> Ok(selection)
+        Error(_) ->
+          case status(config, "/users/" <> owner <> "/installation", auth) {
+            Ok(404) -> Ok("")
+            _ -> Error(Nil)
+          }
+      }
+  }
 }
 
 fn status(

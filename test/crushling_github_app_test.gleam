@@ -67,6 +67,15 @@ fn fake(seen: Subject(Request(String))) -> github.Config {
         "/app/installations/7/access_tokens" -> #(201, "{\"token\":\"ghs_x\"}")
         "/repos/octo/public" -> #(200, "{\"private\":false}")
         "/repos/octo/private" -> #(200, "{\"private\":true}")
+        "/repos/octo/hyper/installation" -> #(200, "{}")
+        "/users/octo/installation" -> #(
+          200,
+          "{\"repository_selection\":\"all\"}",
+        )
+        "/users/picky/installation" -> #(
+          200,
+          "{\"repository_selection\":\"selected\"}",
+        )
         _ -> #(404, "{}")
       }
       Ok(response.new(status) |> response.set_body(body))
@@ -101,4 +110,18 @@ fn drain(seen: Subject(a)) -> Nil {
     Ok(_) -> drain(seen)
     Error(Nil) -> Nil
   }
+}
+
+/// GitHub says 404 for a repo the app can't see and for one that doesn't
+/// exist: on an account it's installed on whole, it's the latter.
+pub fn installed_test() {
+  let assert Ok(key) = app.parse_key(rsa_pem())
+  let assert Ok(a) = app.start(fake(process.new_subject()), key)
+  let assert Some(True) = app.installed(a, "octo", "hyper")
+  // No such repo, on an account with every repo: nothing to install.
+  let assert Some(True) = app.installed(a, "octo", "nope")
+  // On an account with some repos: it may need adding.
+  let assert Some(False) = app.installed(a, "picky", "nope")
+  // On an account without the app.
+  let assert Some(False) = app.installed(a, "stranger", "repo")
 }

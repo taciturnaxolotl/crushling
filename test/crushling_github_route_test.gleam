@@ -6,6 +6,7 @@ import crushling/github/route
 import crushling/gun
 import crushling/relay
 import crushling/sandbox_http
+import crushling/sys
 import crushling/token
 import gleam/bit_array
 import gleam/bytes_tree
@@ -361,18 +362,30 @@ pub fn git_without_a_connection_reads_public_repos_test() {
   let assert Ok(route.Connection(Some("octo/private"))) =
     process.receive(s.nudged, 0)
   let assert Error(Nil) = header(arrived(s), "authorization")
-  // Connected but not found: it may be the app's installation.
+  // Connected, the app installed, and no such repo: GitHub's own answer,
+  // not a guess about installing.
   let resp =
     git_get(
       s,
       connected,
       "/git/octo/gone.git/info/refs?service=git-upload-pack",
     )
-  let assert 403 = resp.status
-  let assert True = string.contains(text(resp), "octo/gone can't be read")
-  let assert True = string.contains(text(resp), "don't have access")
+  let assert 404 = resp.status
+  let assert False = string.contains(text(resp), "crushling")
   // Someone connected isn't asked to connect.
   let assert Error(Nil) = process.receive(s.nudged, 100)
+}
+
+/// A repo that doesn't exist, on an account where the app is installed on
+/// every repo, is just missing: nobody is asked to install anything, and
+/// the read doesn't wait.
+pub fn a_missing_repo_asks_for_nothing_test() {
+  let s = setup()
+  let started = sys.monotonic_ms()
+  let resp = api_get(s, connected, "/repos/octo/gone/branches")
+  let assert 404 = resp.status
+  let assert True = sys.monotonic_ms() - started < 500
+  let assert Error(Nil) = process.receive(s.nudged, 0)
 }
 
 /// A read that needs the person's connection waits for it, then goes

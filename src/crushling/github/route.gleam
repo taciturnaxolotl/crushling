@@ -405,7 +405,11 @@ fn forward_git(
       case status {
         _ if status >= 300 && status < 400 ->
           Ok(list.map(headers, redirect(setup, _)))
-        401 | 403 | 404 -> Error(refuse())
+        401 | 403 | 404 ->
+          case refuse() {
+            Some(answer) -> Error(answer)
+            None -> Ok(headers)
+          }
         _ if status >= 400 ->
           Error(plain(
             502,
@@ -526,7 +530,11 @@ fn api_forward(
   let hooks =
     hooks(thread, fn(status, headers) {
       case status {
-        401 | 403 | 404 -> Error(refuse())
+        401 | 403 | 404 ->
+          case refuse() {
+            Some(answer) -> Error(answer)
+            None -> Ok(headers)
+          }
         _ -> Ok(headers)
       }
     })
@@ -544,17 +552,31 @@ fn reading(
   repo: Option(#(String, String)),
   first: Option(String),
   say: fn(Missing) -> Response(mist.ResponseData),
-  attempt: fn(Option(String), fn() -> Response(mist.ResponseData)) ->
+  attempt: fn(Option(String), fn() -> Option(Response(mist.ResponseData))) ->
     Response(mist.ResponseData),
 ) -> Response(mist.ResponseData) {
-  // `attempt` calls `refuse` when GitHub said no for want of access; its
-  // answer is then replaced by what follows.
-  let try = fn(token) {
+  // `attempt` calls `refuse` when GitHub said 401, 403 or 404. As someone
+  // connected that's usually just so (no such PR, no access), and GitHub's
+  // own answer goes through; only where the app isn't installed is it
+  // taken over (None), and what follows answers instead.
+  // `theirs`: the token is the person's own.
+  let try = fn(token, theirs) {
     let refused = process.new_subject()
     let answer =
       attempt(token, fn() {
-        process.send(refused, Nil)
-        say(NoAccess)
+        let take_over = case theirs, repo {
+          False, _ -> True
+          True, Some(#(owner, name)) ->
+            setup.installed(owner, name) == Some(False)
+          True, None -> False
+        }
+        case take_over {
+          True -> {
+            process.send(refused, Nil)
+            Some(say(NoAccess))
+          }
+          False -> None
+        }
       })
     case process.receive(refused, 0) {
       Ok(Nil) -> Error(Nil)
@@ -565,7 +587,7 @@ fn reading(
   // As the person; when that's refused where the app isn't installed, ask
   // for it, wait, and try once more.
   let as_them = fn(token) {
-    case try(Some(token)), repo {
+    case try(Some(token), True), repo {
       Ok(answer), _ -> answer
       Error(Nil), Some(#(owner, name)) ->
         case setup.installed(owner, name) {
@@ -579,7 +601,8 @@ fn reading(
                 }
               })
             case installed {
-              Some(Nil) -> try(Some(token)) |> result.unwrap(say(NoAccess))
+              Some(Nil) ->
+                try(Some(token), True) |> result.unwrap(say(NoAccess))
               None -> say(NotInstalled(owner))
             }
           }
@@ -591,7 +614,7 @@ fn reading(
   case thread.access {
     Some(token) -> as_them(token)
     None ->
-      case try(first) {
+      case try(first, False) {
         Ok(answer) -> answer
         Error(Nil) -> {
           setup.ask(thread.key, Connection(name))
