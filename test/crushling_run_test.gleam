@@ -418,3 +418,11 @@ pub fn explain_test() {
     cause("lost the connection mid-run")
   let assert "Something went wrong" = cause("boom")
 }
+
+pub fn tool_running_test() {
+  let call = event.ToolCall("c1", "bash", "{\"command\":\"sleep 900\"}", True)
+  let r = feed([assistant("m1", "Waiting on it.", [call])])
+  let assert True = run.tool_running(r)
+  let r = run.apply(r, dict.new(), tool_result("c1", False))
+  let assert False = run.tool_running(r)
+}

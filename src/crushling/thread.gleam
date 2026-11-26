@@ -726,12 +726,10 @@ fn on_event(state: State, event: event.Event) -> State {
     Some(active) -> {
       let run = run.apply(active.run, state.known, event)
       let now = sys.monotonic_ms()
-      // The stall note cleared "Working…"; the agent is back, so is it.
+      // The agent is back after a stall note: a later stall gets a note
+      // of its own.
       let active = case active.stalled {
-        True -> {
-          state.sink.working(True)
-          Active(..active, stalled: False, working_since_ms: now)
-        }
+        True -> Active(..active, stalled: False)
         False -> active
       }
       let active = Active(..active, run:, last_event_ms: now)
@@ -931,28 +929,37 @@ fn watchdog(state: State) -> State {
     Some(active) -> {
       process.send_after(state.self, watchdog_ms, Watchdog)
       let now = sys.monotonic_ms()
-      case active.stalled {
-        True -> state
-        False ->
-          case
-            now - active.last_event_ms > stall_ms,
-            now - active.working_since_ms > rework_ms
-          {
-            True, _ -> {
-              let _ =
-                state.sink.post(
-                  "_no word from the agent in 10 minutes; it may be stuck. Reply `!stop` to stop it._",
-                )
-              state.sink.working(False)
-              State(..state, active: Some(Active(..active, stalled: True)))
-            }
-            False, True -> {
-              state.sink.working(True)
-              let active = Active(..active, working_since_ms: now)
-              State(..state, active: Some(active))
-            }
-            False, False -> state
+      // A tool still running (a long build, or a GitHub read waiting for
+      // someone to connect) sends no events while it runs, and isn't the
+      // agent being stuck. A stall is noted once.
+      let stalled =
+        !active.stalled
+        && now - active.last_event_ms > stall_ms
+        && !run.tool_running(active.run)
+      {
+        case stalled, now - active.working_since_ms > rework_ms {
+          True, _ -> {
+            let _ =
+              state.sink.post(
+                "_no word from the agent in 10 minutes; it may be stuck. Reply `!stop` to stop it._",
+              )
+            // Still shown as working: the run hasn't ended, and Slack's
+            // Stop button is the easiest way to end it.
+            state.sink.working(True)
+            State(
+              ..state,
+              active: Some(
+                Active(..active, stalled: True, working_since_ms: now),
+              ),
+            )
           }
+          False, True -> {
+            state.sink.working(True)
+            let active = Active(..active, working_since_ms: now)
+            State(..state, active: Some(active))
+          }
+          False, False -> state
+        }
       }
     }
   }

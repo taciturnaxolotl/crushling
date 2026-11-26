@@ -77,6 +77,11 @@ pub fn new(session_id: String, run_id: String) -> Run {
   )
 }
 
+/// Whether a tool call is still running.
+pub fn tool_running(run: Run) -> Bool {
+  list.any(run.tools, fn(tool) { tool.status == Running })
+}
+
 pub fn is_done(run: Run) -> Bool {
   option.is_some(run.outcome)
 }
