@@ -3,6 +3,7 @@
 //// A sandbox is on the tailnet exactly while its agent runs and its access
 //// lasts; `sync` makes that so after every change.
 
+import crushling/conversation.{type Conversation}
 import crushling/meta.{type Card, type Grant}
 import crushling/people.{type People}
 import crushling/sys
@@ -91,7 +92,7 @@ pub type Thread {
     running: Bool,
     grant: Option(Grant),
     home: #(String, String),
-    conversation: #(String, String),
+    conversation: Conversation,
   )
 }
 
@@ -179,10 +180,8 @@ pub fn ask(
     Some(setup), False, False -> {
       let client = t.client
       let blocks = ask_blocks(by, reason, key, setup.api.tag, thread.home)
-      let #(channel, thread_ts) = thread.conversation
-      process.spawn_unlinked(fn() {
-        post_card(client, channel, thread_ts, blocks)
-      })
+      let place = thread.conversation
+      process.spawn_unlinked(fn() { post_card(client, place, blocks) })
       #(
         Tailnets(..t, asking: dict.insert(t.asking, key, sys.system_ms())),
         Ok(
@@ -571,20 +570,15 @@ pub fn done_blocks(text: String) -> List(block.Block) {
   [block.markdown(text, [])]
 }
 
-pub fn post_card(
+fn post_card(
   client: slackline.Client,
-  channel: String,
-  thread_ts: String,
+  place: Conversation,
   blocks: List(block.Block),
 ) -> Nil {
-  let call =
-    chat.post_message(channel:, text: "Tailnet access")
-    |> post_message.blocks(blocks)
   let _ =
-    case thread_ts {
-      "" -> call
-      ts -> post_message.thread_ts(call, ts)
-    }
+    chat.post_message(channel: place.channel, text: "Tailnet access")
+    |> post_message.blocks(blocks)
+    |> conversation.in_thread(place, post_message.thread_ts)
     |> httpc.send(client)
   Nil
 }

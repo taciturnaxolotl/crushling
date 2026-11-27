@@ -8,6 +8,7 @@
 //// only reach the conversation the agent is working in, so an agent can't
 //// speak anywhere its people didn't put it.
 
+import crushling/conversation.{type Conversation}
 import crushling/mcp
 import crushling/slack
 import crushling/thread
@@ -25,7 +26,7 @@ import slackline/api/files/complete_upload_external
 import slackline/api/users
 import slackline/api/users/conversations as users_conversations
 import slackline/api/users/info as users_info
-import slackline/conversation
+import slackline/conversation as slack_conversation
 import slackline/httpc
 import slackline/message
 
@@ -224,20 +225,16 @@ pub fn call(
     |> option.to_result("this thread's agent isn't running"),
   )
   use location <- result.try(ask(thread, thread.Where))
-  let thread.Location(conversation:, ..) = location
-  let channel = conversation.channel
-  let thread_ts = option.unwrap(conversation.thread_ts, "")
+  let thread.Location(conversation: place, ..) = location
   case name {
-    "read_conversation" ->
-      read(workspace, channel, thread_ts, limit_arg(arguments))
+    "read_conversation" -> read(workspace, place, limit_arg(arguments))
     "read_channel" ->
       case string_arg(arguments, "channel") {
         "" -> Error("give the channel's id")
         channel ->
           read(
             workspace,
-            channel,
-            string_arg(arguments, "thread_ts"),
+            conversation.from_slack(channel, string_arg(arguments, "thread_ts")),
             limit_arg(arguments),
           )
       }
@@ -294,14 +291,12 @@ pub fn call(
 
 fn read(
   context: Workspace,
-  channel: String,
-  thread_ts: String,
+  place: Conversation,
   limit: Int,
 ) -> Result(String, String) {
   use messages <- result.try(slack.read_conversation(
     context.client,
-    channel,
-    thread_ts,
+    place,
     "",
     "",
   ))
@@ -361,9 +356,9 @@ fn list_channels(context: Workspace) -> Result(String, String) {
 fn all_channels(
   context: Workspace,
   call: slackline.Call(users.Conversations, users.ConversationsResponse),
-  found: List(conversation.Conversation),
+  found: List(slack_conversation.Conversation),
   pages_left: Int,
-) -> Result(List(conversation.Conversation), String) {
+) -> Result(List(slack_conversation.Conversation), String) {
   use page <- result.try(
     httpc.send(call, context.client) |> result.map_error(slack.describe),
   )
@@ -443,9 +438,7 @@ pub fn share(
     |> option.to_result("this thread's agent isn't running"),
   )
   use location <- result.try(ask(thread, thread.Where))
-  let thread.Location(conversation:, ..) = location
-  let channel = conversation.channel
-  let thread_ts = option.unwrap(conversation.thread_ts, "")
+  let thread.Location(conversation: place, ..) = location
   let file =
     slackline.FileUpload(
       filename: name,
@@ -453,11 +446,9 @@ pub fn share(
       contents:,
     )
   httpc.upload_files(workspace.client, [file], share: fn(call) {
-    let call = complete_upload_external.channel_id(call, channel)
-    let call = case thread_ts {
-      "" -> call
-      ts -> complete_upload_external.thread_ts(call, ts)
-    }
+    let call =
+      complete_upload_external.channel_id(call, place.channel)
+      |> conversation.in_thread(place, complete_upload_external.thread_ts)
     case comment {
       "" -> call
       comment -> complete_upload_external.initial_comment(call, comment)

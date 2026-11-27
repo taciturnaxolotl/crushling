@@ -2,7 +2,6 @@ import crushling/crush/event
 import crushling/mcp
 import crushling/run
 import crushling/slack_tools
-import gleam/dict
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
@@ -107,10 +106,10 @@ fn assistant(id: String, text: String) -> event.Event {
 
 pub fn settled_messages_test() {
   let r = run.new("s", "r")
-  let r = run.apply(r, dict.new(), assistant("m1", "looking around"))
+  let r = run.apply(r, assistant("m1", "looking around"))
   // The only message may still grow.
   let assert [] = run.messages(r, False)
-  let r = run.apply(r, dict.new(), assistant("m2", "found it"))
+  let r = run.apply(r, assistant("m2", "found it"))
   let assert [#("m1", "looking around")] = run.messages(r, False)
   let assert [_, #("m2", "found it")] = run.messages(r, True)
 }

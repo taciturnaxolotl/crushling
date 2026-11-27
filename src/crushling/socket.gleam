@@ -3,6 +3,7 @@
 
 import crushling/connections
 import crushling/home
+import crushling/key as thread_key
 import crushling/models
 import crushling/pr
 import crushling/registry
@@ -269,7 +270,7 @@ pub fn pressed(
   })
   let user = payload.user.id
   registry.Tailnet(
-    registry.key(team, channel, thread_ts),
+    thread_key.new(team, channel, thread_ts) |> thread_key.to_string,
     tailnet.Pressed(choice:, channel:, thread_ts:, user:, card:),
   )
 }

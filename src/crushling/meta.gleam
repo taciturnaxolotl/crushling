@@ -7,6 +7,7 @@
 //// imports them on its first start; `write` and `write_link` remain to make
 //// such files in tests.
 
+import crushling/sys
 import crushling/venue.{type Venue}
 import gleam/dynamic/decode
 import gleam/json
@@ -108,20 +109,11 @@ pub type Link {
   Link(origin_channel: String, origin_ts: String, opened_ts: String)
 }
 
-@external(erlang, "crushling_ffi", "read_file")
-fn read_file(path: String) -> Result(String, Nil)
-
-@external(erlang, "crushling_ffi", "write_private")
-fn write_file(path: String, content: String) -> Result(Nil, String)
-
-@external(erlang, "crushling_ffi", "mkdir_p")
-fn mkdir_p(path: String) -> Result(Nil, String)
-
 /// Write a file whole, making its directory first: a new thread's meta is
 /// saved before its launch creates the thread's directory.
 fn write_private(path: String, content: String) -> Result(Nil, String) {
-  use _ <- result.try(mkdir_p(filepath_dir(path)))
-  write_file(path, content)
+  use _ <- result.try(sys.mkdir_p(filepath_dir(path)))
+  sys.write_private(path, content)
 }
 
 fn filepath_dir(path: String) -> String {
@@ -132,7 +124,7 @@ fn filepath_dir(path: String) -> String {
 }
 
 pub fn read(path: String) -> Result(Meta, Nil) {
-  use text <- result.try(read_file(path))
+  use text <- result.try(sys.read_file(path))
   json.parse(text, {
     use follow <- decode.optional_field("follow", False, decode.bool)
     use paused <- decode.optional_field("paused", False, decode.bool)
@@ -203,7 +195,7 @@ pub fn write(path: String, meta: Meta) -> Result(Nil, String) {
 }
 
 pub fn read_link(path: String) -> Result(Link, Nil) {
-  use text <- result.try(read_file(path))
+  use text <- result.try(sys.read_file(path))
   json.parse(text, {
     use origin_channel <- decode.field("origin_channel", decode.string)
     use origin_ts <- decode.field("origin_ts", decode.string)

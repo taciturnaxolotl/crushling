@@ -23,11 +23,12 @@ pub fn create_workspace_call_test() {
 
 pub fn send_prompt_call_test() {
   let call =
-    client.send_prompt(
+    client.send_prompt_with(
       workspace_id: "w",
       session_id: "s",
       run_id: "r",
       prompt: "fix \"it\"",
+      attachments: [],
     )
   let assert "/v1/workspaces/w/agent" = call.path
   let assert 202 = call.expect

@@ -1,6 +1,7 @@
 //// Code channel commands: what's offered, what they mean, and `!info`'s
 //// answer from the repository.
 
+import crushling/conversation
 import crushling/sink
 import crushling/slack
 import crushling/thread/repo
@@ -97,7 +98,7 @@ fn real_shell(dir: String) -> repo.Shell {
 
 fn sink_recording(code: process.Subject(#(String, String))) -> sink.Sink {
   sink.Sink(
-    conversation: sink.Conversation("C", None),
+    conversation: conversation.Conversation("C", None),
     working: fn(_) { Nil },
     title: fn(_) { Nil },
     post: fn(_) { Ok("1") },

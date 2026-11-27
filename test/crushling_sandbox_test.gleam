@@ -25,33 +25,6 @@ fn policy() -> sandbox.Policy {
   )
 }
 
-pub fn key_sanitizes_test() {
-  let assert "T1-C0123-1699999999.000100" =
-    sandbox.key("T1", "C0123", "1699999999.000100")
-  let assert "T_x-a_b_c-d_e" = sandbox.key("T/x", "a/b c", "d;e")
-  let assert 64 = string.length(sandbox.key("T1", string.repeat("x", 100), "1"))
-}
-
-pub fn key_carries_the_team_test() {
-  // Real ids: an 11-character workspace and channel, and a message ts.
-  let key = sandbox.key("T0A1B2C3D4E", "C07QWERTY12", "1731888000.123456")
-  let assert "T0A1B2C3D4E-C07QWERTY12-1731888000.123456" = key
-  let assert True = string.length(key) <= 64
-  let assert Ok("T0A1B2C3D4E") = sandbox.team_of(key)
-  // Enterprise Grid ids are longer, and still fit.
-  let grid = sandbox.key("E0123456789AB", "C0123456789AB", "1731888000.123456")
-  let assert True = string.length(grid) <= 64
-  let assert False = string.contains(grid, "_")
-  // The key a thread had before.
-  let assert "C07QWERTY12-1731888000.123456" =
-    sandbox.legacy_key("C07QWERTY12", "1731888000.123456")
-  let assert Error(Nil) = sandbox.team_of("")
-  // A key from before keys carried the workspace has none.
-  let assert Error(Nil) = sandbox.team_of("C07QWERTY12-1731888000.123456")
-  let assert Error(Nil) = sandbox.team_of("T-1.0")
-  let assert Ok("E0123") = sandbox.team_of("E0123-C1-1.0")
-}
-
 pub fn run_args_test() {
   let args = sandbox.run_args(policy(), "k", [])
   let pairs = list.window_by_2(args)

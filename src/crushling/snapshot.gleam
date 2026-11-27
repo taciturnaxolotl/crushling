@@ -57,10 +57,6 @@ pub fn diff(from: String, to: String) -> String {
   git("diff --no-color --no-ext-diff " <> from <> " " <> to)
 }
 
-pub fn numstat(from: String, to: String) -> String {
-  git("diff --numstat --no-color " <> from <> " " <> to)
-}
-
 pub type Change {
   /// Lines added and removed; both errors for a binary file.
   Change(path: String, added: Result(Int, Nil), removed: Result(Int, Nil))
@@ -239,10 +235,4 @@ pub fn web_url(url: String) -> String {
       "https://" <> host <> "/" <> string.join(parts, "/")
     _, _ -> ""
   }
-}
-
-/// Whether a shell command clones a repository.
-pub fn is_clone(command: String) -> Bool {
-  string.contains(command, "git clone ")
-  || string.contains(command, "gh repo clone ")
 }

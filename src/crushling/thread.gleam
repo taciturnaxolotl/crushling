@@ -12,6 +12,7 @@
 //// the venue, and it changes the sink at the same time. It tells the registry
 //// about each change through `notify`.
 
+import crushling/conversation.{type Conversation}
 import crushling/crush/client
 import crushling/crush/event
 import crushling/gun
@@ -29,7 +30,6 @@ import crushling/thread/repo
 import crushling/thread/resume
 import crushling/thread/subagents.{type Subagents}
 import crushling/venue.{type Venue}
-import gleam/dict
 import gleam/erlang/process.{type Subject}
 import gleam/float
 import gleam/int
@@ -44,14 +44,8 @@ pub type Finished {
     /// Whether this was a prompt the bridge sent, rather than a turn crush
     /// started by itself to read a subagent's report.
     solicited: Bool,
-    run_id: String,
-    outcome: run.Outcome,
-    /// The reply as posted, joined across messages.
-    text: String,
     /// The last message of the reply, or "" when nothing was posted.
     reply_ts: String,
-    changes: List(snapshot.Change),
-    patch: String,
   )
 }
 
@@ -114,7 +108,7 @@ pub type Config {
 /// The conversation the thread posts to now, and the workspace path that the
 /// agent sees.
 pub type Location {
-  Location(conversation: sink.Conversation, root: String)
+  Location(conversation: Conversation, root: String)
 }
 
 pub type Message {
@@ -219,7 +213,6 @@ type State {
     /// Who sent the latest prompt, for turns crush starts on its own.
     requester: String,
     active: Option(Active),
-    known: run.Known,
     flushing: Bool,
     subs: Subagents,
     retries: Int,
@@ -291,7 +284,6 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       waiting: [],
       requester: "",
       active: None,
-      known: dict.new(),
       flushing: False,
       subs: subagents.new(),
       retries: 0,
@@ -425,7 +417,6 @@ fn parent(state: State) -> subagents.Parent {
     session_id: option.unwrap(state.session_id, ""),
     sink: state.sink,
     root: state.config.root,
-    known: state.known,
     threads: case state.venue {
       venue.CodeChannel(..) -> True
       _ -> False
@@ -745,7 +736,7 @@ fn on_event(state: State, event: event.Event) -> State {
   let state = case state.active {
     None -> state
     Some(active) -> {
-      let run = run.apply(active.run, state.known, event)
+      let run = run.apply(active.run, event)
       let now = sys.monotonic_ms()
       // The agent is back after a stall note: a later stall gets a note
       // of its own.
@@ -1048,11 +1039,7 @@ fn finish_if_done(state: State) -> State {
       case run.is_done(active.run) {
         True -> {
           finish(state, active)
-          State(
-            ..state,
-            active: None,
-            known: run.remember(state.known, active.run),
-          )
+          State(..state, active: None)
           |> send_next
         }
         False -> state
@@ -1061,45 +1048,42 @@ fn finish_if_done(state: State) -> State {
   }
 }
 
-/// The run's changed files and its patch. When the work has a repository, they
-/// come from the repository's own history. In a code channel the Code tab shows
-/// the diff, so the patch is empty. Without a repository, they come from
-/// workspace snapshots, which include edits made through `bash`. If the
-/// snapshots fail, they come from the run's file events.
-fn changes(state: State, active: Active) -> #(List(snapshot.Change), String) {
+/// The patch to attach for the run, if any. A code channel's Code tab shows
+/// the diff instead, so it gets none. With a repository the patch comes from
+/// its own history; without one, from workspace snapshots, which include
+/// edits made through `bash`.
+fn patch_for(state: State, active: Active) -> Option(String) {
   let shell = shell(state)
   case state.venue {
     venue.CodeChannel(repo: dir, ..) -> {
       repo.show(shell, state.sink, dir, repo.info(shell, dir))
-      #(repo.changes(shell, dir), "")
+      None
     }
-    venue.ThreadOnly(repo: dir) if dir != "" -> #(
-      repo.changes(shell, dir),
-      shell(snapshot.repo_diff(dir)) |> result.unwrap(""),
-    )
+    venue.ThreadOnly(repo: dir) if dir != "" ->
+      shell(snapshot.repo_diff(dir)) |> option.from_result
     _ -> {
-      let from_snapshots = {
+      let patch = {
         use base <- result.try(option.to_result(active.base, Nil))
         use after <- result.try(take_snapshot(state) |> option.to_result(Nil))
-        use numstat <- result.try(shell(snapshot.numstat(base, after)))
-        use patch <- result.try(shell(snapshot.diff(base, after)))
-        Ok(#(snapshot.parse_numstat(numstat), patch))
+        shell(snapshot.diff(base, after))
       }
-      use <- result.lazy_unwrap(from_snapshots)
-      let root = state.config.root
-      let changes =
-        run.changes(active.run, root)
-        |> list.map(fn(change) {
-          snapshot.Change(change.path, Error(Nil), Error(Nil))
-        })
-      #(changes, run.patch(active.run, root))
+      case patch {
+        Ok(patch) -> Some(patch)
+        Error(Nil) -> {
+          sys.warn(
+            "crushling: no workspace snapshot, so no patch for run "
+            <> active.run.run_id,
+          )
+          None
+        }
+      }
     }
   }
 }
 
 fn finish(state: State, active: Active) -> Nil {
   let sink = state.sink
-  let #(changes, patch) = changes(state, active)
+  let patch = patch_for(state, active)
   let answer = render.answer(active.run)
   let closing =
     [
@@ -1119,29 +1103,27 @@ fn finish(state: State, active: Active) -> Nil {
     None, closing -> sink.post(closing) |> result.unwrap("")
   }
   sink.working(False)
-  case patch, string.byte_size(patch) > max_patch_bytes {
-    "", _ -> Nil
-    _, True ->
-      sys.warn("crushling: patch too large to attach: " <> active.run.run_id)
-    patch, False ->
-      case
-        sink.upload(string.slice(active.run.run_id, 0, 8) <> ".diff", patch)
-      {
-        Ok(Nil) -> Nil
-        Error(reason) -> sys.warn("crushling: upload failed: " <> reason)
+  case patch {
+    None | Some("") -> Nil
+    Some(patch) ->
+      case string.byte_size(patch) > max_patch_bytes {
+        True ->
+          sys.warn(
+            "crushling: patch too large to attach: " <> active.run.run_id,
+          )
+        False -> upload_patch(sink, active, patch)
       }
   }
   state.config.notify(
-    RunEnded(Finished(
-      solicited: active.solicited,
-      run_id: active.run.run_id,
-      outcome: option.unwrap(active.run.outcome, run.Cancelled),
-      text: string.join(answer, "\n\n"),
-      reply_ts:,
-      changes:,
-      patch:,
-    )),
+    RunEnded(Finished(solicited: active.solicited, reply_ts:)),
   )
+}
+
+fn upload_patch(sink: Sink, active: Active, patch: String) -> Nil {
+  case sink.upload(string.slice(active.run.run_id, 0, 8) <> ".diff", patch) {
+    Ok(Nil) -> Nil
+    Error(reason) -> sys.warn("crushling: upload failed: " <> reason)
+  }
 }
 
 fn close_connection(state: State) -> Nil {

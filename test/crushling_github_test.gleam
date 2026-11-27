@@ -7,6 +7,7 @@ import crushling/connections
 import crushling/crush/client
 import crushling/github
 import crushling/home
+import crushling/key
 import crushling/launcher
 import crushling/people
 import crushling/proxy/meter
@@ -16,6 +17,7 @@ import crushling/slack
 import crushling/store
 import crushling/store/github as accounts
 import crushling/store/usage
+import crushling/usage as spend
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process.{type Subject}
@@ -304,26 +306,26 @@ fn copy_row(s: store.Store, team: String, user: String) -> Nil {
 
 pub fn spend_adds_up_by_day_test() {
   let s = fresh_store()
-  let one = meter.Usage(10, 5, 0.25, 1)
+  let one = spend.Usage(10, 5, 0.25, 1)
   let assert Ok(Nil) =
     usage.record(s, [#("T1-C1-1.0", one), #("T1-C2-2.0", one)])
   let assert Ok(Nil) =
     usage.record(s, [#("T1-C1-1.0", one), #("T2-C1-1.0", one)])
-  let assert Ok(meter.Usage(20, 10, 0.5, 2)) =
+  let assert Ok(spend.Usage(20, 10, 0.5, 2)) =
     usage.thread_total(s, "T1-C1-1.0", usage.Ever)
-  let assert Ok(meter.Usage(30, 15, 0.75, 3)) =
+  let assert Ok(spend.Usage(30, 15, 0.75, 3)) =
     usage.team_total(s, "T1", usage.Today)
-  let assert Ok(meter.Usage(requests: 3, ..)) =
+  let assert Ok(spend.Usage(requests: 3, ..)) =
     usage.team_total(s, "T1", usage.Month)
-  let assert Ok(meter.Usage(0, 0, 0.0, 0)) =
+  let assert Ok(spend.Usage(0, 0, 0.0, 0)) =
     usage.team_total(s, "T9", usage.Ever)
-  let assert Ok(meter.Usage(requests: 3, ..)) =
+  let assert Ok(spend.Usage(requests: 3, ..)) =
     usage.threads_total(s, ["T1-C1-1.0", "T2-C1-1.0"], usage.Ever)
   // A key from before keys carried a workspace counts under none.
   let assert Ok(Nil) = usage.record(s, [#("C1-1.0", one)])
-  let assert Ok(meter.Usage(requests: 1, ..)) =
+  let assert Ok(spend.Usage(requests: 1, ..)) =
     usage.team_total(s, "", usage.Ever)
-  let assert Ok(meter.Usage(requests: 0, ..)) =
+  let assert Ok(spend.Usage(requests: 0, ..)) =
     usage.team_total(s, "C1", usage.Ever)
   store.close(s)
 }
@@ -333,22 +335,22 @@ pub fn spend_adds_up_by_day_test() {
 pub fn the_meter_drains_once_test() {
   let s = fresh_store()
   let assert Ok(m) =
-    meter.start(meter.Limits(meter.unlimited, meter.unlimited, 4, 4))
-  let one = meter.Usage(10, 5, 0.25, 1)
+    meter.start(meter.Limits(spend.unlimited, spend.unlimited, 4, 4))
+  let one = spend.Usage(10, 5, 0.25, 1)
   meter.record(m, "T1-C1-1.0", one)
   meter.record(m, "T1-C1-1.0", one)
   meter.record(m, "T1-C2-2.0", one)
   let drained = meter.drain(m)
-  let assert [#("T1-C1-1.0", meter.Usage(requests: 2, ..)), _] =
+  let assert [#("T1-C1-1.0", spend.Usage(requests: 2, ..)), _] =
     list.sort(drained, fn(a, b) { string.compare(a.0, b.0) })
   let assert [] = meter.drain(m)
   let assert Ok(Nil) = usage.record(s, drained)
   meter.record(m, "T1-C1-1.0", one)
   let assert Ok(Nil) = usage.record(s, meter.drain(m))
-  let assert Ok(meter.Usage(requests: 3, ..)) =
+  let assert Ok(spend.Usage(requests: 3, ..)) =
     usage.thread_total(s, "T1-C1-1.0", usage.Ever)
   // The meter's own totals are untouched by draining.
-  let assert meter.Usage(requests: 3, ..) = meter.totals(m, "T1-C1-1.0")
+  let assert spend.Usage(requests: 3, ..) = meter.totals(m, "T1-C1-1.0")
   store.close(s)
 }
 
@@ -363,8 +365,8 @@ fn base(github: home.GitHub) -> home.Home {
     github:,
     threads: [],
     thread_count: 0,
-    today: meter.Usage(0, 0, 1.5, 3),
-    month: meter.Usage(0, 0, 12.0, 40),
+    today: spend.Usage(0, 0, 1.5, 3),
+    month: spend.Usage(0, 0, 12.0, 40),
     default_model: "prism",
   )
 }
@@ -432,17 +434,17 @@ pub fn home_view_test() {
   let v =
     home.view(home.Home(
       github: home.Unavailable,
-      today: meter.zero,
-      month: meter.zero,
+      today: spend.zero,
+      month: spend.zero,
       default_model: "prism",
       threads: [
         home.Thread(
           "C1",
           Some("https://x.slack.com/p1"),
           "kimi-k3",
-          meter.Usage(0, 0, 0.42, 1),
+          spend.Usage(0, 0, 0.42, 1),
         ),
-        home.Thread("C2", None, "prism", meter.zero),
+        home.Thread("C2", None, "prism", spend.zero),
       ],
       thread_count: 25,
     ))
@@ -623,7 +625,7 @@ pub fn connecting_from_a_thread_saves_the_account_test() {
   let assert Ok(accounts.Account(login: "octo", ..)) = eventually(s, "U1", 50)
   let assert Ok(_) = home_with(calls, "octo", 2000)
   // No agent was started for it.
-  let assert Ok(Nil) = store.thread(s, registry.key("T1", "D1", "1.0")) |> none
+  let assert Ok(Nil) = store.thread(s, thread_key("T1", "D1", "1.0")) |> none
   // Disconnecting forgets it, and says so on the Home.
   process.send(r, registry.GitHubDisconnect("U1"))
   let assert True = gone(s, "U1", 50)
@@ -802,7 +804,7 @@ fn start_registry(
       allowed:,
       admins: set.new(),
       store: s,
-      migrate_legacy: False,
+      stranded: set.new(),
       idle_ms: 60_000,
       flush_ms: 50,
       mode: client.Sysadmin,
@@ -813,4 +815,8 @@ fn start_registry(
       default_model: "prism",
     ))
   r
+}
+
+fn thread_key(team: String, channel: String, ts: String) -> String {
+  key.new(team, channel, ts) |> key.to_string
 }

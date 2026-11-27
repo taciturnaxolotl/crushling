@@ -19,26 +19,26 @@
 //// `CRUSHLING_TEST_SMALL`. Assertions are about structure (order, diffs,
 //// history), never wording, beyond asking the model to echo a marker word.
 
+import crushling/conversation
 import crushling/crush/client
 import crushling/gun
+import crushling/key
 import crushling/launcher
 import crushling/mcp
 import crushling/people
 import crushling/provider
 import crushling/proxy
-import crushling/proxy/meter
 import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/render
-import crushling/run
 import crushling/sandbox_http
 import crushling/sink
 import crushling/slack_tools
-import crushling/snapshot
 import crushling/store
 import crushling/sys
 import crushling/thread
 import crushling/tunnel
+import crushling/usage as spend
 import crushling/venue
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
@@ -112,7 +112,14 @@ fn to_dynamic(a: a) -> Dynamic
 
 type Call {
   Progress(String)
-  Done(thread.Finished)
+  Uploaded(contents: String)
+  Done
+}
+
+/// How a run ended, as the sink saw it: the last thing posted (its reply),
+/// the patch attached, if any, and everything posted, newest first.
+type Ended {
+  Ended(reply: String, patch: String, said: List(String))
 }
 
 /// EUnit generator: a list of tests with long timeouts, or none at all.
@@ -173,8 +180,8 @@ fn start_wiring() -> Wiring {
         secret:,
         org_key:,
         upstream: proxy.upstream_from(api_key),
-        thread_cap: meter.unlimited,
-        instance_cap: meter.unlimited,
+        thread_cap: spend.unlimited,
+        instance_cap: spend.unlimited,
         max_per_thread: proxy.default_max_per_thread,
         max_uploads: proxy.default_max_uploads,
         upload_timeout_ms: proxy.default_upload_timeout_ms,
@@ -286,12 +293,15 @@ fn sink(calls: Subject(Call)) -> sink.Sink {
     post_blocks: fn(text, _) { progress(text) },
     update_blocks: fn(_, _, _) { Ok(Nil) },
     delete: fn(_) { Ok(Nil) },
-    upload: fn(_, _) { Ok(Nil) },
+    upload: fn(_, contents) {
+      process.send(calls, Uploaded(contents))
+      Ok(Nil)
+    },
     branch: fn(_, _, _) { Error("no branches in this test") },
     open_code_channel: fn(_) { Error("no code channels in this test") },
     context: fn(_) { Nil },
     code: fn(_, _, _) { Nil },
-    conversation: sink.Conversation("CTEST", Some("1.0")),
+    conversation: conversation.Conversation("CTEST", Some("1.0")),
   )
 }
 
@@ -329,7 +339,7 @@ fn start_observed(
         sink: sink(calls),
         flush_ms: 250,
         mode: client.Sysadmin,
-        notify: on_finished(fn(finished) { process.send(calls, Done(finished)) }),
+        notify: on_finished(fn(_) { process.send(calls, Done) }),
         on_connect:,
         model: None,
         home: #("C", "1.0"),
@@ -338,10 +348,19 @@ fn start_observed(
   #(t, calls)
 }
 
-fn await_finished(calls: Subject(Call)) -> thread.Finished {
+fn await_finished(calls: Subject(Call)) -> Ended {
+  await_ended(calls, Ended("", "", []))
+}
+
+fn await_ended(calls: Subject(Call), ended: Ended) -> Ended {
   case process.receive(calls, 240_000) {
-    Ok(Done(finished)) -> finished
-    Ok(Progress(_)) -> await_finished(calls)
+    Ok(Done) -> ended
+    Ok(Progress(text)) ->
+      await_ended(
+        calls,
+        Ended(..ended, reply: text, said: [text, ..ended.said]),
+      )
+    Ok(Uploaded(patch)) -> await_ended(calls, Ended(..ended, patch:))
     Error(Nil) -> panic as "no run finished within 4 minutes"
   }
 }
@@ -353,14 +372,18 @@ fn await_progress(calls: Subject(Call), containing: String) -> Nil {
         True -> Nil
         False -> await_progress(calls, containing)
       }
-    Ok(Done(finished)) ->
-      panic as { "run finished before showing progress: " <> finished.text }
+    Ok(Uploaded(_)) -> await_progress(calls, containing)
+    Ok(Done) -> panic as "run finished before showing progress"
     Error(Nil) -> panic as "no progress within 4 minutes"
   }
 }
 
-fn says(finished: thread.Finished, word: String) -> Bool {
-  string.contains(string.uppercase(finished.text), word)
+fn says(ended: Ended, word: String) -> Bool {
+  string.contains(string.uppercase(ended.reply), word)
+}
+
+fn lost(ended: Ended) -> Bool {
+  list.any(ended.said, string.contains(_, "lost the connection"))
 }
 
 fn queued_prompts_and_bash_diff(wiring: Wiring) -> Nil {
@@ -378,14 +401,13 @@ fn queued_prompts_and_bash_diff(wiring: Wiring) -> Nil {
   )
 
   let first = await_finished(calls)
-  let assert run.Completed(_) = first.outcome
+  let assert False = lost(first)
   let assert True = says(first, "ALPHA")
   let assert "" = first.patch
 
   let second = await_finished(calls)
-  let assert run.Completed(_) = second.outcome
+  let assert False = lost(second)
   let assert True = says(second, "BETA")
-  let assert [snapshot.Change("notes.txt", Ok(1), Ok(0))] = second.changes
   let assert True = string.contains(second.patch, "+second line")
 
   // Snapshot shell calls must not end up in the agent's history, and the
@@ -435,7 +457,7 @@ fn survives_server_restart(wiring: Wiring) -> Nil {
   wait_for_socket(env.socket, 15_000)
 
   let stranded = await_finished(calls)
-  let assert run.Errored("lost the connection mid-run") = stranded.outcome
+  let assert True = lost(stranded)
 
   // The same session carries on after the restart.
   process.send(
@@ -443,7 +465,7 @@ fn survives_server_restart(wiring: Wiring) -> Nil {
     prompt("Reply with exactly the word GAMMA and nothing else. Use no tools."),
   )
   let after = await_finished(calls)
-  let assert run.Completed(_) = after.outcome
+  let assert False = lost(after)
   let assert True = says(after, "GAMMA")
 
   process.send(t, thread.Stop)
@@ -485,11 +507,9 @@ fn resumes_a_dropped_stream(wiring: Wiring) -> Nil {
   await_idle(watcher, workspace_id, session_id, 120)
   resume(pid)
 
-  let #(finished, said) = await_finished_saying(calls, [])
-  let assert run.Completed(_) = finished.outcome
+  let finished = await_finished(calls)
   let assert True = says(finished, "DONE")
-  let assert False =
-    list.any(said, fn(text) { string.contains(text, "lost the connection") })
+  let assert False = lost(finished)
 
   let _ = client.perform(watcher, client.retire_client(watcher_id))
   gun.close(watcher)
@@ -513,18 +533,6 @@ fn await_idle(
   }
 }
 
-/// The next finished run, and everything posted before it.
-fn await_finished_saying(
-  calls: Subject(Call),
-  said: List(String),
-) -> #(thread.Finished, List(String)) {
-  case process.receive(calls, 240_000) {
-    Ok(Done(finished)) -> #(finished, said)
-    Ok(Progress(text)) -> await_finished_saying(calls, [text, ..said])
-    Error(Nil) -> panic as "no run finished within 4 minutes"
-  }
-}
-
 type Launch {
   Launched(String)
   Stopped(String)
@@ -538,7 +546,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-registry-"
     <> int.to_string(int.absolute_value(unique()))
-  let key = registry.key("T1", "C1", "10.1")
+  let key = thread_key("T1", "C1", "10.1")
   let local = launcher.local(root, "", wiring.models, wiring.bridge)
   let launches = process.new_subject()
   let watched =
@@ -577,7 +585,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: real_store(root),
-      migrate_legacy: False,
+      stranded: set.new(),
       idle_ms: 500,
       flush_ms: 250,
       mode: client.Sysadmin,
@@ -638,7 +646,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
   let root =
     "/tmp/crushling-real-shutdown-"
     <> int.to_string(int.absolute_value(unique()))
-  let key = registry.key("T1", "C1", "20.1")
+  let key = thread_key("T1", "C1", "20.1")
   let local = launcher.local(root, "", wiring.models, wiring.bridge)
   let launches = process.new_subject()
   let watched =
@@ -677,7 +685,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: real_store(root),
-      migrate_legacy: False,
+      stranded: set.new(),
       idle_ms: 600_000,
       flush_ms: 250,
       mode: client.Sysadmin,
@@ -755,7 +763,7 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> sink.Sink {
     open_code_channel: fn(_) { Error("no code channels in this test") },
     context: fn(_) { Nil },
     code: fn(_, _, _) { Nil },
-    conversation: sink.Conversation("CTEST", Some("1.0")),
+    conversation: conversation.Conversation("CTEST", Some("1.0")),
   )
 }
 
@@ -859,7 +867,8 @@ type CodeCall {
   InThreadPost(String)
   InChannelPost(String)
   CodeView(diff: String)
-  CodeFinished(changes: List(snapshot.Change), patch: String)
+  CodeUploaded(patch: String)
+  CodeFinished
 }
 
 /// A sink that records where things are posted. `opens` is whether
@@ -886,7 +895,10 @@ fn code_sink(
     post_blocks: fn(text, _) { post(text) },
     update_blocks: fn(_, _, _) { Ok(Nil) },
     delete: fn(_) { Ok(Nil) },
-    upload: fn(_, _) { Ok(Nil) },
+    upload: fn(_, patch) {
+      process.send(calls, CodeUploaded(patch))
+      Ok(Nil)
+    },
     branch: fn(_, _, _) { Error("no branches in this test") },
     open_code_channel: fn(name) {
       process.send(calls, Opened(name))
@@ -903,7 +915,7 @@ fn code_sink(
         False -> Nil
       }
     },
-    conversation: sink.Conversation("CTEST", Some("1.0")),
+    conversation: conversation.Conversation("CTEST", Some("1.0")),
   )
 }
 
@@ -912,7 +924,7 @@ fn collect_code_calls(
   acc: List(CodeCall),
 ) -> List(CodeCall) {
   case process.receive(calls, 240_000) {
-    Ok(CodeFinished(..) as call) -> list.reverse([call, ..acc])
+    Ok(CodeFinished) -> list.reverse([CodeFinished, ..acc])
     Ok(call) -> collect_code_calls(calls, [call, ..acc])
     Error(Nil) -> panic as { "stuck; saw " <> string.inspect(list.reverse(acc)) }
   }
@@ -952,9 +964,7 @@ fn reading_stays_in_the_thread(wiring: Wiring) -> Nil {
         sink: code_sink(calls, False, True),
         flush_ms: 250,
         mode: client.Sysadmin,
-        notify: on_finished(fn(finished) {
-          process.send(calls, CodeFinished(finished.changes, finished.patch))
-        }),
+        notify: on_finished(fn(_) { process.send(calls, CodeFinished) }),
         on_connect: fn(_) { Nil },
         model: None,
         home: #("C", "1.0"),
@@ -998,9 +1008,7 @@ fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
         sink: code_sink(calls, False, opens),
         flush_ms: 250,
         mode: client.Sysadmin,
-        notify: on_finished(fn(finished) {
-          process.send(calls, CodeFinished(finished.changes, finished.patch))
-        }),
+        notify: on_finished(fn(_) { process.send(calls, CodeFinished) }),
         on_connect: fn(_) { Nil },
         model: None,
         home: #("C", "1.0"),
@@ -1057,10 +1065,13 @@ fn cloning_moves_to_a_code_channel(wiring: Wiring) -> Nil {
         _ -> False
       }
     })
-  let assert Ok(CodeFinished(
-    changes: [snapshot.Change("notes.txt", Ok(1), Ok(0))],
-    patch: "",
-  )) = list.last(seen)
+  let assert False =
+    list.any(seen, fn(call) {
+      case call {
+        CodeUploaded(_) -> True
+        _ -> False
+      }
+    })
   Nil
 }
 
@@ -1077,9 +1088,13 @@ fn failed_code_channel_keeps_the_diff(wiring: Wiring) -> Nil {
         _ -> False
       }
     })
-  let assert Ok(CodeFinished(changes:, patch:)) = list.last(seen)
-  let assert True = changes != []
-  let assert True = string.contains(patch, "+two")
+  let assert True =
+    list.any(seen, fn(call) {
+      case call {
+        CodeUploaded(patch) -> string.contains(patch, "+two")
+        _ -> False
+      }
+    })
   Nil
 }
 
@@ -1194,4 +1209,8 @@ fn drain(subject: Subject(String), last: String) -> String {
     Ok(text) -> drain(subject, text)
     Error(Nil) -> last
   }
+}
+
+fn thread_key(team: String, channel: String, ts: String) -> String {
+  key.new(team, channel, ts) |> key.to_string
 }

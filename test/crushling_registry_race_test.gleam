@@ -3,6 +3,7 @@
 //// until the test lets them finish.
 
 import crushling/crush/client
+import crushling/key
 import crushling/launcher
 import crushling/people
 import crushling/registry
@@ -71,7 +72,7 @@ fn start_with(
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: race_store(),
-      migrate_legacy: False,
+      stranded: set.new(),
       idle_ms: 600_000,
       flush_ms: 50,
       mode: client.Sysadmin,
@@ -111,7 +112,7 @@ fn nothing(calls: Subject(Call)) -> Nil {
 pub fn a_message_during_a_stop_waits_for_it_test() {
   let calls = process.new_subject()
   let r = start(calls)
-  let key = registry.key("T1", "C1", "30.1")
+  let key = thread_key("T1", "C1", "30.1")
   process.send(r, message("30.1", "30.1", "<@UBOT> hi", True))
   let assert Launch(launched, go) = next(calls)
   let assert True = launched == key
@@ -155,7 +156,7 @@ fn wait_live(
 pub fn shutdown_during_a_launch_stops_what_it_starts_test() {
   let calls = process.new_subject()
   let r = start(calls)
-  let key = registry.key("T1", "C1", "40.1")
+  let key = thread_key("T1", "C1", "40.1")
   process.send(r, message("40.1", "40.1", "<@UBOT> hi", True))
   let assert Launch(_, launch_go) = next(calls)
   let done = process.new_subject()
@@ -181,7 +182,7 @@ fn up_then_stopping(
   calls: Subject(Call),
   thread_ts: String,
 ) -> Call {
-  let key = registry.key("T1", "C1", thread_ts)
+  let key = thread_key("T1", "C1", thread_ts)
   process.send(r, message(thread_ts, thread_ts, "<@UBOT> hi", True))
   let assert Launch(_, go) = next(calls)
   process.send(go, Nil)
@@ -196,7 +197,7 @@ fn up_then_stopping(
 pub fn a_failed_stop_is_retried_test() {
   let calls = process.new_subject()
   let r = start_with(calls, [10, 20, 30])
-  let key = registry.key("T1", "C1", "50.1")
+  let key = thread_key("T1", "C1", "50.1")
   let assert Stop(_, go) = up_then_stopping(r, calls, "50.1")
   process.send(r, message("50.1", "50.2", "carry on", False))
   process.send(go, Error("docker daemon is down"))
@@ -219,7 +220,7 @@ pub fn a_failed_stop_is_retried_test() {
 pub fn a_stop_that_always_fails_is_reported_test() {
   let calls = process.new_subject()
   let r = start_with(calls, [10, 20])
-  let key = registry.key("T1", "C1", "60.1")
+  let key = thread_key("T1", "C1", "60.1")
   let assert Stop(_, go) = up_then_stopping(r, calls, "60.1")
   process.send(go, Error("no"))
   let assert Stop(_, go) = next(calls)
@@ -247,7 +248,7 @@ pub fn shutdown_budget_covers_its_timers_test() {
 pub fn a_lost_agent_is_stopped_and_started_again_test() {
   let calls = process.new_subject()
   let r = start(calls)
-  let key = registry.key("T1", "C1", "40.1")
+  let key = thread_key("T1", "C1", "40.1")
   process.send(r, message("40.1", "40.1", "<@UBOT> hi", True))
   let assert Launch(_, go) = next(calls)
   process.send(go, Nil)
@@ -262,4 +263,8 @@ pub fn a_lost_agent_is_stopped_and_started_again_test() {
   process.send(go, Nil)
   let _ = wait_live(r, key, 50)
   Nil
+}
+
+fn thread_key(team: String, channel: String, ts: String) -> String {
+  key.new(team, channel, ts) |> key.to_string
 }

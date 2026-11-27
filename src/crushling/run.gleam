@@ -1,9 +1,8 @@
 //// The pure state of one agent run as seen from a Slack thread: the
-//// assistant's text so far, the tools it called, and the files it changed.
+//// assistant's text so far and the tools it called.
 //// The thread actor feeds events in and renders snapshots out.
 
 import crushling/crush/event.{type Event}
-import crushling/diff
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/int
@@ -52,16 +51,9 @@ pub type Run {
     /// now."), shown as the run's status rather than in its reply.
     acting: Set(String),
     tools: List(Tool),
-    baseline: Dict(String, Option(String)),
-    latest: Dict(String, String),
     outcome: Option(Outcome),
   )
 }
-
-/// File contents as last seen anywhere in the thread, so a later run that
-/// edits a file without re-reading it still has a baseline to diff against.
-pub type Known =
-  Dict(String, String)
 
 pub fn new(session_id: String, run_id: String) -> Run {
   Run(
@@ -71,8 +63,6 @@ pub fn new(session_id: String, run_id: String) -> Run {
     texts: dict.new(),
     acting: set.new(),
     tools: [],
-    baseline: dict.new(),
-    latest: dict.new(),
     outcome: None,
   )
 }
@@ -88,12 +78,10 @@ pub fn is_done(run: Run) -> Bool {
 
 /// Fold one event into the run. Events for other sessions or runs are
 /// ignored, so every run can be fed the whole stream.
-pub fn apply(run: Run, known: Known, event: Event) -> Run {
+pub fn apply(run: Run, event: Event) -> Run {
   case event {
     event.MessageEvent(message:, ..) if message.session_id == run.session_id ->
       apply_message(run, message)
-    event.FileEvent(file) if file.session_id == run.session_id ->
-      apply_file(run, known, file)
     event.RunCompleteEvent(done)
       if done.run_id == run.run_id && done.session_id == run.session_id
     -> {
@@ -225,29 +213,6 @@ fn one_line(text: String, max: Int) -> String {
   }
 }
 
-fn apply_file(run: Run, known: Known, file: event.FileVersion) -> Run {
-  let baseline = case dict.has_key(run.baseline, file.path) {
-    True -> run.baseline
-    False -> {
-      let base = case file.version {
-        0 -> Some(file.content)
-        _ -> dict.get(known, file.path) |> option.from_result
-      }
-      dict.insert(run.baseline, file.path, base)
-    }
-  }
-  Run(
-    ..run,
-    baseline:,
-    latest: dict.insert(run.latest, file.path, file.content),
-  )
-}
-
-/// Remember this run's final file contents for the next run in the thread.
-pub fn remember(known: Known, run: Run) -> Known {
-  dict.merge(known, run.latest)
-}
-
 /// What the run says to the person: its messages, without narration
 /// between tool calls. While it runs, the latest message is held back,
 /// since a tool call may yet make it narration.
@@ -290,49 +255,4 @@ pub fn messages(run: Run, done: Bool) -> List(#(String, String)) {
       Error(Nil) -> Error(Nil)
     }
   })
-}
-
-pub type FileChange {
-  Changed(path: String, diff: String)
-  Unknown(path: String)
-}
-
-pub fn changes(run: Run, root: String) -> List(FileChange) {
-  dict.to_list(run.latest)
-  |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
-  |> list.filter_map(fn(pair) {
-    let #(path, latest) = pair
-    let shown = display_path(path, root)
-    case dict.get(run.baseline, path) {
-      Ok(Some(base)) ->
-        case diff.unified(shown, base, latest) {
-          "" -> Error(Nil)
-          patch -> Ok(Changed(shown, patch))
-        }
-      _ -> Ok(Unknown(shown))
-    }
-  })
-}
-
-pub fn display_path(path: String, root: String) -> String {
-  let root = case string.ends_with(root, "/") {
-    True -> root
-    False -> root <> "/"
-  }
-  case string.starts_with(path, root) {
-    True -> string.drop_start(path, string.length(root))
-    False -> path
-  }
-}
-
-/// Everything changed in the run as one patch, for attaching to the thread.
-pub fn patch(run: Run, root: String) -> String {
-  changes(run, root)
-  |> list.filter_map(fn(change) {
-    case change {
-      Changed(diff:, ..) -> Ok(diff)
-      Unknown(_) -> Error(Nil)
-    }
-  })
-  |> string.concat
 }

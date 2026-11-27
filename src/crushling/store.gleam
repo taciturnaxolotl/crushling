@@ -287,15 +287,15 @@ pub fn load_key(
       |> result.map_error(fn(reason) { "CRUSHLING_STORE_KEY " <> reason })
     Error(Nil) -> {
       let path = root <> "/store-key"
-      case read_file(path) {
+      case sys.read_file(path) {
         Ok(text) ->
           parse_key(text)
           |> result.map(fn(key) { #(key, False) })
           |> result.map_error(fn(reason) { path <> " " <> reason })
         Error(Nil) -> {
           let key = random_key()
-          use _ <- result.try(mkdir_p(root))
-          use _ <- result.map(write_private(
+          use _ <- result.try(sys.mkdir_p(root))
+          use _ <- result.map(sys.write_private(
             path,
             bit_array.base64_encode(key, True) <> "\n",
           ))
@@ -332,18 +332,6 @@ pub fn unseal(
 
 @external(erlang, "crushling_store_ffi", "random_key")
 fn random_key() -> BitArray
-
-@external(erlang, "crushling_ffi", "read_file")
-fn read_file(path: String) -> Result(String, Nil)
-
-@external(erlang, "crushling_ffi", "mkdir_p")
-fn mkdir_p(path: String) -> Result(Nil, String)
-
-@external(erlang, "crushling_ffi", "write_private")
-fn write_private(path: String, content: String) -> Result(Nil, String)
-
-@external(erlang, "crushling_ffi", "list_dir")
-fn list_dir(path: String) -> Result(List(String), Nil)
 
 fn now_seconds() -> Int {
   sys.system_ms() / 1000
@@ -612,6 +600,21 @@ fn read_thread(
   |> result.map(fn(rows) { list.first(rows) |> option.from_result })
 }
 
+/// A workspace's threads, with those that have no workspace recorded.
+pub fn team_threads(
+  store: Store,
+  team: String,
+) -> Result(List(Thread), String) {
+  use connection, _ <- run(store)
+  query(
+    connection,
+    "SELECT key, team_id, channel, thread_ts, follow, paused, cursor, venue,
+       tailnet, model FROM threads WHERE team_id = ? OR team_id = ''",
+    [sqlight.text(team)],
+    thread_decoder(),
+  )
+}
+
 /// A workspace's threads whose meta last changed before `before` (Unix
 /// seconds), with when. Meta changes with every message the agent reads,
 /// so this is when each thread last saw work.
@@ -764,7 +767,7 @@ pub fn import_files(
     [_, ..] -> Ok(AlreadyImported)
     [] -> {
       let entries =
-        list_dir(root) |> result.unwrap([]) |> list.sort(string.compare)
+        sys.list_dir(root) |> result.unwrap([]) |> list.sort(string.compare)
       use found <- result.try(
         list.try_fold(entries, #([], [], []), fn(found, entry) {
           import_entry(connection, root, team, entry, found)

@@ -12,9 +12,9 @@
 
 import crushling/gun
 import crushling/proxy
-import crushling/proxy/meter.{Cap}
 import crushling/proxy/usage
 import crushling/sandbox_http
+import crushling/usage.{Cap} as spend
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dynamic.{type Dynamic}
@@ -185,8 +185,8 @@ fn config(upstream: String) -> proxy.Config {
     secret:,
     org_key:,
     upstream:,
-    thread_cap: meter.unlimited,
-    instance_cap: meter.unlimited,
+    thread_cap: spend.unlimited,
+    instance_cap: spend.unlimited,
     max_per_thread: proxy.default_max_per_thread,
     max_uploads: proxy.default_max_uploads,
     upload_timeout_ms: proxy.default_upload_timeout_ms,
@@ -582,8 +582,8 @@ pub fn json_passes_through_and_is_metered_test() {
   let assert Ok(gun.Response(status: 201, headers:, body:)) = answered(result)
   let assert True = bits(body) == usage_json
   let assert Ok("application/json") = list.key_find(headers, "content-type")
-  let assert meter.Usage(9, 2, 0.25, 1) = proxy.totals(setup.proxy, "k")
-  let assert meter.Usage(9, 2, 0.25, 1) = proxy.instance_totals(setup.proxy)
+  let assert spend.Usage(9, 2, 0.25, 1) = proxy.totals(setup.proxy, "k")
+  let assert spend.Usage(9, 2, 0.25, 1) = proxy.instance_totals(setup.proxy)
   // Upstream errors pass through as they are.
   let result = post_later(setup, completions("k"), [auth("k")])
   reply_json(
@@ -609,7 +609,7 @@ pub fn chunks_arrive_before_the_stream_ends_and_usage_is_metered_test() {
   let assert gun.Data(data:, fin: False, stream: s, ..) = next_message()
   let assert True = s == stream
   let assert True = bits(data) == sse_text
-  let assert meter.Usage(0, 0, 0.0, 0) = proxy.totals(setup.proxy, "k")
+  let assert spend.Usage(0, 0, 0.0, 0) = proxy.totals(setup.proxy, "k")
   // The usage chunk split mid-line across two writes.
   let #(first, second) = #(
     string.slice(sse_usage, 0, 40),
@@ -621,7 +621,7 @@ pub fn chunks_arrive_before_the_stream_ends_and_usage_is_metered_test() {
   process.send(steps, Send(second))
   process.send(steps, Finish)
   let assert True = rest_of_body("") == second
-  let assert meter.Usage(100, 20, 0.5, 1) = proxy.totals(setup.proxy, "k")
+  let assert spend.Usage(100, 20, 0.5, 1) = proxy.totals(setup.proxy, "k")
 }
 
 pub fn trailers_end_the_stream_and_are_not_forwarded_test() {
@@ -635,7 +635,7 @@ pub fn trailers_end_the_stream_and_are_not_forwarded_test() {
   // Upstream keeps its connection open, so only the trailers end this; a
   // forwarded trailer would arrive as gun.Trailers and fail here.
   let assert True = rest_of_body("") == sse_usage
-  let assert meter.Usage(100, 20, 0.5, 1) = proxy.totals(p, "k")
+  let assert spend.Usage(100, 20, 0.5, 1) = proxy.totals(p, "k")
 }
 
 pub fn over_the_cap_is_429_test() {
@@ -657,7 +657,7 @@ pub fn over_the_cap_is_429_test() {
   reply_json(next_arrival(setup), 200, "{}")
   let assert Ok(gun.Response(status: 200, ..)) = answered(result)
   // A per-thread override lifts it.
-  proxy.set_thread_cap(setup.proxy, "k", Some(meter.unlimited))
+  proxy.set_thread_cap(setup.proxy, "k", Some(spend.unlimited))
   let result = post_later(setup, completions("k"), [auth("k")])
   reply_json(next_arrival(setup), 200, "{}")
   let assert Ok(gun.Response(status: 200, ..)) = answered(result)
@@ -726,7 +726,7 @@ pub fn a_stream_crossing_the_cap_is_cut_test() {
   let assert True =
     rest
     == "data: {\"error\":{\"message\":\"This thread has reached its inference spending cap.\",\"type\":\"rate_limit_error\"}}\n\n"
-  let assert meter.Usage(120, 25, 0.5, 2) = proxy.totals(setup.proxy, "k")
+  let assert spend.Usage(120, 25, 0.5, 2) = proxy.totals(setup.proxy, "k")
   // And upstream is closed.
   let assert Ok(Nil) = process.receive(setup.closed, 2000)
 }
@@ -937,8 +937,8 @@ pub fn usage_scanner_test() {
     |> usage.feed(<<
       "ens\":3,\"completion_tokens\":4,\"cost\":{\"usd\":1}}}\n":utf8,
     >>)
-  let assert Some(meter.Usage(3, 4, 1.0, 1)) = usage.finish(scanner)
-  let assert Some(meter.Usage(5, 6, 0.0, 1)) =
+  let assert Some(spend.Usage(3, 4, 1.0, 1)) = usage.finish(scanner)
+  let assert Some(spend.Usage(5, 6, 0.0, 1)) =
     usage.parse_usage("{\"usage\":{\"input_tokens\":5,\"output_tokens\":6}}")
   let assert None = usage.parse_usage("{\"choices\":[]}")
   let assert None =
@@ -995,8 +995,8 @@ fn real_proxy(key: String) -> #(proxy.Proxy, Int) {
       secret:,
       org_key: key,
       upstream: proxy.upstream_from(api_key),
-      thread_cap: meter.unlimited,
-      instance_cap: meter.unlimited,
+      thread_cap: spend.unlimited,
+      instance_cap: spend.unlimited,
       max_per_thread: proxy.default_max_per_thread,
       max_uploads: proxy.default_max_uploads,
       upload_timeout_ms: proxy.default_upload_timeout_ms,

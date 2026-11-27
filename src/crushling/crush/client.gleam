@@ -204,21 +204,6 @@ pub type Attachment {
   )
 }
 
-pub fn send_prompt(
-  workspace_id workspace_id: String,
-  session_id session_id: String,
-  run_id run_id: String,
-  prompt prompt: String,
-) -> Call(Nil) {
-  send_prompt_with(
-    workspace_id:,
-    session_id:,
-    run_id:,
-    prompt:,
-    attachments: [],
-  )
-}
-
 pub fn send_prompt_with(
   workspace_id workspace_id: String,
   session_id session_id: String,

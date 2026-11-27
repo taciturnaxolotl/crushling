@@ -6,10 +6,10 @@ import crushling/launcher
 import crushling/mcp
 import crushling/provider
 import crushling/proxy
-import crushling/proxy/meter
 import crushling/sandbox
 import crushling/sys
 import crushling/tunnel
+import crushling/usage as spend
 import gleam/erlang/charlist
 import gleam/erlang/process.{type Subject}
 import gleam/int
@@ -61,8 +61,8 @@ fn real_bridge_at(root: String, url: String) -> launcher.Bridge {
       secret:,
       org_key: "org-key",
       upstream: proxy.default_upstream,
-      thread_cap: meter.unlimited,
-      instance_cap: meter.unlimited,
+      thread_cap: spend.unlimited,
+      instance_cap: spend.unlimited,
       max_per_thread: proxy.default_max_per_thread,
       max_uploads: proxy.default_max_uploads,
       upload_timeout_ms: proxy.default_upload_timeout_ms,

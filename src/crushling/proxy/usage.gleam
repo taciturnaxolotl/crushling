@@ -12,7 +12,7 @@
 ////
 //// Anthropic-style `input_tokens`/`output_tokens` are understood too.
 
-import crushling/proxy/meter.{type Usage, Usage}
+import crushling/usage.{type Usage, Usage}
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/int

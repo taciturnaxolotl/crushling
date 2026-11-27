@@ -202,7 +202,7 @@ fn start_registry(
       allowed: people.parse(allowed),
       admins: set.new(),
       store: s,
-      migrate_legacy: False,
+      stranded: set.new(),
       idle_ms: 600_000,
       flush_ms: 50,
       mode: client.Sysadmin,

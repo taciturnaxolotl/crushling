@@ -1,10 +1,12 @@
 import crushling/crush/client
 import crushling/events
+import crushling/key
 import crushling/launcher
 import crushling/meta
 import crushling/people
 import crushling/registry
 import crushling/registry/incoming as msg
+import crushling/registry/legacy
 import crushling/registry/tailnet
 import crushling/slack
 import crushling/snapshot
@@ -123,7 +125,7 @@ type Launch {
 
 /// The test workspace's key for a thread.
 fn k(channel: String, ts: String) -> String {
-  registry.key("T1", channel, ts)
+  thread_key("T1", channel, ts)
 }
 
 /// A store of its own for each test.
@@ -187,16 +189,15 @@ fn start_registry_using(
   store: store.Store,
   tailnet: Option(tailnet.Setup),
 ) {
-  start_registry_as(fake, store, tailnet, True)
+  start_registry_as(fake, store, tailnet, set.new())
 }
 
-/// `migrate_legacy` says whether this is the workspace whose old threads
-/// may move to their new keys.
+/// `stranded` are the threads whose old workspace couldn't be moved.
 fn start_registry_as(
   fake: launcher.Launcher,
   store: store.Store,
   tailnet: Option(tailnet.Setup),
-  migrate_legacy: Bool,
+  stranded: set.Set(String),
 ) {
   let assert Ok(client) =
     slackline.new("xoxb-test")
@@ -211,7 +212,7 @@ fn start_registry_as(
       allowed: people.only(["U1"]),
       admins: set.new(),
       store:,
-      migrate_legacy:,
+      stranded:,
       idle_ms: 50,
       flush_ms: 50,
       mode: client.Sysadmin,
@@ -389,9 +390,6 @@ pub fn native_stop_in_a_code_channel_test() {
 }
 
 pub fn repo_helpers_test() {
-  let assert True = snapshot.is_clone("cd /w && git clone https://x/y.git")
-  let assert True = snapshot.is_clone("gh repo clone owner/repo")
-  let assert False = snapshot.is_clone("git status")
   let assert "owner/repo" =
     snapshot.repo_name("https://github.com/owner/repo.git")
   let assert "owner/repo" = snapshot.repo_name("git@github.com:owner/repo.git")
@@ -738,9 +736,9 @@ fn unique() -> Int
 @external(erlang, "crushling_ffi", "file_exists")
 fn file_exists(path: String) -> Bool
 
-/// A thread from before keys carried the workspace is found under its old
-/// key once, and moved: its row, its directory, and its container (which
-/// the launcher's `rekey` removes).
+/// A thread from before keys carried the workspace is moved at start: its
+/// row, its directory, and its container (which the launcher's `rekey`
+/// removes).
 pub fn threads_under_their_old_key_move_to_the_new_one_test() {
   let root = "/tmp/crushling-registry-test/migrate-" <> sys.uuid()
   let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
@@ -756,26 +754,29 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
         meta.Meta(..meta.new(True), cursor: "2.0"),
       ),
     )
-  let launches = process.new_subject()
-  let rekeys = process.new_subject()
-  let fake =
-    launcher.Launcher(
-      launch: fn(key) {
-        process.send(launches, Launched(key))
-        Error("no agents in this test")
-      },
-      stop: fn(_) { Ok(Nil) },
-      exists: fn(key) { file_exists(root <> "/" <> key <> "/work") },
-      forget: fn(_) { Ok(Nil) },
-      rekey: fn(old, new) {
-        process.send(rekeys, #(old, new))
-        launcher.move_dir(root, old, new)
-      },
-      run_in_sandbox: None,
+  // Another workspace's old thread isn't this one's to take.
+  let assert Ok(Nil) = mkdir_p(root <> "/C5-1.0/work")
+  let assert Ok(Nil) =
+    store.put_thread(
+      s,
+      store.Thread("C5-1.0", "T2", "C5", "1.0", meta.new(True)),
     )
-  let r = start_registry_using(fake, s, None)
+  let #(fake, launches, rekeys) = migrating_launcher(root, False)
+  let assert True = set.is_empty(legacy.migrate(s, fake, root, "T1"))
+  let assert Ok(#("C9-1.0", "T1-C9-1.0")) = process.receive(rekeys, 100)
+  let assert Error(Nil) = process.receive(rekeys, 50)
   let new = k("C9", "1.0")
   let assert "T1-C9-1.0" = new
+  let assert Ok(None) = store.thread(s, "C9-1.0")
+  let assert Ok(Some(store.Thread(team: "T1", ..))) = store.thread(s, new)
+  let assert True = file_exists(root <> "/T1-C9-1.0/work")
+  let assert False = file_exists(root <> "/C9-1.0")
+  let assert Ok(Some(_)) = store.thread(s, "C5-1.0")
+  let assert True = file_exists(root <> "/C5-1.0/work")
+  // Only once.
+  let assert True = set.is_empty(legacy.migrate(s, fake, root, "T1"))
+  let assert Error(Nil) = process.receive(rekeys, 50)
+  let r = start_registry_using(fake, s, None)
   // A plain reply: the thread follows along, as its old meta says.
   process.send(
     r,
@@ -783,33 +784,12 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
   )
   let assert Ok(Launched(launched)) = process.receive(launches, 1000)
   let assert True = launched == new
-  let assert Ok(#("C9-1.0", "T1-C9-1.0")) = process.receive(rekeys, 100)
-  let assert Ok(None) = store.thread(s, "C9-1.0")
-  let assert Ok(Some(store.Thread(team: "T1", ..))) = store.thread(s, new)
-  let assert True = file_exists(root <> "/T1-C9-1.0/work")
-  let assert False = file_exists(root <> "/C9-1.0")
-  // Only once.
-  process.send(
-    r,
-    registry.Received(
-      msg.Incoming("C9", "1.0", "4.0", "U1", "again", False, []),
-    ),
-  )
-  let assert Ok(Launched(_)) = process.receive(launches, 1000)
-  let assert Error(Nil) = process.receive(rekeys, 100)
   // A thread nobody knew under either key stays unknown.
   process.send(
     r,
     registry.Received(msg.Incoming("C8", "1.0", "5.0", "U1", "hm", False, [])),
   )
   let assert Error(Nil) = process.receive(launches, 100)
-  let assert Error(Nil) = process.receive(rekeys, 50)
-  // Another workspace's old thread isn't this one's to take.
-  let assert Ok(Nil) =
-    store.put_thread(
-      s,
-      store.Thread("C5-1.0", "T2", "C5", "1.0", meta.new(True)),
-    )
   process.send(
     r,
     registry.Received(
@@ -817,18 +797,12 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
     ),
   )
   let assert Error(Nil) = process.receive(launches, 100)
-  let assert Error(Nil) = process.receive(rekeys, 50)
-  let assert Ok(Some(_)) = store.thread(s, "C5-1.0")
+  Nil
 }
 
-/// A registry over `root`, whose launcher reports its launches and rekeys,
-/// and whose rekey fails when `rekey_fails`.
-fn migrating_registry(
-  root: String,
-  s: store.Store,
-  migrate: Bool,
-  rekey_fails: Bool,
-) {
+/// A launcher over `root` that reports its launches and rekeys, and whose
+/// rekey fails when `rekey_fails`.
+fn migrating_launcher(root: String, rekey_fails: Bool) {
   let launches = process.new_subject()
   let rekeys = process.new_subject()
   let fake =
@@ -849,18 +823,26 @@ fn migrating_registry(
       },
       run_in_sandbox: None,
     )
-  #(start_registry_as(fake, s, None, migrate), launches, rekeys)
+  #(fake, launches, rekeys)
+}
+
+/// A registry over `root` started the way the self-host workspace's is:
+/// after moving its old threads.
+fn migrating_registry(root: String, s: store.Store, rekey_fails: Bool) {
+  let #(fake, launches, rekeys) = migrating_launcher(root, rekey_fails)
+  let stranded = legacy.migrate(s, fake, root, "T1")
+  #(start_registry_as(fake, s, None, stranded), launches, rekeys)
 }
 
 fn reply_in(channel: String, ts: String) {
   registry.Received(msg.Incoming(channel, "1.0", ts, "U1", "more", False, []))
 }
 
-pub fn only_the_self_host_workspace_moves_old_threads_test() {
+pub fn a_registry_moves_no_old_threads_itself_test() {
   let root = "/tmp/crushling-registry-test/other-" <> sys.uuid()
   let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
-  let #(r, launches, rekeys) =
-    migrating_registry(root, fresh_store(), False, False)
+  let #(fake, launches, rekeys) = migrating_launcher(root, False)
+  let r = start_registry_using(fake, fresh_store(), None)
   process.send(r, reply_in("C9", "3.0"))
   let assert Error(Nil) = process.receive(launches, 150)
   let assert Error(Nil) = process.receive(rekeys, 50)
@@ -883,14 +865,15 @@ pub fn a_move_cut_short_after_the_directory_finishes_test() {
         meta.Meta(..meta.new(True), cursor: "2.0"),
       ),
     )
-  let #(r, launches, rekeys) = migrating_registry(root, s, True, False)
-  process.send(r, reply_in("C9", "3.0"))
-  let assert Ok(Launched("T1-C9-1.0")) = process.receive(launches, 1000)
+  let #(r, launches, rekeys) = migrating_registry(root, s, False)
   // Nothing left to rename on disk.
   let assert Error(Nil) = process.receive(rekeys, 50)
   let assert Ok(None) = store.thread(s, "C9-1.0")
   let assert Ok(Some(store.Thread(meta: meta.Meta(cursor: "2.0", ..), ..))) =
     store.thread(s, "T1-C9-1.0")
+  process.send(r, reply_in("C9", "3.0"))
+  let assert Ok(Launched("T1-C9-1.0")) = process.receive(launches, 1000)
+  Nil
 }
 
 pub fn a_move_cut_short_after_the_row_finishes_test() {
@@ -899,12 +882,13 @@ pub fn a_move_cut_short_after_the_row_finishes_test() {
   let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
   let s = fresh_store()
   put_meta(s, "C9", "1.0", meta.new(True))
-  let #(r, launches, rekeys) = migrating_registry(root, s, True, False)
-  process.send(r, reply_in("C9", "3.0"))
+  let #(r, launches, rekeys) = migrating_registry(root, s, False)
   let assert Ok(#("C9-1.0", "T1-C9-1.0")) = process.receive(rekeys, 1000)
-  let assert Ok(Launched("T1-C9-1.0")) = process.receive(launches, 1000)
   let assert True = file_exists(root <> "/T1-C9-1.0/work")
   let assert False = file_exists(root <> "/C9-1.0")
+  process.send(r, reply_in("C9", "3.0"))
+  let assert Ok(Launched("T1-C9-1.0")) = process.receive(launches, 1000)
+  Nil
 }
 
 pub fn a_failed_move_starts_nothing_test() {
@@ -916,18 +900,21 @@ pub fn a_failed_move_starts_nothing_test() {
       s,
       store.Thread("C9-1.0", "T1", "C9", "1.0", meta.new(True)),
     )
-  let #(r, launches, rekeys) = migrating_registry(root, s, True, True)
-  process.send(r, reply_in("C9", "3.0"))
+  let #(r, launches, rekeys) = migrating_registry(root, s, True)
   let assert Ok(_) = process.receive(rekeys, 1000)
   // No fresh thread under the new key; the old one stays as it was.
+  process.send(r, reply_in("C9", "3.0"))
   let assert Error(Nil) = process.receive(launches, 150)
   let assert Ok(Some(_)) = store.thread(s, "C9-1.0")
   let assert Ok(None) = store.thread(s, "T1-C9-1.0")
   let assert True = file_exists(root <> "/C9-1.0/work")
-  // A later message tries again, and still starts nothing.
+  // A later message still starts nothing.
   process.send(r, reply_in("C9", "4.0"))
-  let assert Ok(_) = process.receive(rekeys, 1000)
   let assert Error(Nil) = process.receive(launches, 150)
+  // The next start tries again.
+  let #(fake, _, rekeys) = migrating_launcher(root, True)
+  let assert False = set.is_empty(legacy.migrate(s, fake, root, "T1"))
+  let assert Ok(_) = process.receive(rekeys, 1000)
   Nil
 }
 
@@ -946,4 +933,8 @@ pub fn events_route_to_the_installation_they_were_delivered_to_test() {
   after()
   let assert Ok(registry.StopRequested("C1", "10.1", "U1")) =
     process.receive(registry, 1000)
+}
+
+fn thread_key(team: String, channel: String, ts: String) -> String {
+  key.new(team, channel, ts) |> key.to_string
 }

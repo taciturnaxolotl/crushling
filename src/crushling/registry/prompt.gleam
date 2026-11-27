@@ -3,6 +3,7 @@
 //// kept on the bridge for the agent to fetch, with small images and text
 //// sent along.
 
+import crushling/conversation
 import crushling/registry/incoming.{type Incoming}
 import crushling/slack
 import crushling/thread
@@ -40,8 +41,7 @@ pub fn build(
     False ->
       slack.catch_up(
         source.client,
-        message.channel,
-        catch_up,
+        conversation.from_slack(message.channel, catch_up),
         cursor,
         message.ts,
         source.bot_user,

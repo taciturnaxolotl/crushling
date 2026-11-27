@@ -4,6 +4,7 @@
 import crushling/crush/client
 import crushling/instance
 import crushling/launcher
+import crushling/meta
 import crushling/people
 import crushling/registry
 import crushling/slack_tools
@@ -300,4 +301,27 @@ pub fn a_crashed_registry_is_restarted_alone_test() {
   let assert registry.Clean = instance.shutdown(teams, 100)
   process.sleep(1200)
   let assert [] = instance.all(teams)
+}
+
+/// Threads from before keys carried the workspace are moved when the bridge
+/// starts, and only for the self-host workspace, which alone had them.
+pub fn old_threads_move_only_for_the_self_host_workspace_test() {
+  let dir = tmp()
+  let old = store.Thread("C9-1.0", "", "C9", "1.0", meta.new(True))
+  let launches = process.new_subject()
+
+  let s = open_store(dir)
+  let assert Ok(Nil) = store.put_thread(s, old)
+  let assert Ok(_) = instance.start(shared(s, dir, launches, "", None))
+  let assert Ok(Some(_)) = store.thread(s, "C9-1.0")
+
+  let s = open_store(dir)
+  let assert Ok(Nil) = store.put_thread(s, old)
+  let env =
+    instance.EnvTeam(id: "TA", allowed: people.nobody(), admins: set.new())
+  let assert Ok(_) = instance.start(shared(s, dir, launches, "", Some(env)))
+  let assert Ok(None) = store.thread(s, "C9-1.0")
+  let assert Ok(Some(store.Thread(team: "TA", ..))) =
+    store.thread(s, "TA-C9-1.0")
+  Nil
 }

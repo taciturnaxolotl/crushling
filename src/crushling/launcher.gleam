@@ -9,6 +9,7 @@
 //// The agent's crush.json comes from `provider.config` and holds no key.
 
 import crushling/github/route as github_route
+import crushling/key as thread_key
 import crushling/mcp
 import crushling/provider
 import crushling/proxy
@@ -299,9 +300,9 @@ fn delete_tree(path: String) -> Result(Nil, String)
 /// Delete `<root>/<key>`, for a key that can only name a thread's own
 /// directory.
 fn delete_thread_dir(root: String, key: String) -> Result(Nil, String) {
-  case key, string.contains(key, "/") {
-    "", _ | ".", _ | "..", _ | _, True -> Error("not a thread key: " <> key)
-    key, False ->
+  case thread_key.is_valid(key) {
+    False -> Error("not a thread key: " <> key)
+    True ->
       delete_tree(root <> "/" <> key)
       |> result.map_error(fn(reason) { "deleting the workspace: " <> reason })
   }
@@ -318,12 +319,6 @@ pub fn move_dir(root: String, old: String, new: String) -> Result(Nil, String) {
     False, _ -> Ok(Nil)
   }
 }
-
-@external(erlang, "crushling_ffi", "mkdir_p")
-fn mkdir_p(path: String) -> Result(Nil, String)
-
-@external(erlang, "crushling_ffi", "write_private")
-fn write_private(path: String, content: String) -> Result(Nil, String)
 
 /// Run each thread's `crush server --dial` on this machine, under
 /// `root/<key>`, the same way a sandbox runs it. `crush` is the binary, or
@@ -364,11 +359,11 @@ pub fn local(
       )
       bridge.restore(key)
       let started = {
-        use _ <- result.try(mkdir_p(work))
-        use _ <- result.try(mkdir_p(base <> "/home/config"))
-        use _ <- result.try(mkdir_p(base <> "/home/data"))
-        use _ <- result.try(mkdir_p(base <> "/home/honcho"))
-        use _ <- result.try(write_private(
+        use _ <- result.try(sys.mkdir_p(work))
+        use _ <- result.try(sys.mkdir_p(base <> "/home/config"))
+        use _ <- result.try(sys.mkdir_p(base <> "/home/data"))
+        use _ <- result.try(sys.mkdir_p(base <> "/home/honcho"))
+        use _ <- result.try(sys.write_private(
           base <> "/home/data/crush.json",
           provider.config(models, bridge.url),
         ))

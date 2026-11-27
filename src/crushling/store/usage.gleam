@@ -3,9 +3,9 @@
 //// from the bridge's start (`proxy/meter`); this is the record. The meter is
 //// drained into it in batches (`record`).
 
-import crushling/proxy/meter.{type Usage, Usage}
-import crushling/sandbox
+import crushling/key as thread_key
 import crushling/store.{type Store}
+import crushling/usage.{type Usage, Usage, zero}
 import gleam/dynamic/decode
 import gleam/list
 import gleam/result
@@ -35,7 +35,11 @@ pub fn record(
            cost_usd = cost_usd + excluded.cost_usd,
            requests = requests + excluded.requests",
         [
-          sqlight.text(sandbox.team_of(key) |> result.unwrap("")),
+          sqlight.text(
+            thread_key.parse(key)
+            |> result.map(thread_key.team)
+            |> result.unwrap(""),
+          ),
           sqlight.text(key),
           sqlight.int(usage.input_tokens),
           sqlight.int(usage.output_tokens),
@@ -91,7 +95,7 @@ fn total(
     store.query(connection, sums <> " WHERE " <> where, with, usage_decoder())
   {
     Ok([usage, ..]) -> Ok(usage)
-    Ok([]) -> Ok(meter.zero)
+    Ok([]) -> Ok(zero)
     Error(reason) -> Error(reason)
   }
 }
@@ -121,7 +125,7 @@ pub fn threads_total(
   since: Since,
 ) -> Result(Usage, String) {
   case keys {
-    [] -> Ok(meter.zero)
+    [] -> Ok(zero)
     keys ->
       total(
         store,

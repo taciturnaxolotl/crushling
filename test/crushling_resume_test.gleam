@@ -4,11 +4,11 @@
 //// falls back to checking the session on a resync, and never handles an
 //// event twice.
 
+import crushling/conversation
 import crushling/crush/client
 import crushling/crush/event
 import crushling/gun
 import crushling/render
-import crushling/run
 import crushling/sink
 import crushling/thread
 import crushling/thread/resume
@@ -120,7 +120,9 @@ pub fn stream_sends_last_event_id_test() {
 
 type Seen {
   Posted(String)
-  Ended(thread.Finished)
+  /// What the reply says so far.
+  Shown(String)
+  Ended
 }
 
 fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
@@ -138,7 +140,7 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
   }
   let sink =
     sink.Sink(
-      conversation: sink.Conversation("C", Some("1.0")),
+      conversation: conversation.Conversation("C", Some("1.0")),
       working: fn(_) { Nil },
       title: fn(_) { Nil },
       post:,
@@ -148,10 +150,13 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
       post_plan: fn(plan) { post(render.plan_markdown(plan)) },
       update_plan: fn(_, _) { Ok(Nil) },
       reply: fn(_) {
-        sink.Reply(show: fn(_, _, _) { Nil }, finish: fn(closing) {
-          let _ = post(closing)
-          []
-        })
+        sink.Reply(
+          show: fn(text, _, _) { process.send(seen, Shown(text)) },
+          finish: fn(closing) {
+            let _ = post(closing)
+            []
+          },
+        )
       },
       upload: fn(_, _) { Ok(Nil) },
       branch: fn(_, _, _) { Error("no") },
@@ -171,7 +176,7 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
         mode: client.Yolo,
         notify: fn(notice) {
           case notice {
-            thread.RunEnded(finished) -> process.send(seen, Ended(finished))
+            thread.RunEnded(_) -> process.send(seen, Ended)
             _ -> Nil
           }
         },
@@ -202,13 +207,23 @@ fn until_events(seen: List(String)) -> #(List(String), String) {
   }
 }
 
+/// Wait for the run to end: what its reply said last, and everything posted.
 fn finished(
   seen: Subject(Seen),
   posts: List(String),
-) -> #(thread.Finished, List(String)) {
+) -> #(String, List(String)) {
+  finished_showing(seen, "", posts)
+}
+
+fn finished_showing(
+  seen: Subject(Seen),
+  shown: String,
+  posts: List(String),
+) -> #(String, List(String)) {
   case process.receive(seen, 5000) {
-    Ok(Ended(finished)) -> #(finished, list.reverse(posts))
-    Ok(Posted(text)) -> finished(seen, [text, ..posts])
+    Ok(Ended) -> #(shown, list.reverse(posts))
+    Ok(Shown(text)) -> finished_showing(seen, text, posts)
+    Ok(Posted(text)) -> finished_showing(seen, shown, [text, ..posts])
     Error(Nil) -> panic as "the run never ended"
   }
 }
@@ -262,9 +277,8 @@ pub fn run_completing_in_a_gap_finishes_from_the_replay_test() {
   push(server, frame("e-2", says("all done")))
   push(server, frame("e-3", completes(run_id)))
 
-  let #(finished, posts) = finished(seen, [])
-  let assert run.Completed("done") = finished.outcome
-  let assert "all done" = finished.text
+  let #(text, posts) = finished(seen, [])
+  let assert "all done" = text
   let assert False = lost(posts)
   let assert Error(Nil) = next_request(50)
   process.send(t, thread.Stop)
@@ -300,8 +314,8 @@ pub fn resync_falls_back_to_the_session_state_test() {
   set_busy(server, False)
   push(server, frame("f-2", resync("expired")))
   let assert False = expect("busy")
-  let #(finished, _) = finished(seen, [])
-  let assert run.Errored("lost the connection mid-run") = finished.outcome
+  let #(_, posts) = finished(seen, [])
+  let assert True = lost(posts)
   let _ = run_id
   process.send(t, thread.Stop)
   stop_server(server)
@@ -321,9 +335,9 @@ pub fn duplicates_are_ignored_test() {
   push(server, frame("e-2", says("stale two again")))
   push(server, frame("e-1", says("stale one")))
   push(server, frame("e-3", completes(run_id)))
-  let #(finished, _) = finished(seen, [])
-  let assert run.Completed(_) = finished.outcome
-  let assert "new" = finished.text
+  let #(text, posts) = finished(seen, [])
+  let assert False = lost(posts)
+  let assert "new" = text
   process.send(t, thread.Stop)
   stop_server(server)
 }
@@ -362,8 +376,8 @@ pub fn drop_before_any_id_settles_after_attach_test() {
   let assert #(kinds, "") = until_events([])
   let assert False = list.contains(kinds, "busy")
   let assert False = expect("busy")
-  let #(finished, _) = finished(seen, [])
-  let assert run.Errored("lost the connection mid-run") = finished.outcome
+  let #(_, posts) = finished(seen, [])
+  let assert True = lost(posts)
   process.send(t, thread.Stop)
   stop_server(server)
 }
@@ -375,8 +389,8 @@ pub fn event_without_id_is_handled_test() {
   // gun reports this with the id before it, e-1; it must still count.
   push(server, frame("", says("second")))
   push(server, frame("e-2", completes(run_id)))
-  let #(finished, _) = finished(seen, [])
-  let assert "second" = finished.text
+  let #(text, _) = finished(seen, [])
+  let assert "second" = text
   process.send(t, thread.Stop)
   stop_server(server)
 }

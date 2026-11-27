@@ -115,7 +115,7 @@ Bolt's `authorize`), so the Slack tools, files and tailnet flow find a
 thread's workspace from its key and use that instance's client; such a hook
 would let one client follow the event's workspace.
 
-Thread keys carry the workspace: `T…-C…-<ts>` (`sandbox.key`), at most 64
+Thread keys carry the workspace: `T…-C…-<ts>` (`crushling/key`), at most 64
 characters of `[A-Za-z0-9_.-]`. Every thread's directory, container
 (`crushling-<key>`), tunnel, proxy and Slack tool tokens are named by it,
 so two workspaces never share any of them.
@@ -191,11 +191,10 @@ imported and each directory it skipped (and why), and never reads them
 again; the files stay where they are.
 
 Threads from before keys carried the workspace keep their old key,
-`C…-<ts>`, until they are next looked up. Only the self-host workspace
-moves such threads (another workspace never had them). When the new key is
-missing its row or its directory, the registry finishes the move from the
-old key, step by step, so a move cut short by a crash completes on the
-next lookup:
+`C…-<ts>`, until the self-host workspace next starts (another workspace
+never had them). Then every such thread (a row whose key has no workspace,
+or a directory named `<channel>-<ts>`) is moved to its new key, step by
+step, so a move cut short by a crash completes on the next start:
 
 - the directory, if the old one exists and the new one doesn't: the
   launcher's `rekey` removes the old container (`docker rm --force`, "no
@@ -206,8 +205,8 @@ next lookup:
 
 If a step fails, the registry doesn't start a fresh thread under the new
 key, which would hide the old work: it posts once in the thread that an
-admin should check the logs, drops the message, and tries again on the
-next one. Its tokens are derived
+admin should check the logs and drops the message. The move is tried again
+on the next start. Its tokens are derived
 from the key, so they change with it; nothing keeps the old ones, and the
 next launch makes a new container with the new key's environment.
 
@@ -459,8 +458,7 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 | `crushling/gun` | HTTP and SSE over a unix socket on `gun`. Requests block; stream events arrive as messages, picked up with `gun.select`. |
 | `crushling/crush/client` | Each server call as a pure `Call` (method, path, body, parser), run with `perform`. |
 | `crushling/crush/event` | Decodes the SSE envelope into `MessageEvent`, `RunCompleteEvent`, `AgentError`, `FileEvent`, or `Other`. |
-| `crushling/run` | Pure state for one run: text by message id, tool calls and their status, file baselines and latest contents. |
-| `crushling/diff` | Myers line diff and unified hunks, so diffs never need `git` on the host. |
+| `crushling/run` | Pure state for one run: text by message id, tool calls and their status. |
 | `crushling/render` | The run as text and steps: plan title, task rows, the reply so far, split under Slack's markdown-block limit with code fences kept balanced. |
 | `crushling/thread` | One actor per thread. Sends each prompt with a new run id, shows progress through a `Sink`, and ends runs that a dropped stream left open. Keeps the thread's `Venue`, moves the work to a code channel, and tells the registry what happens through `Notice`s. |
 | `crushling/thread/conn` | A thread's two connections to its server, its workspace and session, and shell commands that stay out of the agent's history. |
@@ -468,6 +466,9 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 | `crushling/thread/repo` | Finds a repository in the workspace, lists its changes, and updates a code channel's context bar and Code tab. |
 | `crushling/venue` | Where a thread's work is. That is the thread, a code channel, an archived channel, or the thread after Slack refused a code channel. |
 | `crushling/sink` | The functions a thread uses to post in Slack. `crushling/slack` builds the real one. |
+| `crushling/conversation` | Where in Slack something is said: a channel, and maybe a thread in it. |
+| `crushling/key` | A thread's key (workspace, channel and thread ts) and its string form, checked to be safe as a file, container and socket name. |
+| `crushling/usage` | What inference cost and the caps on it, shared by the proxy, the store and the App Home. |
 | `crushling/meta` | What the bridge saves for each thread (follow, pause, cursor, venue) and each code channel (its thread), and the old files' format, for their one-time import. |
 | `crushling/store` | The SQLite store: workspaces (tokens encrypted), their settings, thread meta and code channel links; migrations and the import of the old files. |
 | `crushling/instance` | One instance (registry and Slack client) per workspace, kept by team id; the self-host seed, per-workspace settings, the event router's lookup and the Slack tools' workspace. |
@@ -480,7 +481,7 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 | `crushling/sandbox_http` | The one port agents reach the bridge on, with the tunnel, proxy and Slack tools routes. |
 | `crushling` | Entry point: reads the settings, opens the store, starts the proxy, the tunnels, an instance per workspace, the sandbox server, the events server and Socket Mode. |
 | `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; routes events by workspace and turns them into `Incoming`. |
-| `crushling/registry` | One workspace's threads: maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, writes all thread meta to the store, and moves threads from their old keys. |
+| `crushling/registry` | One workspace's threads: maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, writes all thread meta to the store. |
 | `crushling/tailscale` | The Tailscale API (auth keys) and the scripts that join and leave the tailnet inside a sandbox. |
 | `crushling/registry/tailnet` | Tailnet access for each thread: one rule (on the tailnet while the agent runs and access lasts), the Slack card and its buttons. |
 | `crushling/registry/entry`, `incoming`, `prompt` | A thread's entry in the registry, an incoming Slack message, and the prompt built from it. |
@@ -512,7 +513,7 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
   sandbox, and catches edits made with `bash`, which emit no file events.
   The shell calls name a session id that doesn't exist, which makes the
   server skip saving their output into the agent's history. If the
-  snapshot fails, the diff falls back to SSE `file` events.
+  snapshot fails, no patch is attached and a warning is logged.
 
 ## Assumptions to check against the real thing
 

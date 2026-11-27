@@ -16,51 +16,13 @@
 ////   flight when a cap is reached can overshoot it, each by at most its own
 ////   cost (and a thread has at most `max_per_thread` in flight).
 
+import crushling/usage.{type Cap, type Usage, add, reached, zero}
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/set.{type Set}
-
-/// What was spent: by one response, one thread, or the whole instance.
-pub type Usage {
-  Usage(input_tokens: Int, output_tokens: Int, cost_usd: Float, requests: Int)
-}
-
-pub const zero = Usage(0, 0, 0.0, 0)
-
-pub fn add(a: Usage, b: Usage) -> Usage {
-  Usage(
-    input_tokens: a.input_tokens + b.input_tokens,
-    output_tokens: a.output_tokens + b.output_tokens,
-    cost_usd: a.cost_usd +. b.cost_usd,
-    requests: a.requests + b.requests,
-  )
-}
-
-pub fn tokens(usage: Usage) -> Int {
-  usage.input_tokens + usage.output_tokens
-}
-
-/// A spending limit. `None` in a field means no limit on that measure.
-pub type Cap {
-  Cap(tokens: Option(Int), usd: Option(Float))
-}
-
-pub const unlimited = Cap(None, None)
-
-pub fn reached(usage: Usage, cap: Cap) -> Bool {
-  let over_tokens = case cap.tokens {
-    Some(limit) -> tokens(usage) >= limit
-    None -> False
-  }
-  let over_usd = case cap.usd {
-    Some(limit) -> usage.cost_usd >=. limit
-    None -> False
-  }
-  over_tokens || over_usd
-}
 
 /// How much may happen at once.
 pub type Limits {

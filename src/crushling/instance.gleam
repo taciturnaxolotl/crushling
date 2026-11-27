@@ -14,11 +14,12 @@
 import crushling/crush/client
 import crushling/github
 import crushling/github/route as github_route
+import crushling/key as thread_key
 import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
 import crushling/registry
+import crushling/registry/legacy
 import crushling/registry/tailnet
-import crushling/sandbox
 import crushling/slack_tools
 import crushling/socket
 import crushling/store.{type Store}
@@ -99,6 +100,9 @@ type State {
     self: Subject(Message),
     running: Dict(String, Running),
     draining: Bool,
+    /// Threads of the self-host workspace whose old workspace couldn't be
+    /// moved to their key (`registry/legacy`).
+    stranded: Set(String),
   )
 }
 
@@ -111,12 +115,19 @@ const restart_ms = 1000
 /// monitored instead: one team's crash leaves the others, and this actor,
 /// alone, and the crashed registry is started again.
 pub fn start(shared: Shared) -> Result(Teams, String) {
+  // Only the self-host workspace has threads from before keys carried the
+  // workspace. Moved here, once, as moving each can take a docker call.
+  let stranded = case shared.env_team {
+    Some(env) ->
+      legacy.migrate(shared.store, shared.launcher, shared.root, env.id)
+    None -> set.new()
+  }
   actor.new_with_initialiser(timeout_ms, fn(self) {
     let selector =
       process.new_selector()
       |> process.select(self)
       |> process.select_monitors(RegistryDown)
-    State(shared:, self:, running: dict.new(), draining: False)
+    State(shared:, self:, running: dict.new(), draining: False, stranded:)
     |> actor.initialised
     |> actor.selecting(selector)
     |> actor.returning(self)
@@ -219,7 +230,7 @@ fn launch(
   state: State,
   team: store.Team,
 ) -> #(State, Result(Instance, String)) {
-  case start_instance(state.shared, team) {
+  case start_instance(state.shared, state.stranded, team) {
     Error(reason) -> #(state, Error(reason))
     Ok(instance) -> {
       let assert Ok(pid) = process.subject_owner(instance.registry)
@@ -305,6 +316,7 @@ pub fn people(
 
 fn start_instance(
   shared: Shared,
+  stranded: Set(String),
   team: store.Team,
 ) -> Result(Instance, String) {
   use #(allowed, admins) <- result.try(people(shared, team.id))
@@ -323,7 +335,10 @@ fn start_instance(
       allowed:,
       admins:,
       store: shared.store,
-      migrate_legacy: is_env,
+      stranded: case is_env {
+        True -> stranded
+        False -> set.new()
+      },
       idle_ms: shared.idle_ms,
       flush_ms: shared.flush_ms,
       mode: shared.mode,
@@ -525,8 +540,8 @@ fn instance_of(
   store: Store,
   key: String,
 ) -> Result(Instance, String) {
-  let team = case sandbox.team_of(key) {
-    Ok(team) -> Ok(team)
+  let team = case thread_key.parse(key) {
+    Ok(parsed) -> Ok(thread_key.team(parsed))
     Error(Nil) ->
       case store.thread(store, key) {
         Ok(Some(thread)) -> Ok(thread.team)

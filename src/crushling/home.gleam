@@ -4,7 +4,7 @@
 //// time; pure, so the view is easy to test.
 
 import crushling/github
-import crushling/proxy/meter.{type Usage}
+import crushling/usage.{type Usage}
 import gleam/float
 import gleam/int
 import gleam/list

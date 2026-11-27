@@ -12,6 +12,8 @@
 //// The argument building and the adopt/start/recreate decision are pure and
 //// tested; `ensure`, `stop` and `remove` shell out to docker.
 
+import crushling/key
+import crushling/sys
 import crushling/tunnel
 import gleam/int
 import gleam/list
@@ -65,59 +67,15 @@ const docker_timeout_ms = 60_000
 
 /// What a thread's container gets beyond `policy.env`: `own_env`, when the
 /// thread is in `own_team`.
-pub fn team_env(policy: Policy, key: String) -> List(String) {
-  case team_of(key) {
-    Ok(team) if team == policy.own_team && team != "" -> policy.own_env
+pub fn team_env(policy: Policy, thread: String) -> List(String) {
+  case key.parse(thread) {
+    Ok(thread) if policy.own_team != "" ->
+      case key.team(thread) == policy.own_team {
+        True -> policy.own_env
+        False -> []
+      }
     _ -> []
   }
-}
-
-/// A container and directory name for a thread, from the Slack workspace,
-/// channel and thread timestamp: `T…-C…-<ts>`. Only `[a-zA-Z0-9_.-]`
-/// survive, as in kloe, and it is at most 64 characters (Slack's ids are
-/// about 11, so a real key is about 40).
-pub fn key(team: String, channel: String, thread_ts: String) -> String {
-  safe(team <> "-" <> channel <> "-" <> thread_ts)
-}
-
-/// The key a thread had before keys carried the workspace: `C…-<ts>`. Only
-/// for moving such threads to their new key.
-pub fn legacy_key(channel: String, thread_ts: String) -> String {
-  safe(channel <> "-" <> thread_ts)
-}
-
-/// The workspace in a key made by `key`: everything before the first `-`,
-/// when that is a workspace (`T…`) or organization (`E…`) id. A key from
-/// before keys carried the workspace (`C…-<ts>`) has none.
-pub fn team_of(key: String) -> Result(String, Nil) {
-  case string.split_once(key, "-") {
-    Ok(#("T" <> _ as team, _))
-      | Ok(#("E" <> _ as team, _))
-      if team != "T" && team != "E"
-    -> Ok(team)
-    _ -> Error(Nil)
-  }
-}
-
-fn safe(name: String) -> String {
-  name
-  |> string.to_graphemes
-  |> list.map(fn(g) {
-    case is_safe(g) {
-      True -> g
-      False -> "_"
-    }
-  })
-  |> string.concat
-  |> string.slice(0, 64)
-}
-
-fn is_safe(grapheme: String) -> Bool {
-  string.contains(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-",
-    grapheme,
-  )
-  && grapheme != ""
 }
 
 pub fn container_name(key: String) -> String {
@@ -154,7 +112,7 @@ pub fn fingerprint(policy: Policy) -> String {
     ..policy.env
   ]
   |> string.join("\u{0}")
-  |> sha256_hex
+  |> sys.sha256_hex
   |> string.slice(0, 16)
 }
 
@@ -167,9 +125,6 @@ fn crush_stamp(path: String) -> String {
 
 @external(erlang, "crushling_ffi", "file_stamp")
 fn file_stamp(path: String) -> Result(String, Nil)
-
-@external(erlang, "crushling_ffi", "sha256_hex")
-fn sha256_hex(data: String) -> String
 
 /// `key_env` is the thread's own environment: its tokens for the Slack
 /// tools, the tunnel and the proxy. They are derived from the key, so they
@@ -467,12 +422,6 @@ pub fn remove(policy: Policy, key: String) -> Result(Nil, Error) {
   |> result.replace(Nil)
 }
 
-@external(erlang, "crushling_ffi", "mkdir_p")
-fn mkdir_p(path: String) -> Result(Nil, String)
-
-@external(erlang, "crushling_ffi", "write_private")
-fn write_private(path: String, content: String) -> Result(Nil, String)
-
 /// Where crush in the container keeps its global data, under the
 /// `XDG_DATA_HOME` set in `run_args`.
 pub fn host_crush_data(policy: Policy, key: String) -> String {
@@ -489,18 +438,18 @@ pub fn host_resolv_conf(policy: Policy) -> String {
 /// container's uid could then not write its workspace.
 pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
   use _ <- result.try(
-    mkdir_p(host_workspace(policy, key)) |> result.map_error(Filesystem),
+    sys.mkdir_p(host_workspace(policy, key)) |> result.map_error(Filesystem),
   )
   let data = host_crush_data(policy, key)
-  use _ <- result.try(mkdir_p(data) |> result.map_error(Filesystem))
+  use _ <- result.try(sys.mkdir_p(data) |> result.map_error(Filesystem))
   use _ <- result.try(case policy.dns {
     [] -> Ok(Nil)
     servers ->
       list.map(servers, fn(server) { "nameserver " <> server <> "\n" })
       |> string.concat
-      |> write_private(host_resolv_conf(policy), _)
+      |> sys.write_private(host_resolv_conf(policy), _)
       |> result.map_error(Filesystem)
   })
-  write_private(data <> "/crush.json", policy.crush_config)
+  sys.write_private(data <> "/crush.json", policy.crush_config)
   |> result.map_error(Filesystem)
 }

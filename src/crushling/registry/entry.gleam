@@ -1,5 +1,6 @@
 //// What the registry knows about one thread.
 
+import crushling/conversation.{type Conversation, Conversation}
 import crushling/meta.{type Meta, Meta}
 import crushling/registry/incoming.{type Incoming}
 import crushling/registry/tailnet
@@ -97,10 +98,10 @@ pub fn is_quiet(entry: Entry) -> Bool {
 }
 
 /// The conversation a thread talks in now: its thread, or its code channel.
-pub fn conversation(entry: Entry) -> #(String, String) {
+pub fn conversation(entry: Entry) -> Conversation {
   case entry.meta.venue {
-    venue.CodeChannel(channel:, ..) -> #(channel, "")
-    _ -> #(entry.channel, entry.thread_ts)
+    venue.CodeChannel(channel:, ..) -> Conversation(channel, None)
+    _ -> Conversation(entry.channel, Some(entry.thread_ts))
   }
 }
 

@@ -540,11 +540,10 @@ pub fn open_checks_the_key_and_path_test() {
   let assert Error(_) = tunnel.open(b.tunnels, "..")
   let assert Error(_) = tunnel.open(b.tunnels, "a/b")
   let assert Error(_) = tunnel.open(b.tunnels, string.repeat("a", 65))
-  let assert Ok(long) =
+  // A root whose shims don't fit a unix socket path is refused up front.
+  let assert Error(reason) =
     tunnel.start(tunnel.config(secret, "/tmp/" <> string.repeat("r", 95)))
-  let assert Error(reason) = tunnel.open(long, "C1-1.2")
-  let assert True = string.contains(reason, "too long")
-  let assert True = string.contains(reason, ".sock")
+  let assert True = string.contains(reason, "at most")
 }
 
 pub fn shim_paths_fit_any_key_test() {

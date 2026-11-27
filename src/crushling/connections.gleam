@@ -11,14 +11,15 @@
 //// - Homes are drawn and published by one process per workspace, in the
 ////   order asked, so an older view never covers a newer one.
 
+import crushling/conversation
 import crushling/github.{type Tokens}
 import crushling/home
-import crushling/proxy/meter
 import crushling/slack
 import crushling/store.{type Store}
 import crushling/store/github as accounts
 import crushling/store/usage
 import crushling/sys
+import crushling/usage as spend
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/list
@@ -475,7 +476,12 @@ fn reply(state: State, from: Option(Place), user: String, text: String) -> Nil {
     Some(Place(channel:, thread_ts:, respond: None)) -> {
       let client = state.setup.client
       process.spawn_unlinked(fn() {
-        slack.whisper(client, channel, thread_ts, user, text)
+        slack.whisper(
+          client,
+          conversation.from_slack(channel, thread_ts),
+          user,
+          text,
+        )
       })
       Nil
     }
@@ -562,7 +568,7 @@ fn draw(
     Some(threads) -> {
       let total = fn(since) {
         usage.team_total(setup.store, setup.team, since)
-        |> result.unwrap(meter.zero)
+        |> result.unwrap(spend.zero)
       }
       home.Home(
         github:,
@@ -579,7 +585,7 @@ fn draw(
                 |> option.from_result,
               model: thread.model,
               spent: usage.thread_total(setup.store, thread.key, usage.Ever)
-                |> result.unwrap(meter.zero),
+                |> result.unwrap(spend.zero),
             )
           }),
         thread_count: list.length(threads),

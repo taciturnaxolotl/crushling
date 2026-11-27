@@ -30,12 +30,13 @@
 //// override `<NAME>`, so a sandbox must not also get `CRUSH_HYPER_API_KEY`
 //// or `CRUSH_HYPER_URL`.
 
-import crushling/proxy/meter.{type Cap, type Usage}
+import crushling/proxy/meter
 import crushling/proxy/usage
 import crushling/relay
 import crushling/sandbox_http
 import crushling/sys
 import crushling/token as bearer
+import crushling/usage.{type Cap, type Usage} as spend
 import gleam/bit_array
 import gleam/bool
 
@@ -529,7 +530,7 @@ pub fn parse_cap(tokens: String, usd: String) -> Result(Cap, CapError) {
     text ->
       float_parse(text) |> result.map(Some) |> result.replace_error(BadUsd)
   })
-  meter.Cap(tokens:, usd:)
+  spend.Cap(tokens:, usd:)
 }
 
 fn float_parse(text: String) -> Result(Float, Nil) {

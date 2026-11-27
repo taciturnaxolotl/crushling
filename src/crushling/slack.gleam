@@ -2,6 +2,7 @@
 //// session (Slack's "Working…" and Stop), a plan card and markdown replies, and the helpers that turn a Slack
 //// message back into a prompt.
 
+import crushling/conversation.{type Conversation, Conversation}
 import crushling/crush/client
 import crushling/files
 import crushling/gun
@@ -210,7 +211,7 @@ pub fn sink(
   }
   let set_status = fn(status) {
     case has_session {
-      True -> session_status(client, channel, thread_ts, status)
+      True -> session_status(client, Conversation(channel, thread_ts), status)
       False -> Nil
     }
   }
@@ -240,7 +241,7 @@ pub fn sink(
     Ok(#(branch, link, root))
   }
   thread_sink.Sink(
-    conversation: thread_sink.Conversation(channel, thread_ts),
+    conversation: Conversation(channel, thread_ts),
     // Slack shows "Working…" with its Stop control until the session is
     // set back to active; posting doesn't clear it.
     working: fn(working) {
@@ -296,27 +297,21 @@ pub fn sink(
       |> result.replace(Nil)
     },
     upload: fn(name, content) {
-      case in_code_channel {
-        // The Code tab shows the changes there.
-        True -> Ok(Nil)
-        False -> {
-          let file =
-            slackline.FileUpload(
-              filename: name,
-              content_type: "text/x-diff",
-              contents: bit_array.from_string(content),
-            )
-          use <- send
-          httpc.upload_files(client, [file], share: fn(call) {
-            let call = complete_upload_external.channel_id(call, channel)
-            case thread_ts {
-              Some(ts) -> complete_upload_external.thread_ts(call, ts)
-              None -> call
-            }
-          })
-          |> result.replace(Nil)
-        }
-      }
+      let file =
+        slackline.FileUpload(
+          filename: name,
+          content_type: "text/x-diff",
+          contents: bit_array.from_string(content),
+        )
+      use <- send
+      httpc.upload_files(client, [file], share: fn(call) {
+        complete_upload_external.channel_id(call, channel)
+        |> conversation.in_thread(
+          Conversation(channel, thread_ts),
+          complete_upload_external.thread_ts,
+        )
+      })
+      |> result.replace(Nil)
     },
     branch:,
     open_code_channel: fn(name) {
@@ -447,33 +442,25 @@ pub fn archive_code_channel(
   |> result.map_error(describe)
 }
 
+/// Show the agent session in a conversation as working at once, before its
+/// agent is even up: the thread's sink does the rest.
+pub fn mark_working(client: slackline.Client, place: Conversation) -> Nil {
+  session_status(client, place, agents.Processing)
+}
+
 /// Set an agent session's status: a thread's, or a whole code channel's
 /// when there is no thread. Best effort: it is decoration, and Slack times
 /// a working session out after an hour regardless.
-/// Show the agent session in `channel` (and thread, if any) as working at
-/// once, before its agent is even up: the thread's sink does the rest.
-pub fn mark_working(
-  client: slackline.Client,
-  channel: String,
-  thread_ts: Option(String),
-) -> Nil {
-  session_status(client, channel, thread_ts, agents.Processing)
-}
-
 fn session_status(
   client: slackline.Client,
-  channel: String,
-  thread_ts: Option(String),
+  place: Conversation,
   status: agents.AgentStatus,
 ) -> Nil {
-  let call =
+  let channel = place.channel
+  let sent =
     agents.sessions_set_status(status:)
     |> sessions_set_status.channel_id(channel)
-  let sent =
-    case thread_ts {
-      Some(ts) -> sessions_set_status.thread_ts(call, ts)
-      None -> call
-    }
+    |> conversation.in_thread(place, sessions_set_status.thread_ts)
     |> httpc.send(client)
   case sent {
     Ok(_) -> Nil
@@ -491,34 +478,20 @@ fn session_status(
 
 /// Mark the agent session as ready for the next prompt. `thread_ts` is ""
 /// for a code channel.
-pub fn session_done(
-  client: slackline.Client,
-  channel: String,
-  thread_ts: String,
-) -> Nil {
-  let thread = case thread_ts {
-    "" -> None
-    ts -> Some(ts)
-  }
-  session_status(client, channel, thread, agents.Active)
+pub fn session_done(client: slackline.Client, place: Conversation) -> Nil {
+  session_status(client, place, agents.Active)
 }
 
 /// Reply to one user only, such as for `!help`.
 pub fn whisper(
   client: slackline.Client,
-  channel: String,
-  thread_ts: String,
+  place: Conversation,
   user: String,
   text: String,
 ) -> Nil {
   let _ =
-    chat.post_ephemeral(channel:, user:, text:)
-    |> fn(call) {
-      case thread_ts {
-        "" -> call
-        ts -> post_ephemeral.thread_ts(call, ts)
-      }
-    }
+    chat.post_ephemeral(channel: place.channel, user:, text:)
+    |> conversation.in_thread(place, post_ephemeral.thread_ts)
     |> httpc.send(client)
   Nil
 }
@@ -586,15 +559,14 @@ pub fn replace_ephemeral(response_url: String, text: String) -> Nil {
 /// `whisper`, with blocks; `text` is the fallback for notifications.
 pub fn whisper_blocks(
   client: slackline.Client,
-  channel: String,
-  thread_ts: String,
+  place: Conversation,
   user: String,
   text: String,
   blocks: List(block.Block),
 ) -> Nil {
   let _ =
-    chat.post_ephemeral(channel:, user:, text:)
-    |> post_ephemeral.thread_ts(thread_ts)
+    chat.post_ephemeral(channel: place.channel, user:, text:)
+    |> conversation.in_thread(place, post_ephemeral.thread_ts)
     |> post_ephemeral.blocks(blocks)
     |> httpc.send(client)
   Nil
@@ -602,18 +574,12 @@ pub fn whisper_blocks(
 
 pub fn say(
   client: slackline.Client,
-  channel: String,
-  thread_ts: String,
+  place: Conversation,
   markdown: String,
 ) -> Nil {
   let _ =
-    chat.post_message(channel:, text: fallback(markdown))
-    |> fn(call) {
-      case thread_ts {
-        "" -> call
-        ts -> post_message.thread_ts(call, ts)
-      }
-    }
+    chat.post_message(channel: place.channel, text: fallback(markdown))
+    |> conversation.in_thread(place, post_message.thread_ts)
     |> post_message.blocks([block.markdown(markdown, [])])
     |> httpc.send(client)
   Nil
@@ -966,13 +932,13 @@ pub fn ts_value(ts: String) -> Float {
 /// At most 200 messages.
 pub fn read_conversation(
   client: slackline.Client,
-  channel: String,
-  thread_ts: String,
+  place: Conversation,
   after_ts: String,
   before_ts: String,
 ) -> Result(List(message.Message), String) {
-  case thread_ts {
-    "" -> {
+  let channel = place.channel
+  case place.thread {
+    None -> {
       let call = conversations.history(channel:) |> history.limit(200)
       let call = case before_ts {
         "" -> call
@@ -988,7 +954,7 @@ pub fn read_conversation(
         option.unwrap(response.messages, []) |> list.reverse
       })
     }
-    ts ->
+    Some(ts) ->
       conversations.replies(channel:, ts:)
       |> replies.limit(200)
       |> httpc.send(client)
@@ -1024,8 +990,7 @@ pub type CatchUp {
 /// prompt. The last `limit` messages are kept; `##` asides are left out.
 pub fn catch_up(
   client: slackline.Client,
-  channel: String,
-  thread_ts: String,
+  place: Conversation,
   after_ts: String,
   before_ts: String,
   bot_user: String,
@@ -1037,7 +1002,7 @@ pub fn catch_up(
   }
   let before = ts_value(before_ts)
   // A code channel is caught up on as a whole.
-  let found = read_conversation(client, channel, thread_ts, after_ts, before_ts)
+  let found = read_conversation(client, place, after_ts, before_ts)
   let kept =
     result.unwrap(found, [])
     |> list.filter_map(fn(message) {
@@ -1072,13 +1037,13 @@ pub fn catch_up(
         with_files -> Ok(with_files)
       }
     })
-  let place = case thread_ts {
-    "" -> "Slack channel"
-    _ -> "Slack thread"
+  let where = case place.thread {
+    None -> "Slack channel"
+    Some(_) -> "Slack thread"
   }
   let heading = case after_ts {
-    "" -> "Earlier in this " <> place
-    _ -> "New in this " <> place <> " since your last turn"
+    "" -> "Earlier in this " <> where
+    _ -> "New in this " <> where <> " since your last turn"
   }
   let text = case lines {
     [] -> ""

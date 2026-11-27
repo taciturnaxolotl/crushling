@@ -1,8 +1,8 @@
 //// The functions a thread actor uses to post in one Slack conversation.
 //// `slack.sink` builds the real one, and the tests build their own.
 
+import crushling/conversation.{type Conversation}
 import crushling/render
-import gleam/option.{type Option}
 import slackline/block
 
 pub type Sink {
@@ -44,10 +44,6 @@ pub type Sink {
     context: fn(List(ContextItem)) -> Nil,
     code: fn(String, String, String) -> Nil,
   )
-}
-
-pub type Conversation {
-  Conversation(channel: String, thread_ts: Option(String))
 }
 
 /// A run's reply while the agent writes it. Slack streams it where it can.

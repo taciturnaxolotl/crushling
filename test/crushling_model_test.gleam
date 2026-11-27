@@ -3,7 +3,9 @@
 //// server` (test/fake_crush_ffi.erl), and the registry waking and putting
 //// to sleep a thread that only got `!model`.
 
+import crushling/conversation
 import crushling/crush/client
+import crushling/key
 import crushling/launcher
 import crushling/meta.{DefaultReasoning, Effort, ModelChoice, Thinking}
 import crushling/models
@@ -417,7 +419,7 @@ fn start(
   }
   let sink =
     sink.Sink(
-      conversation: sink.Conversation("C", Some("1.0")),
+      conversation: conversation.Conversation("C", Some("1.0")),
       working: fn(_) { Nil },
       title: fn(_) { Nil },
       post:,
@@ -707,7 +709,7 @@ fn start_woken_registry(name: String) {
     )
   let assert Ok(key) = store.parse_key(test_key)
   let assert Ok(s) = store.start(":memory:", key)
-  let thread_key = registry.key("T1", "C1", "1.0")
+  let thread_key = thread_key("T1", "C1", "1.0")
   let assert Ok(Nil) =
     store.put_thread(
       s,
@@ -726,7 +728,7 @@ fn start_woken_registry(name: String) {
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: s,
-      migrate_legacy: False,
+      stranded: set.new(),
       idle_ms: 300,
       flush_ms: 50,
       mode: client.Sysadmin,
@@ -785,4 +787,8 @@ fn count_jobs() -> Int {
     Ok(_) -> count_jobs()
     Error(Nil) -> panic as "no job count"
   }
+}
+
+fn thread_key(team: String, channel: String, ts: String) -> String {
+  key.new(team, channel, ts) |> key.to_string
 }

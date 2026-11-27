@@ -60,7 +60,6 @@ pub type Parent {
     session_id: String,
     sink: Sink,
     root: String,
-    known: run.Known,
     /// Whether subagents get threads of their own: only in a code channel.
     threads: Bool,
   )
@@ -101,17 +100,16 @@ pub fn track(subs: Subagents, parent: Parent, event: event.Event) -> Subagents {
           _, _ -> subs
         }
       })
-    event.MessageEvent(message: event.Message(session_id: child, ..), ..)
-    | event.FileEvent(event.FileVersion(session_id: child, ..)) ->
+    event.MessageEvent(message: event.Message(session_id: child, ..), ..) ->
       update(subs, call_id(child) |> result.unwrap(""), fn(sub) {
-        Sub(..sub, run: run.apply(sub.run, parent.known, event))
+        Sub(..sub, run: run.apply(sub.run, event))
       })
     event.RunCompleteEvent(done) ->
       update(subs, call_id(done.session_id) |> result.unwrap(""), fn(sub) {
         case sub.done {
           True -> sub
           False -> {
-            let sub = Sub(..sub, run: run.apply(sub.run, parent.known, event))
+            let sub = Sub(..sub, run: run.apply(sub.run, event))
             case run.is_done(sub.run) {
               True -> finish(parent, Sub(..sub, done: True))
               False -> sub

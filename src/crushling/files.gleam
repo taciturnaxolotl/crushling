@@ -19,6 +19,7 @@
 import crushling/crush/client
 import crushling/mcp
 import crushling/sandbox_http
+import crushling/sys
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
@@ -123,12 +124,6 @@ fn valid_key(key: String) -> Bool {
 @external(erlang, "crushling_ffi", "write_bytes")
 fn write_bytes(path: String, bytes: BitArray) -> Result(Nil, String)
 
-@external(erlang, "crushling_ffi", "list_dir")
-fn list_dir(path: String) -> Result(List(String), Nil)
-
-@external(erlang, "crushling_ffi", "uuid_v4")
-fn uuid_v4() -> String
-
 /// Keep `bytes` as the thread's file `id`, named `name`.
 pub fn store(
   root: String,
@@ -154,7 +149,7 @@ pub fn find(
     False -> Error(Nil)
     True -> {
       let dir = dir(root, key)
-      use names <- result.try(list_dir(dir))
+      use names <- result.try(sys.list_dir(dir))
       list.find_map(names, fn(entry) {
         case string.split_once(entry, "-") {
           Ok(#(found, name)) if found == id -> Ok(#(dir <> "/" <> entry, name))
@@ -169,7 +164,7 @@ pub fn find(
 fn new_id() -> String {
   "S"
   <> {
-    uuid_v4()
+    sys.uuid()
     |> string.replace("-", "")
     |> string.slice(0, 16)
     |> string.uppercase

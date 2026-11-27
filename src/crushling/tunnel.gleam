@@ -20,6 +20,7 @@
 //// opens it never answered are reissued under fresh ids, so a late dial
 //// for an old id is turned away rather than racing the new crush's dial.
 
+import crushling/key as thread_key
 import crushling/sandbox_http
 import crushling/sys
 import crushling/token
@@ -113,18 +114,15 @@ pub fn dial_url(base: String, key: String) -> String {
 /// Where a thread's shim listens: a short name in one directory, so the
 /// path's length doesn't depend on the key's and a unix socket fits it.
 pub fn shim_path(root: String, key: String) -> String {
-  shim_dir(root) <> "/" <> string.slice(sha256_hex(key), 0, 16) <> ".sock"
+  shim_dir(root) <> "/" <> string.slice(sys.sha256_hex(key), 0, 16) <> ".sock"
 }
 
 fn shim_dir(root: String) -> String {
   root <> "/s"
 }
 
-@external(erlang, "crushling_ffi", "sha256_hex")
-fn sha256_hex(data: String) -> String
-
-/// Whether shims under `root` fit a unix socket path. Check it at startup:
-/// `open` refuses every key otherwise.
+/// Whether shims under `root` fit a unix socket path. `start` refuses a
+/// root they don't fit.
 pub fn check_root(root: String) -> Result(Nil, String) {
   let path = shim_path(root, "key")
   let overhead = string.byte_size(path) - string.byte_size(root)
@@ -225,6 +223,7 @@ type State {
 /// Start the tunnels' actor. Serve them with `route`. Its listeners and
 /// control sockets stop if it does.
 pub fn start(config: Config) -> Result(Tunnels, String) {
+  use _ <- result.try(check_root(config.root))
   actor.new_with_initialiser(1000, fn(self) {
     let selector =
       process.new_selector()
@@ -251,44 +250,11 @@ pub fn start(config: Config) -> Result(Tunnels, String) {
 /// Returns the shim's path. Opening an open endpoint returns the same path.
 /// The key must be one path component of `A-Za-z0-9._-`, at most 64 long.
 pub fn open(tunnels: Tunnels, key: String) -> Result(String, String) {
-  use _ <- result.try(check_key(key))
-  let path = shim_path(tunnels.config.root, key)
-  use _ <- result.try(case string.byte_size(path) > max_socket_path {
-    True ->
-      Error(
-        "shim socket path is too long for a unix socket ("
-        <> int.to_string(string.byte_size(path))
-        <> " bytes, at most "
-        <> int.to_string(max_socket_path)
-        <> "): "
-        <> path,
-      )
-    False -> Ok(Nil)
-  })
-  process.call(tunnels.subject, 10_000, Open(key, _))
-}
-
-fn check_key(key: String) -> Result(Nil, String) {
-  let safe = fn(c) {
-    let c = string.utf_codepoint_to_int(c)
-    { c >= 0x41 && c <= 0x5A }
-    || { c >= 0x61 && c <= 0x7A }
-    || { c >= 0x30 && c <= 0x39 }
-    || c == 0x2E
-    || c == 0x5F
-    || c == 0x2D
-  }
-  let length = string.length(key)
-  case
-    key != "."
-    && key != ".."
-    && length >= 1
-    && length <= 64
-    && list.all(string.to_utf_codepoints(key), safe)
-  {
+  use _ <- result.try(case thread_key.is_valid(key) {
     True -> Ok(Nil)
     False -> Error("not a valid tunnel key: " <> string.inspect(key))
-  }
+  })
+  process.call(tunnels.subject, 10_000, Open(key, _))
 }
 
 /// Wait until the thread's crush has dialed in and said hello, returning
@@ -332,9 +298,6 @@ pub fn pending(tunnels: Tunnels, key: String) -> List(Int) {
   process.call(tunnels.subject, 5000, PendingIds(key, _))
 }
 
-@external(erlang, "crushling_ffi", "mkdir_p")
-fn mkdir_p(path: String) -> Result(Nil, String)
-
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   let config = state.config
   let update = fn(key, endpoint) {
@@ -351,7 +314,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
         found -> {
           let path = shim_path(config.root, key)
           let started = {
-            use _ <- result.try(mkdir_p(shim_dir(config.root)))
+            use _ <- result.try(sys.mkdir_p(shim_dir(config.root)))
             shim.start(path, config.write_timeout_ms, connection(
               state.self,
               config,

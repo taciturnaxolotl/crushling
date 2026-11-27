@@ -2,7 +2,6 @@ import crushling/crush/event
 import crushling/render
 import crushling/run
 import crushling/snapshot
-import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
@@ -30,10 +29,6 @@ fn tool_result(call_id: String, is_error: Bool) {
   )
 }
 
-fn file(path: String, content: String, version: Int) {
-  event.FileEvent(event.FileVersion("s1", path, content, version))
-}
-
 fn done(text: String, error: String, cancelled: Bool) {
   event.RunCompleteEvent(event.RunComplete(
     "s1",
@@ -46,11 +41,7 @@ fn done(text: String, error: String, cancelled: Bool) {
 }
 
 fn feed(events: List(event.Event)) -> run.Run {
-  feed_known(dict.new(), events)
-}
-
-fn feed_known(known: run.Known, events: List(event.Event)) -> run.Run {
-  list.fold(events, run.new("s1", "r1"), fn(r, e) { run.apply(r, known, e) })
+  list.fold(events, run.new("s1", "r1"), run.apply)
 }
 
 pub fn text_accumulates_across_messages_test() {
@@ -63,7 +54,7 @@ pub fn text_accumulates_across_messages_test() {
     ])
   // While the run goes, the latest message waits: it may be narration.
   let assert "Looking at it." = run.text(r)
-  let r = run.apply(r, dict.new(), done("Fixed.", "", False))
+  let r = run.apply(r, done("Fixed.", "", False))
   let assert "Looking at it.\n\nFixed." = run.text(r)
 }
 
@@ -81,7 +72,6 @@ pub fn narration_is_status_not_reply_test() {
   let r =
     run.apply(
       r,
-      dict.new(),
       assistant(
         "m2",
         "Crush starts in 2s; most of it waits on the network.",
@@ -90,7 +80,7 @@ pub fn narration_is_status_not_reply_test() {
     )
   // Not shown until the run ends: a tool call could still follow.
   let assert "" = run.text(r)
-  let r = run.apply(r, dict.new(), done("", "", False))
+  let r = run.apply(r, done("", "", False))
   let assert "Crush starts in 2s; most of it waits on the network." =
     run.text(r)
   let assert "" = run.narration(r)
@@ -145,36 +135,6 @@ pub fn outcomes_test() {
   let assert Some(run.Cancelled) = feed([done("", "", True)]).outcome
 }
 
-pub fn file_changes_test() {
-  let r =
-    feed([
-      file("/workspace/a.txt", "one\n", 0),
-      file("/workspace/a.txt", "two\n", 1),
-      file("/workspace/same.txt", "x\n", 0),
-      file("/workspace/b.txt", "new\n", 3),
-    ])
-  let assert [
-    run.Changed(
-      "a.txt",
-      "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-one\n+two\n",
-    ),
-    run.Unknown("b.txt"),
-  ] = run.changes(r, "/workspace")
-}
-
-pub fn known_baseline_carries_between_runs_test() {
-  let first =
-    feed([
-      file("/workspace/a.txt", "one\n", 0),
-      file("/workspace/a.txt", "two\n", 1),
-    ])
-  let known = run.remember(dict.new(), first)
-  let second = feed_known(known, [file("/workspace/a.txt", "three\n", 2)])
-  let assert [run.Changed("a.txt", _)] = run.changes(second, "/workspace")
-  let assert True =
-    string.contains(run.patch(second, "/workspace"), "-two\n+three\n")
-}
-
 pub fn plan_render_test() {
   let calls =
     list.map(["1", "2"], fn(i) {
@@ -220,11 +180,11 @@ pub fn plan_render_test() {
   ) = three
   let assert None = render.plan(feed([assistant("m", "hi", [])]), "/w")
 
-  let completed = run.apply(r, dict.new(), done("Working on it.", "", False))
+  let completed = run.apply(r, done("Working on it.", "", False))
   let assert Some(render.Plan("Done · 3 steps", [_, two, _])) =
     render.plan(completed, "/workspace")
   let assert render.Task(status: render.Complete, ..) = two
-  let failed = run.apply(r, dict.new(), done("", "boom", False))
+  let failed = run.apply(r, done("", "boom", False))
   let assert Some(render.Plan(
     "Failed · 3 steps",
     [_, render.Task(status: render.Failed, ..), _],
@@ -246,7 +206,7 @@ pub fn streamed_text_test() {
   // The latest message is the status until the run ends.
   let assert "Fixed." = render.progress_title(r)
   let assert "Looking at it." = render.reply(r)
-  let r = run.apply(r, dict.new(), done("", "", False))
+  let r = run.apply(r, done("", "", False))
   let assert "Looking at it.\n\nFixed." = render.reply(r)
   let assert ["Looking at it.\n\nFixed."] = render.answer(r)
 }
@@ -271,9 +231,9 @@ pub fn done_title_test() {
   let assert "On it." = render.progress_title(r)
   let assert "Working" = render.progress_title(feed([]))
   let assert "Done · 0 steps" =
-    render.progress_title(run.apply(r, dict.new(), done("On it.", "", False)))
+    render.progress_title(run.apply(r, done("On it.", "", False)))
   let assert "Stopped · 0 steps" =
-    render.progress_title(run.apply(r, dict.new(), done("", "", True)))
+    render.progress_title(run.apply(r, done("", "", True)))
 }
 
 pub fn a_failure_worked_around_is_not_a_badge_test() {
@@ -284,17 +244,17 @@ pub fn a_failure_worked_around_is_not_a_badge_test() {
     render.plan(r, "/w")
   // The agent carried on and finished, so the card doesn't keep Slack's
   // warning badge for the whole run.
-  let finished = run.apply(r, dict.new(), done("On it.", "", False))
+  let finished = run.apply(r, done("On it.", "", False))
   let assert Some(render.Plan(
     "Done · 1 step",
     [render.Task(status: render.Complete, ..)],
   )) = render.plan(finished, "/w")
   // A run that ends badly still says so, and so does one the user stopped:
   // the failure is the thing to look at.
-  let failed = run.apply(r, dict.new(), done("", "boom", False))
+  let failed = run.apply(r, done("", "boom", False))
   let assert Some(render.Plan(_, [render.Task(status: render.Failed, ..)])) =
     render.plan(failed, "/w")
-  let stopped = run.apply(r, dict.new(), done("", "", True))
+  let stopped = run.apply(r, done("", "", True))
   let assert Some(render.Plan(_, [render.Task(status: render.Failed, ..)])) =
     render.plan(stopped, "/w")
 }
@@ -423,6 +383,6 @@ pub fn tool_running_test() {
   let call = event.ToolCall("c1", "bash", "{\"command\":\"sleep 900\"}", True)
   let r = feed([assistant("m1", "Waiting on it.", [call])])
   let assert True = run.tool_running(r)
-  let r = run.apply(r, dict.new(), tool_result("c1", False))
+  let r = run.apply(r, tool_result("c1", False))
   let assert False = run.tool_running(r)
 }
