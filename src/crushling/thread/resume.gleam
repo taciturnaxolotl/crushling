@@ -14,6 +14,35 @@ import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/string
 
+/// What a thread keeps across reconnects. Sessions are stored in the
+/// sandbox's database, so a new actor for the same workspace finds the
+/// latest one; a dropped connection rejoins the workspace it left and
+/// replays the events it missed.
+pub type Resume {
+  Resume(
+    workspace_id: Option(String),
+    session_id: Option(String),
+    cursor: Cursor,
+  )
+}
+
+pub fn fresh() -> Resume {
+  Resume(workspace_id: None, session_id: None, cursor: new())
+}
+
+/// After joining `workspace_id` and its session `session_id`.
+pub fn joined(
+  resume: Resume,
+  workspace_id: String,
+  session_id: String,
+) -> Resume {
+  Resume(
+    ..resume,
+    workspace_id: Some(workspace_id),
+    session_id: Some(session_id),
+  )
+}
+
 pub type EventId {
   EventId(epoch: String, seq: Int)
 }

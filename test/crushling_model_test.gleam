@@ -13,7 +13,6 @@ import crushling/models
 import crushling/people
 import crushling/registry
 import crushling/registry/incoming as msg
-import crushling/render
 import crushling/sink
 import crushling/socket
 import crushling/store
@@ -413,16 +412,13 @@ fn start(
   let socket = socket_path(name)
   let server = start_server(socket)
   let seen = process.new_subject()
-  let post = fn(text) {
-    process.send(seen, Posted(text))
-    Ok("ts")
-  }
   let sink =
     sink.Sink(
       conversation: conversation.Conversation("C", Some("1.0")),
-      working: fn(_) { Nil },
-      title: fn(_) { Nil },
-      post:,
+      post: fn(text) {
+        process.send(seen, Posted(text))
+        Ok("ts")
+      },
       post_blocks: fn(_, blocks) {
         process.send(seen, Card(blocks))
         Ok("card")
@@ -435,16 +431,14 @@ fn start(
         process.send(seen, Deleted(ts))
         Ok(Nil)
       },
-      post_plan: fn(plan) { post(render.plan_markdown(plan)) },
-      update_plan: fn(_, _) { Ok(Nil) },
       reply: fn(_) {
         sink.Reply(show: fn(_, _, _) { Nil }, finish: fn(_) { [] })
       },
       upload: fn(_, _) { Ok(Nil) },
       branch: fn(_, _, _) { Error("no") },
-      open_code_channel: fn(_) { Error("no") },
-      context: fn(_) { Nil },
-      code: fn(_, _, _) { Nil },
+      session: None,
+      code_view: None,
+      open_code_channel: None,
     )
   let assert Ok(t) =
     thread.start(
@@ -453,7 +447,7 @@ fn start(
         root: "/work",
         title: "test",
         venue: venue.Thread,
-        sink:,
+        sink: fn(_) { sink },
         flush_ms: 60_000,
         mode: client.Yolo,
         notify: fn(notice) {

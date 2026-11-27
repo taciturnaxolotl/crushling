@@ -3,6 +3,7 @@
 //// The thread actor feeds events in and renders snapshots out.
 
 import crushling/crush/event.{type Event}
+import crushling/text
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/int
@@ -202,15 +203,12 @@ fn pick(input: String, names: List(String)) -> String {
   }
 }
 
-fn one_line(text: String, max: Int) -> String {
-  let line = case string.split_once(string.trim(text), "\n") {
+fn one_line(input: String, max: Int) -> String {
+  case string.split_once(string.trim(input), "\n") {
     Ok(#(first, _)) -> first <> " …"
-    Error(Nil) -> string.trim(text)
+    Error(Nil) -> input
   }
-  case string.length(line) > max {
-    True -> string.slice(line, 0, max - 1) <> "…"
-    False -> line
-  }
+  |> text.clip(max)
 }
 
 /// What the run says to the person: its messages, without narration

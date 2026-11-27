@@ -6,7 +6,8 @@
 import crushling/crush/client
 import crushling/gun
 import crushling/sys
-import gleam/erlang/process
+import crushling/thread/resume.{type Resume}
+import gleam/erlang/process.{type Pid}
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -24,16 +25,6 @@ pub type Connection {
     /// Whether the workspace joined before was still on the server: the
     /// same server, with everything it held in memory.
     reused: Bool,
-  )
-}
-
-/// Where a previous connection left off.
-pub type Resume {
-  Resume(
-    /// The workspace joined before, reused if the server still has it.
-    workspace_id: Option(String),
-    /// The id of the last event handled, to resume the event stream after.
-    last_event_id: Option(String),
   )
 }
 
@@ -59,24 +50,47 @@ const ready_attempts = 150
 
 const attach_timeout_ms = 15_000
 
+/// `open` in a process of its own, so a slow server never holds up the thread
+/// actor `owner`; `deliver` gets the result there. The process then stays to
+/// pass the event stream's messages on to `owner`, as gun sends them to the
+/// process that opened the stream.
+pub fn open_apart(
+  target: Target,
+  from: Resume,
+  owner: Pid,
+  deliver: fn(Result(Connection, String)) -> Nil,
+) -> Nil {
+  process.spawn_unlinked(fn() {
+    let opened = open(target, from)
+    deliver(opened)
+    case opened {
+      Ok(connection) -> relay(owner, [connection.requests, connection.events])
+      Error(_) -> Nil
+    }
+  })
+  Nil
+}
+
+@external(erlang, "crushling_relay_ffi", "relay")
+fn relay(owner: Pid, conns: List(gun.Conn)) -> Nil
+
 /// Connect to the server, join the workspace and open the event stream. Then
-/// use `session_id` if given, else the latest session, else a new one.
+/// use the session `from` names if any, else the latest session, else a
+/// new one.
 ///
-/// With a `resume`, a workspace the server still has is reused as it is: the
-/// agent is already set up and `session_id` is kept. Otherwise the workspace
-/// is created (or joined, as workspaces are deduplicated by path) and its agent
-/// initialised. Either way the event stream resumes after `last_event_id`,
-/// and a workspace the server re-created answers that with a resync.
+/// A workspace the server still has is reused as it is: the agent is
+/// already set up and the session is kept. Otherwise the workspace is
+/// created (or joined, as workspaces are deduplicated by path) and its agent
+/// initialised. Either way the event stream resumes after the last event
+/// handled, and a workspace the server re-created answers that with a resync.
 ///
 /// Returns only once the event stream is attached (its response was 200), so
 /// the connection is ready for prompts. Checking that a workspace exists does
 /// not hold it, so it can be gone by the time the stream attaches; the stream
 /// then answers 404, and the workspace is set up again in the same attempt.
-pub fn open(
-  target: Target,
-  session_id: Option(String),
-  resume: Resume,
-) -> Result(Connection, String) {
+pub fn open(target: Target, from: Resume) -> Result(Connection, String) {
+  let session_id = from.session_id
+  let last_event_id = resume.last(from.cursor)
   use requests <- result.try(gun.connect_unix(target.socket, 5000))
   use events <- result.try(
     gun.connect_unix(target.socket, 5000)
@@ -94,9 +108,9 @@ pub fn open(
     use #(workspace_id, reused) <- result.try(join(
       requests,
       target,
-      resume.workspace_id,
+      from.workspace_id,
     ))
-    case attach(events, target, workspace_id, resume.last_event_id), reused {
+    case attach(events, target, workspace_id, last_event_id), reused {
       Ok(stream), _ -> Ok(#(workspace_id, reused, stream))
       Error(client.Status(404, _)), True -> {
         use #(workspace_id, reused) <- result.try(join(requests, target, None))
@@ -104,7 +118,7 @@ pub fn open(
           events,
           target,
           workspace_id,
-          resume.last_event_id,
+          last_event_id,
         ))
         Ok(#(workspace_id, reused, stream))
       }
@@ -121,7 +135,7 @@ pub fn open(
       stream:,
       workspace_id:,
       session_id: "",
-      resumed: option.is_some(resume.last_event_id),
+      resumed: option.is_some(last_event_id),
       reused:,
     )
   let session = case reused, session_id {
@@ -221,6 +235,54 @@ pub fn call(
   client.perform(connection.requests, call)
 }
 
+/// How many background jobs the agent has running; unknown counts as none,
+/// as the agent is idle as far as anyone can tell.
+pub fn running_jobs(connection: Connection) -> Int {
+  call(
+    connection,
+    client.running_jobs(connection.workspace_id, connection.session_id),
+  )
+  |> result.unwrap(0)
+}
+
+/// Send a prompt to the session, to run as `run_id`.
+pub fn prompt(
+  connection: Connection,
+  run_id: String,
+  text: String,
+  attachments: List(client.Attachment),
+) -> Result(Nil, client.Error) {
+  call(
+    connection,
+    client.send_prompt_with(
+      workspace_id: connection.workspace_id,
+      session_id: connection.session_id,
+      run_id:,
+      prompt: text,
+      attachments:,
+    ),
+  )
+}
+
+/// Ask crush to cancel the session's run.
+pub fn cancel(connection: Connection) -> Nil {
+  let _ =
+    call(
+      connection,
+      client.cancel(connection.workspace_id, connection.session_id),
+    )
+  Nil
+}
+
+/// Whether the session is still running something; an error if crush can't
+/// say.
+pub fn busy(connection: Connection) -> Result(Bool, client.Error) {
+  call(
+    connection,
+    client.session_busy(connection.workspace_id, connection.session_id),
+  )
+}
+
 pub fn describe(error: client.Error) -> String {
   case error {
     client.Transport(reason) -> "transport: " <> reason
@@ -237,14 +299,43 @@ pub fn shell(
   target: Target,
   command: String,
 ) -> Result(String, Nil) {
+  run_shell(connection.requests, connection.workspace_id, target, command)
+}
+
+/// Run `job` in a process of its own, with a shell like `shell` on a
+/// connection of its own: slow commands then hold up neither the actor nor
+/// the requests it makes meanwhile.
+pub fn apart(
+  connection: Connection,
+  target: Target,
+  job: fn(fn(String) -> Result(String, Nil)) -> Nil,
+) -> Nil {
+  let workspace_id = connection.workspace_id
+  process.spawn_unlinked(fn() {
+    case gun.connect_unix(target.socket, 5000) {
+      Ok(requests) -> {
+        job(run_shell(requests, workspace_id, target, _))
+        gun.close(requests)
+      }
+      Error(reason) -> {
+        sys.warn("crushling: no connection for shell work: " <> reason)
+        job(fn(_) { Error(Nil) })
+      }
+    }
+  })
+  Nil
+}
+
+fn run_shell(
+  requests: gun.Conn,
+  workspace_id: String,
+  target: Target,
+  command: String,
+) -> Result(String, Nil) {
   let ran =
-    call(
-      connection,
-      client.shell(
-        workspace_id: connection.workspace_id,
-        scratch_session: target.scratch,
-        command:,
-      ),
+    client.perform(
+      requests,
+      client.shell(workspace_id:, scratch_session: target.scratch, command:),
     )
   case ran {
     Ok(#(0, output)) -> Ok(output)

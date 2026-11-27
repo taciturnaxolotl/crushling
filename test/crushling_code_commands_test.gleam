@@ -2,12 +2,11 @@
 //// answer from the repository.
 
 import crushling/commands
-import crushling/conversation
+import crushling/git
 import crushling/sink
 import crushling/thread/repo
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{None}
 import gleam/string
 import test_fs
 
@@ -79,7 +78,7 @@ pub fn parse_is_exact_test() {
 }
 
 /// A shell that answers each script by what it asks.
-fn shell(push_state: String, numstat: String) -> repo.Shell {
+fn shell(push_state: String, numstat: String) -> git.Shell {
   fn(script) {
     case
       string.contains(script, "rev-parse --abbrev-ref HEAD"),
@@ -125,7 +124,7 @@ fn run(
 fn tmp_dir() -> String
 
 /// A shell in `dir`, as the thread's sandbox is.
-fn real_shell(dir: String) -> repo.Shell {
+fn real_shell(dir: String) -> git.Shell {
   fn(script) {
     test_fs.write(dir <> "/.script.sh", script)
     case run("sh", [dir <> "/.script.sh"], [], dir, 20_000) {
@@ -135,24 +134,10 @@ fn real_shell(dir: String) -> repo.Shell {
   }
 }
 
-fn sink_recording(code: process.Subject(#(String, String))) -> sink.Sink {
-  sink.Sink(
-    conversation: conversation.Conversation("C", None),
-    working: fn(_) { Nil },
-    title: fn(_) { Nil },
-    post: fn(_) { Ok("1") },
-    post_blocks: fn(_, _) { Ok("1") },
-    update_blocks: fn(_, _, _) { Ok(Nil) },
-    delete: fn(_) { Ok(Nil) },
-    post_plan: fn(_) { Ok("1") },
-    update_plan: fn(_, _) { Ok(Nil) },
-    reply: fn(_) { sink.Reply(show: fn(_, _, _) { Nil }, finish: fn(_) { [] }) },
-    upload: fn(_, _) { Ok(Nil) },
-    branch: fn(_, _, _) { Error("no") },
-    open_code_channel: fn(_) { Error("no") },
-    context: fn(_) { Nil },
-    code: fn(diff, base, _) { process.send(code, #(diff, base)) },
-  )
+fn code_recording(code: process.Subject(#(String, String))) -> sink.CodeView {
+  sink.CodeView(context: fn(_) { Nil }, code: fn(diff, base, _) {
+    process.send(code, #(diff, base))
+  })
 }
 
 /// The Code tab shows every repository the agent changed, each path saying
@@ -167,9 +152,9 @@ pub fn code_tab_covers_every_changed_repo_test() {
   let assert Ok(_) = real_shell(dir)(setup)
   let work = dir <> "/work"
   let code = process.new_subject()
-  let tab = sink_recording(code)
+  let tab = code_recording(code)
   let shell = real_shell(work)
-  let info = repo.info(shell, "./wish")
+  let info = git.info(shell, "./wish")
   // Only the channel's own repository changed: plain paths, its base.
   test_fs.write(work <> "/wish/a.txt", "two\n")
   repo.show(shell, tab, "./wish", info)

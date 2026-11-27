@@ -8,6 +8,7 @@
 //// Everything here is pure; `crushling/slack` turns it into blocks.
 
 import crushling/run.{type Run}
+import crushling/text
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -83,7 +84,8 @@ fn rows(run: Run, root: String) -> List(Task) {
   list.map(run.tools, task(_, root, run.outcome))
 }
 
-fn steps(count: Int) -> String {
+/// "1 step", "5 steps".
+pub fn steps(count: Int) -> String {
   case count {
     1 -> "1 step"
     n -> int.to_string(n) <> " steps"
@@ -133,11 +135,35 @@ fn task(tool: run.Tool, root: String, outcome: Option(run.Outcome)) -> Task {
     |> clip
   // A described call reads as a sentence and needs nothing under it; a
   // generic title ("Reading a file") gets its argument as details.
-  let #(title, details) = case tool.description {
-    "" -> #(title(tool.name), arg)
-    description -> #(string.capitalise(clip(description)), "")
+  let details = case tool.description {
+    "" -> arg
+    _ -> ""
   }
-  Task(id: tool.id, title:, status:, details:, output: output(tool, status))
+  Task(
+    id: tool.id,
+    title: tool_title(tool),
+    status:,
+    details:,
+    output: output(tool, status),
+  )
+}
+
+/// A tool call's row title: what the agent said it is for, else what the
+/// tool does.
+pub fn tool_title(tool: run.Tool) -> String {
+  case tool.description {
+    "" -> title(tool.name)
+    description -> string.capitalise(clip(description))
+  }
+}
+
+/// How a whole run stands, as a row for it.
+pub fn run_status(run: Run) -> TaskStatus {
+  case run.outcome {
+    None -> InProgress
+    Some(run.Completed(_)) -> Complete
+    Some(_) -> Failed
+  }
 }
 
 /// What a tool is doing, in words rather than its name.
@@ -193,12 +219,8 @@ fn first_line(text: String) -> String {
   |> option.unwrap("")
 }
 
-fn clip(text: String) -> String {
-  let text = string.trim(text)
-  case string.length(text) > line_limit {
-    True -> string.slice(text, 0, line_limit - 1) <> "…"
-    False -> text
-  }
+fn clip(line: String) -> String {
+  text.clip(line, line_limit)
 }
 
 /// The reply as one piece of markdown: what the agent said, or, when it said
@@ -342,15 +364,10 @@ pub fn explain(reason: String) -> #(String, String) {
 
 /// The raw error, on one line and short, for a code span.
 fn clip_reason(reason: String) -> String {
-  let reason =
-    reason
-    |> string.replace("\n", " ")
-    |> string.replace("`", "'")
-    |> string.trim
-  case string.length(reason) > 200 {
-    True -> string.slice(reason, 0, 199) <> "…"
-    False -> reason
-  }
+  reason
+  |> string.replace("\n", " ")
+  |> string.replace("`", "'")
+  |> text.clip(200)
 }
 
 /// The same plan as plain markdown, for workspaces that reject plan blocks.

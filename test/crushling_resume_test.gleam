@@ -8,7 +8,6 @@ import crushling/conversation
 import crushling/crush/client
 import crushling/crush/event
 import crushling/gun
-import crushling/render
 import crushling/sink
 import crushling/thread
 import crushling/thread/resume
@@ -141,14 +140,10 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
   let sink =
     sink.Sink(
       conversation: conversation.Conversation("C", Some("1.0")),
-      working: fn(_) { Nil },
-      title: fn(_) { Nil },
       post:,
       post_blocks: fn(text, _) { post(text) },
       update_blocks: fn(_, _, _) { Ok(Nil) },
       delete: fn(_) { Ok(Nil) },
-      post_plan: fn(plan) { post(render.plan_markdown(plan)) },
-      update_plan: fn(_, _) { Ok(Nil) },
       reply: fn(_) {
         sink.Reply(
           show: fn(text, _, _) { process.send(seen, Shown(text)) },
@@ -160,9 +155,9 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
       },
       upload: fn(_, _) { Ok(Nil) },
       branch: fn(_, _, _) { Error("no") },
-      open_code_channel: fn(_) { Error("no") },
-      context: fn(_) { Nil },
-      code: fn(_, _, _) { Nil },
+      session: None,
+      code_view: None,
+      open_code_channel: None,
     )
   let assert Ok(t) =
     thread.start(
@@ -171,7 +166,7 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
         root: "/work",
         title: "test",
         venue: venue.Thread,
-        sink:,
+        sink: fn(_) { sink },
         flush_ms: 60_000,
         mode: client.Yolo,
         notify: fn(notice) {

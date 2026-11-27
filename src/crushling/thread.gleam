@@ -9,35 +9,40 @@
 ////
 //// The thread's `Venue` says where its work is. That is the Slack thread, or a
 //// code channel after the agent clones a repository. Only this actor changes
-//// the venue, and it changes the sink at the same time. It tells the registry
+//// the venue, and its sink always follows from it. It tells the registry
 //// about each change through `notify`.
+////
+//// Anything slow (connecting, scanning the workspace's repositories,
+//// reading their diffs) runs in a process of its own and reports back with
+//// an `Internal` message, so the actor stays free to answer.
 
 import crushling/conversation.{type Conversation}
 import crushling/crush/client
 import crushling/crush/event
+import crushling/git
 import crushling/gun
 import crushling/meta.{type ModelChoice}
 import crushling/models
 import crushling/pr
-import crushling/render
-import crushling/run.{type Run}
-import crushling/sink.{type Reply, type Sink}
-import crushling/snapshot
+import crushling/run
+import crushling/sink.{type Sink, type Surface}
 import crushling/sys
+import crushling/thread/channel
 import crushling/thread/conn.{type Connection}
+import crushling/thread/link.{type Link}
 import crushling/thread/model
-import crushling/thread/repo
+import crushling/thread/progress
 import crushling/thread/resume
+import crushling/thread/say
 import crushling/thread/subagents.{type Subagents}
+import crushling/thread/turn.{type Turn}
+import crushling/thread/workspace
 import crushling/venue.{type Venue}
-import gleam/erlang/process.{type Subject}
-import gleam/float
-import gleam/int
+import gleam/erlang/process.{type Subject, type Timer}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
-import gleam/string
 
 pub type Finished {
   Finished(
@@ -85,9 +90,11 @@ pub type Config {
     /// The workspace path as the server sees it, inside the sandbox.
     root: String,
     title: String,
-    /// Where the work starts. `sink` must post there.
+    /// Where the work starts.
     venue: Venue,
-    sink: Sink,
+    /// The sink for each venue (`slack.surface`): the thread posts through
+    /// the one for where its work is now.
+    sink: Surface,
     /// How often an in-progress message is re-rendered, in milliseconds.
     flush_ms: Int,
     /// Yolo skips permission prompts; sysadmin also lifts crush's block
@@ -155,6 +162,24 @@ pub type Message {
   /// Count the agent's running background jobs for the registry's idle
   /// check of `generation`; answered with `JobsRunning`.
   CountJobs(generation: Int)
+  /// What the thread's own helper processes report back.
+  Internal(Inner)
+}
+
+pub opaque type Inner {
+  /// A connection attempt made off the actor ended.
+  Connected(Result(Connection, String))
+  /// Cancel the run once the connection is back.
+  Recancel
+  /// A scan for a repository the agent changed ended, with what it found.
+  Scanned(Result(git.Found, Nil))
+}
+
+/// The scan for a changed repository, run off the actor. Changes that come
+/// in while one runs are looked at by one more scan, not one each.
+type Scan {
+  Idle
+  Scanning(again: Bool)
 }
 
 type Queued {
@@ -167,55 +192,25 @@ type Queued {
   )
 }
 
-type Active {
-  Active(
-    run: Run,
-    /// The reply, once there is something to show.
-    reply: Option(Reply),
-    /// What the run said in the thread before it moved to a code channel. The
-    /// reply in the channel starts after this text.
-    said_before: String,
-    /// The workspace snapshot taken just before the prompt was sent.
-    base: Option(String),
-    /// When the session was last marked as working. Slack clears that after an
-    /// hour, so a long run marks it again.
-    working_since_ms: Int,
-    last_event_ms: Int,
-    /// Whether the stall note has been posted for this run.
-    stalled: Bool,
-    /// Said in place of "stopped" when the run was cancelled for a reason.
-    cancel_note: Option(String),
-    /// False for a turn crush started on its own to read a subagent report.
-    solicited: Bool,
-    /// Who the reply is for.
-    from: String,
-  )
-}
-
 type State {
   State(
     config: Config,
     self: Subject(Message),
     target: conn.Target,
-    connection: Option(Connection),
-    /// Kept across reconnects. Sessions are stored in the sandbox's database,
-    /// so a new actor for the same workspace finds the latest one.
-    session_id: Option(String),
-    /// The workspace joined last, kept across reconnects so a dropped
-    /// connection rejoins it instead of setting up a new one.
-    workspace_id: Option(String),
-    /// Where the event stream left off, kept across reconnects so a new
-    /// stream replays what the old one missed.
-    cursor: resume.Cursor,
+    link: Link,
+    resume: resume.Resume,
     venue: Venue,
-    sink: Sink,
     waiting: List(Queued),
     /// Who sent the latest prompt, for turns crush starts on its own.
     requester: String,
-    active: Option(Active),
-    flushing: Bool,
+    turn: Option(Turn),
+    /// Messages that need the connection, held while it comes up; newest
+    /// first.
+    deferred: List(Message),
+    scan: Scan,
+    /// The pending re-render, if one is scheduled.
+    flush: Option(Timer),
     subs: Subagents,
-    retries: Int,
     /// Whether the Slack session has its title.
     titled: Bool,
     /// What the thread is about, as crush titled its session: a code
@@ -223,6 +218,8 @@ type State {
     topic: String,
     /// The busy state last sent to the registry.
     reported_busy: Bool,
+    /// Where the session is shown as working, if anywhere.
+    working_in: Option(Sink),
     /// The model picked for the thread, pinned on every connect.
     model: Option(ModelChoice),
     /// The connected server's model catalog, once fetched.
@@ -230,32 +227,7 @@ type State {
   )
 }
 
-const max_retries = 8
-
-/// With no event from the agent for this long, say so in the thread.
-const stall_ms = 600_000
-
 const watchdog_ms = 60_000
-
-/// Slack drops a session out of working after an hour; mark it again well
-/// before.
-const rework_ms = 1_800_000
-
-/// A patch bigger than this is not attached; Slack won't preview it, and a
-/// change that size is better read in the workspace.
-const max_patch_bytes = 400_000
-
-/// Make a session title from the first line of a prompt, cut to 60 characters.
-fn session_title(prompt: String) -> String {
-  let line = case string.split_once(string.trim(prompt), "\n") {
-    Ok(#(first, _)) -> first
-    Error(Nil) -> string.trim(prompt)
-  }
-  case string.length(line) > 60 {
-    True -> string.slice(line, 0, 59) <> "…"
-    False -> line
-  }
-}
 
 pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
   actor.new_with_initialiser(1000, fn(self) {
@@ -275,21 +247,20 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
         client_id: sys.uuid(),
         scratch: sys.uuid(),
       ),
-      connection: None,
-      session_id: None,
-      workspace_id: None,
-      cursor: resume.new(),
+      link: link.new(),
+      resume: resume.fresh(),
       venue: config.venue,
-      sink: config.sink,
       waiting: [],
       requester: "",
-      active: None,
-      flushing: False,
+      turn: None,
+      deferred: [],
+      scan: Idle,
+      flush: None,
       subs: subagents.new(),
-      retries: 0,
       titled: False,
       topic: "",
       reported_busy: False,
+      working_in: None,
       model: config.model,
       catalog: None,
     )
@@ -306,14 +277,13 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
     Stop -> {
-      case state.active {
-        Some(active) -> {
-          close_reply(state.sink, state.config.root, state.subs, active, "")
-          state.sink.working(False)
-        }
+      case state.turn {
+        Some(turn) -> close_reply(state, turn, "")
         None -> Nil
       }
-      case state.connection {
+      let _ = show_working(state, False)
+      // An attempt still under way closes itself once it finds the actor gone.
+      case connection(state) {
         Some(connection) -> conn.retire(connection, state.target)
         None -> Nil
       }
@@ -324,8 +294,44 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
 }
 
 fn step(state: State, message: Message) -> State {
+  case needs_link(message) && link.awaiting(state.link) {
+    True -> State(..state, deferred: [message, ..state.deferred])
+    False -> dispatch(state, message)
+  }
+}
+
+/// Whether a message is about the agent, so it waits for the connection
+/// instead of failing while one is coming up.
+fn needs_link(message: Message) -> Bool {
+  case message {
+    Info(_)
+    | Propose(..)
+    | OpenCodeChannel(..)
+    | ModelCommand(..)
+    | CardPicked(..)
+    | CountJobs(_)
+    | Internal(Recancel) -> True
+    _ -> False
+  }
+}
+
+/// Handle what was held for the connection, oldest first.
+fn replay(state: State) -> State {
+  list.fold(list.reverse(state.deferred), State(..state, deferred: []), step)
+}
+
+fn dispatch(state: State, message: Message) -> State {
   case message {
     Setup | Reconnect -> connect(state)
+    Internal(Connected(result)) -> connected(state, result)
+    Internal(Recancel) -> {
+      case connection(state), state.turn {
+        Some(connection), Some(_) -> conn.cancel(connection)
+        _, _ -> Nil
+      }
+      state
+    }
+    Internal(Scanned(found)) -> scanned(state, found)
     Prompt(text, attachments, from) ->
       State(
         ..state,
@@ -333,24 +339,15 @@ fn step(state: State, message: Message) -> State {
           Queued(text, attachments, from, sys.monotonic_ms()),
         ]),
       )
+      // Shown as working now, so a send that fails is shown as done again.
+      |> report
       |> send_next
     Where(reply) -> {
-      process.send(reply, Location(state.sink.conversation, state.config.root))
+      process.send(reply, Location(here(state).conversation, state.config.root))
       state
     }
     Info(reply) -> {
-      let dir = case state.venue {
-        venue.CodeChannel(repo:, ..)
-        | venue.ThreadOnly(repo:)
-        | venue.Archived(repo:) -> repo
-        venue.Thread -> ""
-      }
-      process.send(reply, case dir, state.connection {
-        "", _ -> "_No repository here yet._"
-        _, None ->
-          "_The agent is asleep; send a message to wake it, then ask again._"
-        dir, Some(_) -> repo.status(shell(state), dir)
-      })
+      info(state, reply)
       state
     }
     Propose(title:, body:, answer:) -> {
@@ -358,14 +355,11 @@ fn step(state: State, message: Message) -> State {
       state
     }
     Requester(reply) -> {
-      process.send(reply, case state.active {
-        Some(active) if active.from != "" -> active.from
-        _ -> state.requester
-      })
+      process.send(reply, reader(state))
       state
     }
     Say(text, reply) -> {
-      process.send(reply, state.sink.post(text))
+      process.send(reply, here(state).post(text))
       state
     }
     OpenCodeChannel(name, dir, reply) -> {
@@ -374,7 +368,7 @@ fn step(state: State, message: Message) -> State {
       state
     }
     Cancel(note) -> cancel(state, note)
-    Flush -> flush(State(..state, flushing: False))
+    Flush -> flush(State(..state, flush: None))
     Watchdog -> watchdog(state)
     Gun(message) -> on_gun(state, message)
     ModelCommand(request, user) ->
@@ -382,16 +376,8 @@ fn step(state: State, message: Message) -> State {
     CardPicked(pick, card_ts, user) ->
       with_model(state, model.pick(_, pick, card_ts, user))
     CountJobs(generation) -> {
-      // Unknown counts as none: the agent is idle as far as anyone can tell.
-      let running = case state.connection {
-        Some(connection) ->
-          conn.call(
-            connection,
-            client.running_jobs(connection.workspace_id, connection.session_id),
-          )
-          |> result.unwrap(0)
-        None -> 0
-      }
+      let running =
+        connection(state) |> option.map(conn.running_jobs) |> option.unwrap(0)
       state.config.notify(JobsRunning(generation:, running:))
       state
     }
@@ -399,23 +385,46 @@ fn step(state: State, message: Message) -> State {
   }
 }
 
-/// Tell the registry when the thread starts or stops being busy.
+/// The sink for where the work is now.
+fn here(state: State) -> Sink {
+  state.config.sink(state.venue)
+}
+
+/// Who the agent works for: whoever asked for the turn under way, else
+/// whoever asked last.
+fn reader(state: State) -> String {
+  option.then(state.turn, turn.asker) |> option.unwrap(state.requester)
+}
+
+/// Tell the registry when the thread starts or stops being busy, and show
+/// the session as working exactly while it is.
 fn report(state: State) -> State {
   let busy =
-    state.active != None || state.waiting != [] || subagents.running(state.subs)
-  case busy == state.reported_busy {
+    state.turn != None || state.waiting != [] || subagents.running(state.subs)
+  let state = case busy == state.reported_busy {
     True -> state
     False -> {
       state.config.notify(Activity(busy))
       State(..state, reported_busy: busy)
     }
   }
+  show_working(state, busy)
+}
+
+fn show_working(state: State, busy: Bool) -> State {
+  State(..state, working_in: sink.mark(state.working_in, here(state), busy))
+}
+
+/// Mark the session working again on the next report: Slack drops the mark
+/// after an hour.
+fn remark(state: State) -> State {
+  State(..state, working_in: None)
 }
 
 fn parent(state: State) -> subagents.Parent {
   subagents.Parent(
-    session_id: option.unwrap(state.session_id, ""),
-    sink: state.sink,
+    session_id: option.unwrap(state.resume.session_id, ""),
+    sink: here(state),
     root: state.config.root,
     threads: case state.venue {
       venue.CodeChannel(..) -> True
@@ -425,26 +434,38 @@ fn parent(state: State) -> subagents.Parent {
 }
 
 fn cancel(state: State, note: Option(String)) -> State {
-  subagents.close(state.subs, case note {
-    Some(note) -> "_" <> note <> "_"
-    None -> ""
-  })
-  case state.connection, state.active {
-    Some(connection), Some(active) -> {
-      let _ =
-        conn.call(
-          connection,
-          client.cancel(connection.workspace_id, connection.session_id),
-        )
-      let active = Active(..active, cancel_note: note)
-      State(..state, waiting: [], active: Some(active))
-    }
-    _, _ -> State(..state, waiting: [])
+  subagents.close(state.subs, option.map(note, say.aside) |> option.unwrap(""))
+  case state.turn {
+    Some(turn) ->
+      State(
+        ..state,
+        waiting: [],
+        turn: Some(turn.Turn(..turn, stop_note: note)),
+      )
+      |> step(Internal(Recancel))
+    None -> State(..state, waiting: [])
   }
 }
 
+// Connection ------------------------------------------------------------------
+
+fn connection(state: State) -> Option(Connection) {
+  link.connection(state.link)
+}
+
 /// Connect (or reconnect) to the server, join the workspace, open the event
-/// stream, and get a session.
+/// stream, and get a session, all off the actor; `connected` takes it from
+/// there.
+fn connect(state: State) -> State {
+  let self = state.self
+  let link =
+    link.connect(state.link, state.target, state.resume, fn(result) {
+      process.send(self, Internal(Connected(result)))
+    })
+  State(..state, link:)
+}
+
+/// A connection attempt ended.
 ///
 /// A reconnect rejoins the same workspace when the server still has it, and
 /// resumes the event stream after the last event handled. The server then
@@ -455,56 +476,44 @@ fn cancel(state: State, note: Option(String)) -> State {
 ///
 /// `conn.open` returns once the event stream is attached, so queued prompts
 /// are only sent, and an orphaned run only settled, on a ready connection.
-fn connect(state: State) -> State {
-  close_connection(state)
-  let state = State(..state, connection: None)
-  let resume =
-    conn.Resume(
-      workspace_id: state.workspace_id,
-      last_event_id: resume.last(state.cursor),
-    )
-  case conn.open(state.target, state.session_id, resume) {
-    Ok(connection) -> {
+fn connected(state: State, result: Result(Connection, String)) -> State {
+  let #(link, attempted) = link.attempted(state.link, result)
+  let state = State(..state, link:)
+  case attempted {
+    link.Joined(connection) -> {
       state.config.on_connect(connection.events)
+      let resume =
+        resume.joined(
+          state.resume,
+          connection.workspace_id,
+          connection.session_id,
+        )
+      let state = State(..state, resume:)
       // Reaching a server that may be new (the workspace wasn't still on
       // it), the catalog may differ and any pin is gone: pin the thread's
       // choice again. The same server still has both.
       let state = case connection.reused {
-        True -> State(..state, connection: Some(connection))
+        True -> state
         False ->
-          State(..state, connection: Some(connection), catalog: None)
+          State(..state, catalog: None)
           |> with_model(model.restore(_, state.model))
       }
-      let state =
-        State(
-          ..state,
-          connection: Some(connection),
-          session_id: Some(connection.session_id),
-          workspace_id: Some(connection.workspace_id),
-          retries: 0,
-        )
       case connection.resumed {
         True -> state
         False -> settle_orphan(state, connection)
       }
+      |> replay
       |> send_next
     }
-    Error(reason) -> {
-      sys.warn("crushling: connect failed: " <> reason)
-      case state.retries >= max_retries {
-        True -> {
-          state.config.notify(Lost)
-          fail_everything(
-            state,
-            "The agent stopped unexpectedly (its sandbox may have run out of memory), so this run is over. Send a message to start it again; the workspace is kept.",
-          )
-        }
-        False -> {
-          process.send_after(state.self, conn.backoff(state.retries), Reconnect)
-          State(..state, retries: state.retries + 1)
-        }
-      }
+    link.Retry(after_ms:) -> {
+      process.send_after(state.self, after_ms, Reconnect)
+      state
     }
+    link.GaveUp -> {
+      state.config.notify(Lost)
+      replay(state) |> fail_everything(say.lost)
+    }
+    link.Stale -> state
   }
 }
 
@@ -512,22 +521,50 @@ fn connect(state: State) -> State {
 /// `run_complete` may have been missed is finished with what was seen, unless
 /// the session is still busy.
 fn settle_orphan(state: State, connection: Connection) -> State {
-  case state.active {
+  case state.turn {
     None -> state
-    Some(active) ->
-      case
-        conn.call(
-          connection,
-          client.session_busy(connection.workspace_id, connection.session_id),
-        )
-      {
+    Some(current) ->
+      case conn.busy(connection) {
         Ok(True) -> state
         _ -> {
           let outcome = run.Errored("lost the connection mid-run")
-          let run = run.Run(..active.run, outcome: Some(outcome))
-          finish_if_done(State(..state, active: Some(Active(..active, run:))))
+          let run = run.Run(..current.run, outcome: Some(outcome))
+          State(..state, turn: Some(turn.Turn(..current, run:)))
+          |> finish_if_done
         }
       }
+  }
+}
+
+fn on_gun(state: State, message: gun.Message) -> State {
+  case link.hear(state.link, message), connection(state) {
+    link.Event(sse), Some(connection) -> on_sse(state, connection, sse)
+    link.Dropped, _ -> {
+      process.send(state.self, Reconnect)
+      State(..state, link: link.drop(state.link))
+    }
+    _, _ -> state
+  }
+}
+
+/// Handle an event from the stream, once. An event with an id that was
+/// already handled, before a drop or earlier in a replay, is skipped.
+fn on_sse(state: State, connection: Connection, sse: gun.SseEvent) -> State {
+  case event.parse(sse.data) {
+    Ok(event.Resync(reason:, ..)) -> {
+      sys.warn("crushling: event stream could not resume: " <> reason)
+      let cursor = resume.resynced(state.resume.cursor, sse.id)
+      State(..state, resume: resume.Resume(..state.resume, cursor:))
+      |> settle_orphan(connection)
+    }
+    parsed -> {
+      let #(fresh, cursor) = resume.admit(state.resume.cursor, sse.id)
+      let state = State(..state, resume: resume.Resume(..state.resume, cursor:))
+      case fresh, parsed {
+        True, Ok(parsed) -> on_event(state, parsed)
+        _, _ -> state
+      }
+    }
   }
 }
 
@@ -536,43 +573,44 @@ fn settle_orphan(state: State, connection: Connection) -> State {
 /// Run a `thread/model` step on the connection, then keep what it found and
 /// tell the registry about a changed choice.
 fn with_model(state: State, step: fn(model.Context) -> model.Done) -> State {
-  let done =
-    model.run(
-      state.connection,
-      state.sink,
+  let #(catalog, model, changed) =
+    model.choose(
+      connection(state),
+      here(state),
       state.config.home,
       state.catalog,
+      state.model,
       step,
     )
-  let choice = model.apply(done.change, state.model)
-  case choice == state.model {
-    True -> Nil
-    False -> state.config.notify(ModelChosen(choice))
+  case changed {
+    True -> state.config.notify(ModelChosen(model))
+    False -> Nil
   }
-  State(..state, catalog: done.catalog, model: choice)
+  State(..state, catalog:, model:)
 }
 
+// Turns -----------------------------------------------------------------------
+
 fn fail_everything(state: State, reason: String) -> State {
-  let note = "_" <> reason <> "_"
-  case state.waiting, state.active {
-    [], None -> Nil
+  let note = say.aside(reason)
+  let open =
+    option.then(state.turn, fn(current) {
+      turn.reply(current) |> option.map(fn(_) { current })
+    })
+  case state.waiting, state.turn, open {
+    [], None, _ -> Nil
     // An open reply ends with the note instead.
-    _, Some(Active(reply: Some(_), ..) as active) ->
-      close_reply(state.sink, state.config.root, state.subs, active, note)
-    _, _ -> {
-      let _ = state.sink.post(note)
+    _, _, Some(current) -> close_reply(state, current, note)
+    _, _, None -> {
+      let _ = here(state).post(note)
       Nil
     }
   }
-  case state.waiting, state.active {
-    [], None -> Nil
-    _, _ -> state.sink.working(False)
-  }
-  State(..state, waiting: [], active: None)
+  State(..state, waiting: [], turn: None)
 }
 
 fn send_next(state: State) -> State {
-  case state.active, state.connection, state.waiting {
+  case state.turn, connection(state), state.waiting {
     None, Some(connection), [next, ..rest] ->
       send_prompt(State(..state, waiting: rest), connection, next)
     _, _, _ -> state
@@ -581,40 +619,21 @@ fn send_next(state: State) -> State {
 
 fn send_prompt(state: State, connection: Connection, next: Queued) -> State {
   let run_id = sys.uuid()
-  let base = take_snapshot(state)
-  let sent =
-    conn.call(
-      connection,
-      client.send_prompt_with(
-        workspace_id: connection.workspace_id,
-        session_id: connection.session_id,
-        run_id:,
-        prompt: next.text,
-        attachments: next.attachments,
-      ),
-    )
-  case sent {
+  let base = workspace.snapshot(shell(state))
+  let prepared = sys.monotonic_ms()
+  case conn.prompt(connection, run_id, next.text, next.attachments) {
     Ok(Nil) -> {
-      sys.info(
-        "crushling: "
-        <> state.config.title
-        <> ": prompt sent "
-        <> int.to_string(sys.monotonic_ms() - next.at_ms)
-        <> "ms after it reached the thread",
-      )
-      state.sink.working(True)
       case state.titled {
         True -> Nil
-        False -> state.sink.title(session_title(next.text))
+        False -> sink.title(here(state), say.session_title(next.text))
       }
       process.send_after(state.self, watchdog_ms, Watchdog)
-      let active =
-        Active(
-          ..new_active(run.new(connection.session_id, run_id), next.from, True),
-          base:,
-        )
+      let run = run.new(connection.session_id, run_id)
+      let sent_ms = sys.monotonic_ms()
+      let started =
+        turn.asked(run, next.from, base, next.at_ms, prepared, sent_ms)
       let state =
-        State(..state, titled: True, requester: next.from, active: Some(active))
+        State(..state, titled: True, requester: next.from, turn: Some(started))
       // `!done` archived the last code channel. Open a new one for the same
       // repository.
       case state.venue {
@@ -627,104 +646,16 @@ fn send_prompt(state: State, connection: Connection, next: Queued) -> State {
       State(..state, waiting: [next, ..state.waiting])
     }
     Error(error) -> {
-      let _ =
-        state.sink.post(
-          "_couldn't send that to the agent: " <> conn.describe(error) <> "_",
-        )
-      // The registry marked the thread working when the message arrived.
-      let state = send_next(state)
-      case state.active, state.waiting {
-        None, [] -> state.sink.working(False)
-        _, _ -> Nil
-      }
-      state
+      let _ = here(state).post(say.not_sent(conn.describe(error)))
+      send_next(state)
     }
   }
-}
-
-fn new_active(run: Run, from: String, solicited: Bool) -> Active {
-  let now = sys.monotonic_ms()
-  Active(
-    run:,
-    reply: None,
-    said_before: "",
-    base: None,
-    working_since_ms: now,
-    last_event_ms: now,
-    stalled: False,
-    cancel_note: None,
-    solicited:,
-    from:,
-  )
-}
-
-fn shell(state: State) -> repo.Shell {
-  fn(command) {
-    case state.connection {
-      Some(connection) -> conn.shell(connection, state.target, command)
-      None -> Error(Nil)
-    }
-  }
-}
-
-fn take_snapshot(state: State) -> Option(String) {
-  shell(state)(snapshot.take())
-  |> result.try(snapshot.parse_tree)
-  |> option.from_result
-}
-
-fn on_gun(state: State, message: gun.Message) -> State {
-  case state.connection {
-    None -> state
-    Some(connection) ->
-      case message {
-        gun.Event(stream:, event: sse, ..) if stream == connection.stream ->
-          on_sse(state, connection, sse)
-        gun.StreamEnd(stream:, ..)
-          | gun.StreamError(stream:, ..)
-          if stream == connection.stream
-        -> reconnect_soon(state)
-        gun.ConnDown(conn:, reason:)
-          if conn == connection.events || conn == connection.requests
-        -> {
-          sys.warn("crushling: connection down: " <> reason)
-          reconnect_soon(state)
-        }
-        _ -> state
-      }
-  }
-}
-
-/// Handle an event from the stream, once. An event with an id that was
-/// already handled, before a drop or earlier in a replay, is skipped.
-fn on_sse(state: State, connection: Connection, sse: gun.SseEvent) -> State {
-  case event.parse(sse.data) {
-    Ok(event.Resync(reason:, ..)) -> {
-      sys.warn("crushling: event stream could not resume: " <> reason)
-      State(..state, cursor: resume.resynced(state.cursor, sse.id))
-      |> settle_orphan(connection)
-    }
-    parsed -> {
-      let #(fresh, cursor) = resume.admit(state.cursor, sse.id)
-      let state = State(..state, cursor:)
-      case fresh, parsed {
-        True, Ok(parsed) -> on_event(state, parsed)
-        _, _ -> state
-      }
-    }
-  }
-}
-
-fn reconnect_soon(state: State) -> State {
-  close_connection(state)
-  process.send(state.self, Reconnect)
-  State(..state, connection: None)
 }
 
 fn on_event(state: State, event: event.Event) -> State {
   let state = case event {
     event.SessionEvent(id:, title:, ..)
-      if Some(id) == state.session_id
+      if Some(id) == state.resume.session_id
       && title != ""
       && title != "New Agent Session"
     -> State(..state, topic: title)
@@ -733,29 +664,22 @@ fn on_event(state: State, event: event.Event) -> State {
   let state =
     State(..state, subs: subagents.track(state.subs, parent(state), event))
     |> adopt_report_turn(event)
-  let state = case state.active {
+  let state = case state.turn {
     None -> state
-    Some(active) -> {
-      let run = run.apply(active.run, event)
-      let now = sys.monotonic_ms()
-      // The agent is back after a stall note: a later stall gets a note
-      // of its own.
-      let active = case active.stalled {
-        True -> Active(..active, stalled: False)
-        False -> active
-      }
-      let active = Active(..active, run:, last_event_ms: now)
-      State(..state, active: Some(active))
+    Some(current) ->
+      State(
+        ..state,
+        turn: Some(turn.observe(current, event, sys.monotonic_ms())),
+      )
       |> move_on_change(event)
       |> finish_if_done
-    }
   }
-  case state.active != None || subagents.running(state.subs), state.flushing {
-    False, _ | _, True -> state
-    True, False -> {
-      process.send_after(state.self, state.config.flush_ms, Flush)
-      State(..state, flushing: True)
+  case state.turn != None || subagents.running(state.subs), state.flush {
+    True, None -> {
+      let timer = process.send_after(state.self, state.config.flush_ms, Flush)
+      State(..state, flush: Some(timer))
     }
+    _, _ -> state
   }
 }
 
@@ -763,17 +687,146 @@ fn on_event(state: State, event: event.Event) -> State {
 /// and nothing is running. That turn carries no run id of ours, so adopt it
 /// as an unsolicited run when its report message appears.
 fn adopt_report_turn(state: State, event: event.Event) -> State {
-  let parent = option.unwrap(state.session_id, "")
-  case state.active, event {
+  let parent = option.unwrap(state.resume.session_id, "")
+  case state.turn, event {
     None, event.MessageEvent(op: "created", message:)
       if message.session_id == parent && message.reports != []
     -> {
-      state.sink.working(True)
       process.send_after(state.self, watchdog_ms, Watchdog)
       let run = run.new(message.session_id, "")
-      State(..state, active: Some(new_active(run, state.requester, False)))
+      State(..state, turn: Some(turn.report(run, sys.monotonic_ms())))
     }
     _, _ -> state
+  }
+}
+
+fn finish_if_done(state: State) -> State {
+  case state.turn {
+    Some(current) ->
+      case run.is_done(current.run) {
+        True -> {
+          finish(state, current)
+          State(..state, turn: None)
+          |> send_next
+        }
+        False -> state
+      }
+    None -> state
+  }
+}
+
+fn finish(state: State, current: Turn) -> Nil {
+  let patch = patch_for(state, current)
+  // The reply ends the run. It holds what the agent said and its steps; what
+  // changed is in the Code tab, or the patch attached below.
+  let reply_ts = progress.end(place(state), current)
+  case patch {
+    Some(patch) -> progress.attach(here(state), current.run.run_id, patch)
+    None -> Nil
+  }
+  case turn.timings(turn.finished(current, sys.monotonic_ms())) {
+    Some(timings) ->
+      sys.info("crushling: " <> state.config.title <> ": turn " <> timings)
+    None -> Nil
+  }
+  state.config.notify(
+    RunEnded(Finished(solicited: turn.solicited(current), reply_ts:)),
+  )
+}
+
+/// The patch to attach for the run, if any. A code channel's Code tab shows
+/// the diff instead, so it gets none.
+fn patch_for(state: State, current: Turn) -> Option(String) {
+  case state.venue {
+    venue.CodeChannel(repo: dir, ..) -> {
+      show_code(state, here(state), dir, None)
+      None
+    }
+    at -> {
+      let base = case current.origin {
+        turn.Asked(base:, ..) -> base
+        turn.ReportTurn -> None
+      }
+      workspace.patch(shell(state), at, base, current.run.run_id)
+    }
+  }
+}
+
+// Showing the turn ------------------------------------------------------------
+
+/// Re-render the in-progress run if it changed since it was last shown.
+fn flush(state: State) -> State {
+  let state = State(..state, subs: subagents.show(state.subs, parent(state)))
+  let state = case state.turn {
+    Some(current) ->
+      State(..state, turn: Some(progress.show(place(state), current)))
+    None -> state
+  }
+  // Keep flushing while subagents work after the main run has ended.
+  case state.turn == None && subagents.running(state.subs) {
+    True -> {
+      let timer =
+        process.send_after(state.self, state.config.flush_ms * 2, Flush)
+      State(..state, flush: Some(timer))
+    }
+    False -> state
+  }
+}
+
+fn watchdog(state: State) -> State {
+  case state.turn {
+    None -> state
+    Some(current) -> {
+      process.send_after(state.self, watchdog_ms, Watchdog)
+      let #(current, tick) = turn.tick(current, sys.monotonic_ms())
+      let state = State(..state, turn: Some(current))
+      case tick {
+        turn.Quiet -> state
+        turn.Rework -> remark(state)
+        // Still shown as working: the run hasn't ended, and Slack's Stop
+        // button is the easiest way to end it.
+        turn.Stall -> {
+          let _ = here(state).post(say.stalled)
+          remark(state)
+        }
+      }
+    }
+  }
+}
+
+fn place(state: State) -> progress.Place {
+  progress.Place(here(state), state.config.root, state.subs, reader(state))
+}
+
+fn close_reply(state: State, current: Turn, note: String) -> Nil {
+  progress.close(place(state), current, note)
+}
+
+// The workspace ---------------------------------------------------------------
+
+fn shell(state: State) -> git.Shell {
+  workspace.shell(connection(state), state.target)
+}
+
+fn show_code(
+  state: State,
+  sink: Sink,
+  dir: String,
+  info: Option(git.RepoInfo),
+) -> Nil {
+  case connection(state), sink.code_view {
+    Some(connection), Some(view) ->
+      workspace.show_code(connection, state.target, view, dir, info)
+    _, _ -> Nil
+  }
+}
+
+fn info(state: State, reply: Subject(String)) -> Nil {
+  case venue.repo(state.venue), connection(state) {
+    None, _ -> process.send(reply, say.no_repo)
+    _, None -> process.send(reply, say.asleep)
+    Some(dir), Some(connection) ->
+      workspace.status(connection, state.target, dir, process.send(reply, _))
   }
 }
 
@@ -781,30 +834,37 @@ fn adopt_report_turn(state: State, event: event.Event) -> State {
 /// file in it, or commits), move the work to a code channel for it.
 /// Cloning to read, as for a review, keeps the work in the thread.
 fn move_on_change(state: State, event: event.Event) -> State {
-  case state.venue, state.active, event {
-    venue.Thread, Some(active), event.MessageEvent(message:, ..)
-      if message.role == event.Tool
-    -> {
-      let changing =
-        list.any(message.tool_results, fn(result) {
-          !result.is_error
-          && list.any(active.run.tools, fn(tool) {
-            tool.id == result.tool_call_id
-            && list.contains(["bash", "edit", "multiedit", "write"], tool.name)
-          })
-        })
-      case changing {
-        False -> state
-        True ->
-          case
-            shell(state)(snapshot.changed_repo()) |> result.map(string.trim)
-          {
-            Ok("") | Error(Nil) -> state
-            Ok(dir) -> move(state, dir, "").0
-          }
+  case state.venue, state.turn, event {
+    venue.Thread, Some(current), event.MessageEvent(message:, ..) ->
+      case workspace.may_change(message, current.run), state.scan {
+        False, _ -> state
+        True, Idle -> scan_repos(state)
+        True, Scanning(_) -> State(..state, scan: Scanning(again: True))
       }
-    }
     _, _, _ -> state
+  }
+}
+
+/// Look for a changed repository off the actor; `scanned` gets the answer.
+fn scan_repos(state: State) -> State {
+  case connection(state) {
+    None -> State(..state, scan: Idle)
+    Some(connection) -> {
+      let self = state.self
+      workspace.find_changed(connection, state.target, fn(found) {
+        process.send(self, Internal(Scanned(found)))
+      })
+      State(..state, scan: Scanning(again: False))
+    }
+  }
+}
+
+fn scanned(state: State, found: Result(git.Found, Nil)) -> State {
+  case found, state.scan, state.venue {
+    Ok(found), _, venue.Thread ->
+      open_code_channel(State(..state, scan: Idle), found, "").0
+    Error(Nil), Scanning(again: True), venue.Thread -> scan_repos(state)
+    _, _, _ -> State(..state, scan: Idle)
   }
 }
 
@@ -817,63 +877,51 @@ fn move(
   dir: String,
   name: String,
 ) -> #(State, Result(String, String)) {
-  case state.venue, repo.find(shell(state), dir) {
-    venue.CodeChannel(..), _ -> #(
+  case state.venue {
+    venue.CodeChannel(..) -> #(
       state,
       Error("the work is already in a code channel"),
     )
-    _, Error(reason) -> #(state, Error(reason))
-    _, Ok(found) -> open_code_channel(state, found, name)
+    _ ->
+      case git.find(shell(state), dir) {
+        Error(reason) -> #(state, Error(reason))
+        Ok(found) -> open_code_channel(state, found, name)
+      }
   }
 }
 
 fn open_code_channel(
   state: State,
-  found: repo.Found,
+  found: git.Found,
   name: String,
 ) -> #(State, Result(String, String)) {
-  // The agent's name for the work, else what the thread is about, else
-  // the repository: the Code tab shows the repository anyway.
-  let name = case string.trim(name), string.trim(state.topic) {
-    "", "" -> found.name
-    "", topic -> topic
-    name, _ -> name
-  }
+  let name = channel.name(name, state.topic, found)
+  let thread = here(state)
   state.config.notify(Opening)
-  case state.sink.open_code_channel(name) {
-    Error(reason) -> {
-      sys.warn("crushling: staying in the thread: " <> reason)
-      // Later clones in this thread do not try again. Each run lists the
-      // repository's changes in the thread and attaches its diff.
-      let venue = venue.ThreadOnly(repo: found.dir)
+  case channel.open(thread, found, name) {
+    channel.Refused(venue:, reason:) -> {
       state.config.notify(Moved(venue, ""))
       #(State(..state, venue:), Error(reason))
     }
-    Ok(#(channel_sink, channel)) -> {
-      let opened_ts = float.to_string(int.to_float(sys.system_ms()) /. 1000.0)
-      let to = venue.CodeChannel(channel:, repo: found.dir)
-      state.config.notify(Moved(to, opened_ts))
-      let thread = state.sink
-      let note = "_working on `" <> found.name <> "` in <#" <> channel <> ">_"
+    channel.Opened(venue: to, channel:, ts:) -> {
+      state.config.notify(Moved(to, ts))
+      let note = say.moved(found.name, channel)
       // Said once: as the end of the reply in the thread when a run is under
       // way (the rest of it goes to the channel, starting after what was
       // already said), else on its own.
-      let active = case state.active {
-        Some(active) -> {
-          close_reply(thread, state.config.root, state.subs, active, note)
-          Some(
-            Active(..active, reply: None, said_before: render.reply(active.run)),
-          )
+      let current = case state.turn {
+        Some(current) -> {
+          close_reply(state, current, note)
+          Some(turn.moved(current))
         }
         None -> {
           let _ = thread.post(note)
           None
         }
       }
-      thread.working(False)
-      channel_sink.working(active != None)
-      let state = State(..state, venue: to, sink: channel_sink, active:)
-      repo.show(shell(state), channel_sink, found.dir, found.info)
+      let state = State(..state, venue: to, turn: current)
+      sink.title(here(state), name)
+      show_code(state, here(state), found.dir, Some(found.info))
       #(state, Ok(channel))
     }
   }
@@ -886,249 +934,10 @@ fn propose(
   body: String,
 ) -> Result(String, String) {
   let shell = shell(state)
-  use dir <- result.try(case state.venue {
-    venue.CodeChannel(repo:, ..)
-      | venue.ThreadOnly(repo:)
-      | venue.Archived(repo:)
-      if repo != ""
-    -> Ok(repo)
-    _ -> repo.find(shell, "") |> result.map(fn(found) { found.dir })
-  })
-  use facts <- result.try(
-    shell(pr.facts(dir))
-    |> result.replace_error("couldn't read the repository; is the agent awake?"),
-  )
-  use proposal <- result.try(pr.from_facts(facts, title, body))
+  use proposal <- result.try(workspace.proposal(shell, state.venue, title, body))
   let #(text, blocks) = pr.card(proposal)
-  use ts <- result.map(state.sink.post_blocks(text, blocks))
-  state.config.notify(Proposed(ts, state.sink.conversation.channel, proposal))
-  "Posted a card proposing `"
-  <> proposal.head
-  <> "` → `"
-  <> proposal.base
-  <> "`; a person opens the PR from it."
-}
-
-/// Re-render the in-progress run if it changed since it was last shown.
-fn flush(state: State) -> State {
-  let state = State(..state, subs: subagents.show(state.subs, parent(state)))
-  let state = case state.active {
-    Some(active) ->
-      State(
-        ..state,
-        active: Some(show_progress(
-          state.sink,
-          state.config.root,
-          state.subs,
-          active,
-        )),
-      )
-    None -> state
-  }
-  // Keep flushing while subagents work after the main run has ended.
-  case state.active == None && subagents.running(state.subs) {
-    True -> {
-      process.send_after(state.self, state.config.flush_ms * 2, Flush)
-      State(..state, flushing: True)
-    }
-    False -> state
-  }
-}
-
-fn watchdog(state: State) -> State {
-  case state.active {
-    None -> state
-    Some(active) -> {
-      process.send_after(state.self, watchdog_ms, Watchdog)
-      let now = sys.monotonic_ms()
-      // A tool still running (a long build, or a GitHub read waiting for
-      // someone to connect) sends no events while it runs, and isn't the
-      // agent being stuck. A stall is noted once.
-      let stalled =
-        !active.stalled
-        && now - active.last_event_ms > stall_ms
-        && !run.tool_running(active.run)
-      {
-        case stalled, now - active.working_since_ms > rework_ms {
-          True, _ -> {
-            let _ =
-              state.sink.post(
-                "_no word from the agent in 10 minutes; it may be stuck. Reply `!stop` to stop it._",
-              )
-            // Still shown as working: the run hasn't ended, and Slack's
-            // Stop button is the easiest way to end it.
-            state.sink.working(True)
-            State(
-              ..state,
-              active: Some(
-                Active(..active, stalled: True, working_since_ms: now),
-              ),
-            )
-          }
-          False, True -> {
-            state.sink.working(True)
-            let active = Active(..active, working_since_ms: now)
-            State(..state, active: Some(active))
-          }
-          False, False -> state
-        }
-      }
-    }
-  }
-}
-
-/// Show the run as it goes: what the agent has said, and its steps.
-fn show_progress(
-  sink: Sink,
-  root: String,
-  subs: subagents.Subagents,
-  active: Active,
-) -> Active {
-  let text = said_since(render.reply(active.run), active.said_before)
-  let steps = render.all_tasks(active.run, root) |> subagents.rows(subs, _)
-  case active.reply, text, steps {
-    None, "", [] -> active
-    _, _, _ -> {
-      let reply = case active.reply {
-        Some(reply) -> reply
-        None -> sink.reply(active.from)
-      }
-      let title = case steps {
-        [] -> ""
-        _ -> render.progress_title(active.run)
-      }
-      reply.show(text, steps, title)
-      Active(..active, reply: Some(reply))
-    }
-  }
-}
-
-/// The text after `before`, which is the part a code channel shows.
-fn said_since(text: String, before: String) -> String {
-  case before, string.starts_with(text, before) {
-    "", _ -> text
-    _, True -> string.drop_start(text, string.length(before)) |> string.trim
-    _, False -> text
-  }
-}
-
-/// End an open reply with what it has, and `note`.
-fn close_reply(
-  sink: Sink,
-  root: String,
-  subs: subagents.Subagents,
-  active: Active,
-  note: String,
-) -> Nil {
-  case active.reply {
-    Some(_) ->
-      case show_progress(sink, root, subs, active).reply {
-        Some(reply) -> {
-          let _ = reply.finish(note)
-          Nil
-        }
-        None -> Nil
-      }
-    None -> Nil
-  }
-}
-
-fn finish_if_done(state: State) -> State {
-  case state.active {
-    Some(active) ->
-      case run.is_done(active.run) {
-        True -> {
-          finish(state, active)
-          State(..state, active: None)
-          |> send_next
-        }
-        False -> state
-      }
-    None -> state
-  }
-}
-
-/// The patch to attach for the run, if any. A code channel's Code tab shows
-/// the diff instead, so it gets none. With a repository the patch comes from
-/// its own history; without one, from workspace snapshots, which include
-/// edits made through `bash`.
-fn patch_for(state: State, active: Active) -> Option(String) {
-  let shell = shell(state)
-  case state.venue {
-    venue.CodeChannel(repo: dir, ..) -> {
-      repo.show(shell, state.sink, dir, repo.info(shell, dir))
-      None
-    }
-    venue.ThreadOnly(repo: dir) if dir != "" ->
-      shell(snapshot.repo_diff(dir)) |> option.from_result
-    _ -> {
-      let patch = {
-        use base <- result.try(option.to_result(active.base, Nil))
-        use after <- result.try(take_snapshot(state) |> option.to_result(Nil))
-        shell(snapshot.diff(base, after))
-      }
-      case patch {
-        Ok(patch) -> Some(patch)
-        Error(Nil) -> {
-          sys.warn(
-            "crushling: no workspace snapshot, so no patch for run "
-            <> active.run.run_id,
-          )
-          None
-        }
-      }
-    }
-  }
-}
-
-fn finish(state: State, active: Active) -> Nil {
-  let sink = state.sink
-  let patch = patch_for(state, active)
-  let answer = render.answer(active.run)
-  let closing =
-    [
-      case active.run.outcome, active.cancel_note {
-        Some(run.Cancelled), Some(note) -> Some("_" <> note <> "_")
-        _, _ -> render.note(active.run, answer != [])
-      },
-    ]
-    |> option.values
-    |> string.join("\n\n")
-  // The reply ends the run. It holds what the agent said and its steps; what
-  // changed is in the Code tab, or the patch attached below.
-  let active = show_progress(sink, state.config.root, state.subs, active)
-  let reply_ts = case active.reply, closing {
-    Some(reply), _ -> reply.finish(closing) |> list.last |> result.unwrap("")
-    None, "" -> ""
-    None, closing -> sink.post(closing) |> result.unwrap("")
-  }
-  sink.working(False)
-  case patch {
-    None | Some("") -> Nil
-    Some(patch) ->
-      case string.byte_size(patch) > max_patch_bytes {
-        True ->
-          sys.warn(
-            "crushling: patch too large to attach: " <> active.run.run_id,
-          )
-        False -> upload_patch(sink, active, patch)
-      }
-  }
-  state.config.notify(
-    RunEnded(Finished(solicited: active.solicited, reply_ts:)),
-  )
-}
-
-fn upload_patch(sink: Sink, active: Active, patch: String) -> Nil {
-  case sink.upload(string.slice(active.run.run_id, 0, 8) <> ".diff", patch) {
-    Ok(Nil) -> Nil
-    Error(reason) -> sys.warn("crushling: upload failed: " <> reason)
-  }
-}
-
-fn close_connection(state: State) -> Nil {
-  case state.connection {
-    Some(connection) -> conn.close(connection)
-    None -> Nil
-  }
+  let sink = here(state)
+  use ts <- result.map(sink.post_blocks(text, blocks))
+  state.config.notify(Proposed(ts, sink.conversation.channel, proposal))
+  say.proposed(proposal.head, proposal.base)
 }

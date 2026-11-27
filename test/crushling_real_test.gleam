@@ -277,17 +277,9 @@ fn sink(calls: Subject(Call)) -> sink.Sink {
     process.send(calls, Progress(text))
     Ok("ts" <> int.to_string(unique()))
   }
-  let plan_text = fn(plan: render.Plan) { render.plan_markdown(plan) }
   sink.Sink(
-    working: fn(_) { Nil },
-    title: fn(_) { Nil },
-    post_plan: fn(plan) { progress(plan_text(plan)) },
     reply: fn(_) {
       fake_reply(progress, fn(text) { progress(text) |> fn(_) { Nil } })
-    },
-    update_plan: fn(_, plan) {
-      process.send(calls, Progress(plan_text(plan)))
-      Ok(Nil)
     },
     post: progress,
     post_blocks: fn(text, _) { progress(text) },
@@ -298,9 +290,9 @@ fn sink(calls: Subject(Call)) -> sink.Sink {
       Ok(Nil)
     },
     branch: fn(_, _, _) { Error("no branches in this test") },
-    open_code_channel: fn(_) { Error("no code channels in this test") },
-    context: fn(_) { Nil },
-    code: fn(_, _, _) { Nil },
+    session: None,
+    code_view: None,
+    open_code_channel: None,
     conversation: conversation.Conversation("CTEST", Some("1.0")),
   )
 }
@@ -336,7 +328,7 @@ fn start_observed(
         root: env.work,
         title: "crushling real test",
         venue: venue.Thread,
-        sink: sink(calls),
+        sink: fn(_) { sink(calls) },
         flush_ms: 250,
         mode: client.Sysadmin,
         notify: on_finished(fn(_) { process.send(calls, Done) }),
@@ -740,11 +732,7 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> sink.Sink {
     Ok("ts" <> int.to_string(unique()))
   }
   sink.Sink(
-    working: fn(_) { Nil },
-    title: fn(_) { Nil },
-    post_plan: fn(plan) { post(render.plan_markdown(plan)) },
     reply: fn(_) { fake_reply(post, fn(_) { Nil }) },
-    update_plan: fn(_, _) { Ok(Nil) },
     post:,
     post_blocks: fn(text, _) { post(text) },
     update_blocks: fn(_, text, _) {
@@ -758,11 +746,19 @@ fn recording_sink(calls: Subject(SubCall), in_branch: Bool) -> sink.Sink {
     upload: fn(_, _) { Ok(Nil) },
     branch: fn(intro, _, title) {
       process.send(calls, Branched(intro, title))
-      Ok(#(recording_sink(calls, True), "https://slack.example/thread", "9.0"))
+      Ok(
+        sink.Branch(
+          sink: recording_sink(calls, True),
+          link: "https://slack.example/thread",
+          root_ts: "9.0",
+          post_plan: fn(plan) { post(render.plan_markdown(plan)) },
+          update_plan: fn(_, _) { Ok(Nil) },
+        ),
+      )
     },
-    open_code_channel: fn(_) { Error("no code channels in this test") },
-    context: fn(_) { Nil },
-    code: fn(_, _, _) { Nil },
+    session: None,
+    code_view: None,
+    open_code_channel: None,
     conversation: conversation.Conversation("CTEST", Some("1.0")),
   )
 }
@@ -780,7 +776,7 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
       title: "crushling subagent test",
       // Subagents get threads of their own only in a code channel.
       venue: venue.CodeChannel(channel: "CTEST", repo: env.work),
-      sink: recording_sink(calls, False),
+      sink: fn(_) { recording_sink(calls, False) },
       flush_ms: 250,
       mode: client.Sysadmin,
       notify: on_finished(fn(finished) {
@@ -886,11 +882,7 @@ fn code_sink(
     Ok("ts" <> int.to_string(unique()))
   }
   sink.Sink(
-    working: fn(_) { Nil },
-    title: fn(_) { Nil },
-    post_plan: fn(plan) { post(render.plan_markdown(plan)) },
     reply: fn(_) { fake_reply(post, fn(_) { Nil }) },
-    update_plan: fn(_, _) { Ok(Nil) },
     post:,
     post_blocks: fn(text, _) { post(text) },
     update_blocks: fn(_, _, _) { Ok(Nil) },
@@ -900,23 +892,40 @@ fn code_sink(
       Ok(Nil)
     },
     branch: fn(_, _, _) { Error("no branches in this test") },
-    open_code_channel: fn(name) {
-      process.send(calls, Opened(name))
-      case in_channel, opens {
-        True, _ -> Error("already in a code channel")
-        False, False -> Error("not_allowed creating a code channel")
-        False, True -> Ok(#(code_sink(calls, True, True), "CCODE"))
-      }
+    session: None,
+    open_code_channel: case in_channel {
+      True -> None
+      False ->
+        Some(fn(name) {
+          process.send(calls, Opened(name))
+          case opens {
+            False -> Error("not_allowed creating a code channel")
+            True -> Ok(sink.Opened(channel: "CCODE", ts: "1.0"))
+          }
+        })
     },
-    context: fn(_) { Nil },
-    code: fn(diff, _, _) {
-      case in_channel {
-        True -> process.send(calls, CodeView(diff))
-        False -> Nil
-      }
+    code_view: case in_channel {
+      True ->
+        Some(
+          sink.CodeView(context: fn(_) { Nil }, code: fn(diff, _, _) {
+            process.send(calls, CodeView(diff))
+          }),
+        )
+      False -> None
     },
     conversation: conversation.Conversation("CTEST", Some("1.0")),
   )
+}
+
+/// The sinks for a thread whose Slack thread can (`opens`) or can't open a
+/// code channel.
+fn code_surface(calls: Subject(CodeCall), opens: Bool) -> sink.Surface {
+  fn(at) {
+    case at {
+      venue.CodeChannel(..) -> code_sink(calls, True, True)
+      _ -> code_sink(calls, False, opens)
+    }
+  }
 }
 
 fn collect_code_calls(
@@ -961,7 +970,7 @@ fn reading_stays_in_the_thread(wiring: Wiring) -> Nil {
         root: env.work,
         title: "crushling read test",
         venue: venue.Thread,
-        sink: code_sink(calls, False, True),
+        sink: code_surface(calls, True),
         flush_ms: 250,
         mode: client.Sysadmin,
         notify: on_finished(fn(_) { process.send(calls, CodeFinished) }),
@@ -1005,7 +1014,7 @@ fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
         root: env.work,
         title: "crushling code channel test",
         venue: venue.Thread,
-        sink: code_sink(calls, False, opens),
+        sink: code_surface(calls, opens),
         flush_ms: 250,
         mode: client.Sysadmin,
         notify: on_finished(fn(_) { process.send(calls, CodeFinished) }),

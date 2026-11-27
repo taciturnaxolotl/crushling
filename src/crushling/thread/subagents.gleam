@@ -15,15 +15,15 @@
 import crushling/crush/event
 import crushling/render
 import crushling/run.{type Run}
-import crushling/sink.{type Sink}
+import crushling/sink.{type Branch, type Sink}
 import crushling/sys
+import crushling/thread/say
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import slackline/block
 
 pub opaque type Subagents {
   Subagents(by_call: Dict(String, Sub))
@@ -38,12 +38,9 @@ type Sub {
     /// What crush titled its session.
     title: String,
     run: Run,
-    /// Its thread, once opened, and the link to it.
-    thread: Option(Sink),
-    link: String,
+    /// Its thread, once opened.
+    thread: Option(Branch),
     plan_ts: Option(String),
-    /// Its first message in the channel, to update when it finishes.
-    root_ts: Option(String),
     /// When it started, in monotonic ms.
     started_ms: Int,
     shown: Option(render.Plan),
@@ -142,11 +139,11 @@ pub fn close(subs: Subagents, note: String) -> Nil {
         case note {
           "" -> Nil
           note -> {
-            let _ = thread.post(note)
+            let _ = thread.sink.post(note)
             Nil
           }
         }
-        thread.working(False)
+        sink.working(thread.sink, False)
       }
       _, _ -> Nil
     }
@@ -174,9 +171,7 @@ fn upsert(
       title: "",
       run: run.new(session_id, ""),
       thread: None,
-      link: "",
       plan_ts: None,
-      root_ts: None,
       started_ms: sys.monotonic_ms(),
       shown: None,
       posted: [],
@@ -240,11 +235,11 @@ fn show_thread(parent: Parent, sub: Sub) -> Sub {
   let sub = case sub.thread, plan {
     None, Some(_) -> {
       let #(who, scope) = name(sub)
-      let #(text, blocks) = card(who, scope, "Subagent · working")
+      let #(text, blocks) = say.subagent_card(who, scope, say.subagent_working)
       case parent.sink.branch(text, blocks, who <> ": " <> scope) {
-        Ok(#(thread, link, ts)) -> {
-          thread.working(True)
-          Sub(..sub, thread: Some(thread), link:, root_ts: Some(ts))
+        Ok(thread) -> {
+          sink.working(thread.sink, True)
+          Sub(..sub, thread: Some(thread))
         }
         Error(reason) -> {
           sys.warn("crushling: couldn't open a subagent thread: " <> reason)
@@ -280,7 +275,7 @@ fn post_messages(sub: Sub) -> Sub {
       |> list.filter(fn(message) { !list.contains(sub.posted, message.0) })
       |> list.fold(sub, fn(sub, message) {
         list.each(render.chunk(message.1, render.message_limit), fn(chunk) {
-          let _ = thread.post(chunk)
+          let _ = thread.sink.post(chunk)
           Nil
         })
         Sub(..sub, posted: [message.0, ..sub.posted])
@@ -288,46 +283,14 @@ fn post_messages(sub: Sub) -> Sub {
   }
 }
 
-/// A subagent's first message in the channel: who, what, and how it's
-/// going.
-fn card(
-  who: String,
-  scope: String,
-  status: String,
-) -> #(String, List(block.Block)) {
-  let text = "*" <> who <> "* · " <> scope
-  #(text, [
-    block.section(text: block.mrkdwn(text), with: []),
-    block.context(elements: [block.context_mrkdwn(status)], with: []),
-  ])
-}
-
 /// How a finished subagent went, in a few words: "Done · 5 steps · 1m 12s".
-fn outcome(sub: Sub, failed: Bool) -> String {
-  let steps = case list.length(sub.run.tools) {
-    1 -> "1 step"
-    n -> int.to_string(n) <> " steps"
-  }
-  let how = case failed, sub.run.outcome {
-    True, Some(run.Cancelled) -> "Stopped"
-    True, _ -> "Ran into trouble"
-    False, _ -> "Done"
-  }
-  how <> " · " <> steps <> " · " <> took(sys.monotonic_ms() - sub.started_ms)
-}
-
-fn took(ms: Int) -> String {
-  let s = ms / 1000
-  case s < 60 {
-    True -> int.to_string(int.max(s, 1)) <> "s"
-    False ->
-      int.to_string(s / 60)
-      <> "m"
-      <> case s % 60 {
-        0 -> ""
-        rest -> " " <> int.to_string(rest) <> "s"
-      }
-  }
+fn outcome(sub: Sub) -> String {
+  say.subagent_outcome(
+    render.run_status(sub.run),
+    sub.run.outcome == Some(run.Cancelled),
+    list.length(sub.run.tools),
+    sys.monotonic_ms() - sub.started_ms,
+  )
 }
 
 /// A finished subagent: the rest of its work in its thread, its first
@@ -353,46 +316,30 @@ fn finish_thread(parent: Parent, sub: Sub) -> Sub {
     _, Ok(_) -> #(False, "")
     _, Error(Nil) -> #(False, render.answer(sub.run) |> string.join("\n\n"))
   }
+  let #(who, scope) = name(sub)
+  let status = outcome(sub)
   case sub.thread {
     Some(thread) -> {
       render.chunk(rest, render.message_limit)
       |> list.filter(fn(chunk) { string.trim(chunk) != "" })
       |> list.each(fn(chunk) {
-        let _ = thread.post(chunk)
+        let _ = thread.sink.post(chunk)
         Nil
       })
-      thread.working(False)
-    }
-    None -> Nil
-  }
-  let #(who, scope) = name(sub)
-  let status = outcome(sub, failed)
-  case sub.root_ts {
-    Some(ts) -> {
-      let #(text, blocks) = card(who, scope, status)
-      let _ = parent.sink.update_blocks(ts, text, blocks)
-      Nil
-    }
-    None -> Nil
-  }
-  case sub.link {
-    "" -> Nil
-    link -> {
-      let verb = case failed {
-        True -> "stopped on"
-        False -> "finished"
+      sink.working(thread.sink, False)
+      let #(text, blocks) = say.subagent_card(who, scope, status)
+      let _ = parent.sink.update_blocks(thread.root_ts, text, blocks)
+      case thread.link {
+        "" -> Nil
+        link -> {
+          let #(text, blocks) =
+            say.subagent_done(who, scope, failed, status, link)
+          let _ = parent.sink.post_blocks(text, blocks)
+          Nil
+        }
       }
-      let text = "*" <> who <> "* " <> verb <> " " <> scope
-      let _ =
-        parent.sink.post_blocks(text, [
-          block.section(
-            text: block.mrkdwn(text <> " · <" <> link <> "|open its thread>"),
-            with: [],
-          ),
-          block.context(elements: [block.context_mrkdwn(status)], with: []),
-        ])
-      Nil
     }
+    None -> Nil
   }
   sub
 }
@@ -407,34 +354,21 @@ pub fn rows(subs: Subagents, tasks: List(render.Task)) -> List(render.Task) {
         let #(who, scope) = name(sub)
         let latest =
           list.last(sub.run.tools)
-          |> result.map(fn(tool) {
-            case tool.description {
-              "" -> render.title(tool.name)
-              description -> string.capitalise(description)
-            }
-          })
+          |> result.map(render.tool_title)
           |> result.unwrap("Starting")
         render.Task(
           ..task,
           title: who <> ": " <> scope,
-          status: case sub.done, sub.run.outcome {
-            False, _ -> render.InProgress
-            True, Some(run.Completed(_)) -> render.Complete
-            True, _ -> render.Failed
+          status: case sub.done {
+            False -> render.InProgress
+            True -> render.run_status(sub.run)
           },
           details: case sub.done {
             False -> latest
-            True -> outcome(sub, sub.run.outcome != None && !is_completed(sub))
+            True -> outcome(sub)
           },
         )
       }
     }
   })
-}
-
-fn is_completed(sub: Sub) -> Bool {
-  case sub.run.outcome {
-    Some(run.Completed(_)) -> True
-    _ -> False
-  }
 }

@@ -30,14 +30,7 @@ fn tool_result(call_id: String, is_error: Bool) {
 }
 
 fn done(text: String, error: String, cancelled: Bool) {
-  event.RunCompleteEvent(event.RunComplete(
-    "s1",
-    "r1",
-    "m",
-    text,
-    error,
-    cancelled,
-  ))
+  event.RunCompleteEvent(event.RunComplete("s1", "r1", text, error, cancelled))
 }
 
 fn feed(events: List(event.Event)) -> run.Run {
@@ -60,7 +53,7 @@ pub fn text_accumulates_across_messages_test() {
 
 /// What the agent says while it calls tools is its status, not its reply.
 pub fn narration_is_status_not_reply_test() {
-  let call = event.ToolCall("c1", "bash", "{\"command\":\"ls\"}", False)
+  let call = event.ToolCall("c1", "bash", "{\"command\":\"ls\"}")
   let r =
     feed([
       assistant("m1", "Building crush from source first.", [call]),
@@ -94,17 +87,16 @@ pub fn other_sessions_and_runs_ignored_test() {
       event.Message("x", "s2", event.Assistant, "nope", [], [], []),
     )
   let other_run =
-    event.RunCompleteEvent(event.RunComplete("s1", "r0", "m", "", "", False))
+    event.RunCompleteEvent(event.RunComplete("s1", "r0", "", "", False))
   let r = feed([foreign, other_run])
   let assert "" = run.text(r)
   let assert False = run.is_done(r)
 }
 
 pub fn tools_track_status_test() {
-  let call =
-    event.ToolCall("c1", "bash", "{\"command\":\"go test ./...\"}", True)
+  let call = event.ToolCall("c1", "bash", "{\"command\":\"go test ./...\"}")
   let call2 =
-    event.ToolCall("c2", "view", "{\"file_path\":\"/workspace/a.go\"}", True)
+    event.ToolCall("c2", "view", "{\"file_path\":\"/workspace/a.go\"}")
   let r =
     feed([
       assistant("m1", "", [call]),
@@ -138,20 +130,10 @@ pub fn outcomes_test() {
 pub fn plan_render_test() {
   let calls =
     list.map(["1", "2"], fn(i) {
-      event.ToolCall(
-        "c" <> i,
-        "bash",
-        "{\"command\":\"step " <> i <> "\"}",
-        True,
-      )
+      event.ToolCall("c" <> i, "bash", "{\"command\":\"step " <> i <> "\"}")
     })
   let edit =
-    event.ToolCall(
-      "c3",
-      "edit",
-      "{\"file_path\":\"/workspace/src/a.go\"}",
-      True,
-    )
+    event.ToolCall("c3", "edit", "{\"file_path\":\"/workspace/src/a.go\"}")
   let r =
     feed([
       assistant("m1", "Working on it.", list.append(calls, [edit])),
@@ -237,7 +219,7 @@ pub fn done_title_test() {
 }
 
 pub fn a_failure_worked_around_is_not_a_badge_test() {
-  let call = event.ToolCall("c1", "bash", "{\"command\":\"false\"}", True)
+  let call = event.ToolCall("c1", "bash", "{\"command\":\"false\"}")
   let r = feed([assistant("m1", "On it.", [call]), tool_result("c1", True)])
   // While it runs, a failed command is shown as one.
   let assert Some(render.Plan(_, [render.Task(status: render.Failed, ..)])) =
@@ -262,7 +244,7 @@ pub fn a_failure_worked_around_is_not_a_badge_test() {
 pub fn plan_folds_many_steps_test() {
   let calls =
     int.range(from: 50, to: 0, with: [], run: fn(acc, i) {
-      [event.ToolCall("c" <> int.to_string(i), "ls", "{}", True), ..acc]
+      [event.ToolCall("c" <> int.to_string(i), "ls", "{}"), ..acc]
     })
   let assert Some(render.Plan(_, tasks)) =
     render.plan(feed([assistant("m", "", calls)]), "/w")
@@ -276,7 +258,6 @@ pub fn descriptions_test() {
       "c1",
       "bash",
       "{\"command\":\"go test ./...\",\"description\":\"Run the tests\"}",
-      True,
     )
   let r = feed([assistant("m1", "", [call])])
   let assert [tool] = r.tools
@@ -380,7 +361,7 @@ pub fn explain_test() {
 }
 
 pub fn tool_running_test() {
-  let call = event.ToolCall("c1", "bash", "{\"command\":\"sleep 900\"}", True)
+  let call = event.ToolCall("c1", "bash", "{\"command\":\"sleep 900\"}")
   let r = feed([assistant("m1", "Waiting on it.", [call])])
   let assert True = run.tool_running(r)
   let r = run.apply(r, tool_result("c1", False))

@@ -10,6 +10,8 @@ import crushling/gun
 import crushling/render
 import crushling/sink.{type Sink} as thread_sink
 import crushling/sys
+import crushling/text
+import crushling/venue
 import gleam/bit_array
 import gleam/bool
 import gleam/erlang/process
@@ -49,11 +51,7 @@ import slackline/stream/httpc as reply
 const fallback_length = 200
 
 fn fallback(markdown: String) -> String {
-  let text = string.trim(markdown)
-  case string.length(text) > fallback_length {
-    True -> string.slice(text, 0, fallback_length - 1) <> "…"
-    False -> text
-  }
+  text.clip(markdown, fallback_length)
 }
 
 fn send(run: fn() -> Result(a, slackline.Error)) -> Result(a, String) {
@@ -126,10 +124,48 @@ pub type Place {
   InCodeThread(thread_ts: String)
 }
 
-/// Everything a thread actor needs to reply in one place in Slack.
+/// The sinks for a thread whose Slack thread is `home` (channel and ts):
+/// there for every venue but a code channel, which gets the channel's.
 /// `team` is the workspace's id: Slack streams a reply in a channel to one
 /// person, named by user and team.
+pub fn surface(
+  client: slackline.Client,
+  team: String,
+  home: #(String, String),
+) -> thread_sink.Surface {
+  fn(at) {
+    case at {
+      venue.CodeChannel(channel:, ..) ->
+        place_sink(client, team, channel, InCodeChannel)
+      venue.Thread | venue.ThreadOnly(..) | venue.Archived(..) ->
+        place_sink(client, team, home.0, InThread(home.1))
+    }
+  }
+}
+
+/// `surface`, for a thread starting in `channel` at `place`: a code channel
+/// sink is used for every venue when it starts in one, since its Slack
+/// thread isn't known here.
 pub fn sink(
+  client: slackline.Client,
+  team: String,
+  channel: String,
+  place: Place,
+) -> thread_sink.Surface {
+  case place {
+    InThread(ts) -> surface(client, team, #(channel, ts))
+    InCodeChannel | InCodeThread(_) -> fn(at) {
+      case at {
+        venue.CodeChannel(channel: code, ..) ->
+          place_sink(client, team, code, InCodeChannel)
+        _ -> place_sink(client, team, channel, place)
+      }
+    }
+  }
+}
+
+/// Everything a thread actor needs to reply in one place in Slack.
+fn place_sink(
   client: slackline.Client,
   team: String,
   channel: String,
@@ -139,14 +175,7 @@ pub fn sink(
     InThread(ts) | InCodeThread(ts) -> Some(ts)
     InCodeChannel -> None
   }
-  let has_session = case place {
-    InCodeThread(_) -> False
-    _ -> True
-  }
-  let in_code_channel = case place {
-    InThread(_) -> False
-    _ -> True
-  }
+  let here = Conversation(channel, thread_ts)
   let post = fn(text, blocks) {
     use <- send
     let call =
@@ -169,59 +198,12 @@ pub fn sink(
     |> httpc.send(client)
     |> result.replace(Nil)
   }
-  // A run's reply streams where Slack can, and falls back to a plan card
-  // and messages where it can't; slackline's stream handles both.
-  let open_reply = fn(from) {
-    let builder =
-      stream.new(client, channel:)
-      |> stream.to(user: from, team:)
-    let builder = case thread_ts {
-      Some(ts) -> stream.in_thread(builder, ts)
-      None -> builder
-    }
-    case reply.open(builder) {
-      Error(error) -> {
-        sys.warn("crushling: couldn't open a reply: " <> string.inspect(error))
-        thread_sink.Reply(show: fn(_, _, _) { Nil }, finish: fn(_) { [] })
-      }
-      Ok(opened) ->
-        thread_sink.Reply(
-          show: fn(text, tasks, title) {
-            reply.text(opened, text)
-            list.each(tasks, fn(task) { reply.task(opened, stream_task(task)) })
-            reply.title(opened, title)
-          },
-          finish: fn(closing) {
-            case reply.finish(opened, closing:) {
-              Ok(finished) -> {
-                case finished.problem {
-                  Some(problem) ->
-                    sys.warn("crushling: the reply didn't stream: " <> problem)
-                  None -> Nil
-                }
-                finished.messages
-              }
-              Error(Nil) -> {
-                sys.warn("crushling: the reply's writer stopped answering")
-                []
-              }
-            }
-          },
-        )
-    }
-  }
-  let set_status = fn(status) {
-    case has_session {
-      True -> session_status(client, Conversation(channel, thread_ts), status)
-      False -> Nil
-    }
-  }
   let branch = fn(intro, blocks, title) {
     // In a code channel a subagent gets a thread there; elsewhere a new
     // top-level message with its own session.
-    let child = case in_code_channel {
-      True -> InCodeThread
-      False -> InThread
+    let child = case place {
+      InThread(_) -> InThread
+      InCodeChannel | InCodeThread(_) -> InCodeThread
     }
     use root <- result.try(
       send(fn() {
@@ -237,57 +219,21 @@ pub fn sink(
       |> httpc.send(client)
       |> result.map(fn(found) { found.permalink })
       |> result.unwrap("")
-    let branch = sink(client, team, channel, child(root))
-    branch.title(title)
-    Ok(#(branch, link, root))
+    let branch = place_sink(client, team, channel, child(root))
+    thread_sink.title(branch, title)
+    Ok(
+      thread_sink.Branch(
+        sink: branch,
+        link:,
+        root_ts: root,
+        post_plan: post_plan(branch, _),
+        update_plan: fn(ts, plan) { update_plan(branch, ts, plan) },
+      ),
+    )
   }
   thread_sink.Sink(
-    conversation: Conversation(channel, thread_ts),
-    // Slack shows "Working…" with its Stop control until the session is
-    // set back to active; posting doesn't clear it.
-    working: fn(working) {
-      set_status(case working {
-        True -> agents.Processing
-        False -> agents.Active
-      })
-    },
-    title: fn(title) {
-      case has_session {
-        False -> Nil
-        True -> {
-          let call =
-            agents.sessions_rename(title:)
-            |> sessions_rename.channel_id(channel)
-          let _ =
-            case thread_ts {
-              Some(ts) -> sessions_rename.thread_ts(call, ts)
-              None -> call
-            }
-            |> httpc.send(client)
-          Nil
-        }
-      }
-    },
-    post_plan: fn(plan) {
-      case post(plan.title, plan_blocks(plan)) {
-        Ok(ts) -> Ok(ts)
-        // A workspace that rejects plan blocks gets the same as markdown.
-        Error(_) -> {
-          let markdown = render.plan_markdown(plan)
-          post(markdown, markdown_blocks(markdown))
-        }
-      }
-    },
-    update_plan: fn(ts, plan) {
-      case update(ts, plan.title, plan_blocks(plan)) {
-        Ok(Nil) -> Ok(Nil)
-        Error(_) -> {
-          let markdown = render.plan_markdown(plan)
-          update(ts, markdown, markdown_blocks(markdown))
-        }
-      }
-    },
-    reply: open_reply,
+    conversation: here,
+    reply: open_reply(client, team, here, _),
     post: fn(markdown) { post(markdown, markdown_blocks(markdown)) },
     post_blocks: post,
     update_blocks: update,
@@ -307,117 +253,237 @@ pub fn sink(
       use <- send
       httpc.upload_files(client, [file], share: fn(call) {
         complete_upload_external.channel_id(call, channel)
-        |> conversation.in_thread(
-          Conversation(channel, thread_ts),
-          complete_upload_external.thread_ts,
-        )
+        |> conversation.in_thread(here, complete_upload_external.thread_ts)
       })
       |> result.replace(Nil)
     },
     branch:,
-    open_code_channel: fn(name) {
-      case place {
-        InThread(root) -> {
-          use opened <- result.try(
-            agents.conversations_create()
-            |> conversations_create.name(string.slice(name, 0, 80))
-            |> conversations_create.origin_channel_id(channel)
-            |> conversations_create.origin_message_ts(root)
-            // A session that was archived and picked up again gets a new
-            // channel, so the id can't be the thread alone; kept short.
-            |> conversations_create.session_id(sys.uuid())
-            |> httpc.send(client)
-            |> result.map_error(fn(error) {
-              describe(error) <> " creating a code channel named " <> name
-            }),
-          )
-          let code = opened.channel_id
-          set_code_commands(client, code)
-          let channel_sink = sink(client, team, code, InCodeChannel)
-          channel_sink.title(name)
-          Ok(#(channel_sink, code))
-        }
-        _ -> Error("already in a code channel")
-      }
+    session: case place {
+      InThread(_) | InCodeChannel -> Some(session(client, here))
+      InCodeThread(_) -> None
     },
-    context: fn(items) {
-      case place {
-        InCodeChannel -> {
-          let items =
-            list.take(items, 5)
-            |> list.map(fn(item) {
-              agents.ContextBarItem(
-                key: item.key,
-                label: item.label,
-                icon: Some(item.icon),
-                url: case item.url {
-                  "" -> None
-                  url -> Some(url)
-                },
-                item_type: None,
-              )
-            })
-          let _ =
-            agents.conversations_set_properties(channel_id: channel)
-            |> conversations_set_properties.code_channel(
-              agents.CodeChannelProperties(
-                context_bar_items: Some(items),
-                summary_message: None,
-              ),
-            )
-            |> httpc.send(client)
-          Nil
+    code_view: case place {
+      InCodeChannel -> Some(code_view(client, channel))
+      InThread(_) | InCodeThread(_) -> None
+    },
+    open_code_channel: case place {
+      InThread(root) -> Some(open_code_channel(client, channel, root, _))
+      InCodeChannel | InCodeThread(_) -> None
+    },
+  )
+}
+
+/// A plan card, as markdown in a workspace that rejects plan blocks.
+fn post_plan(sink: Sink, plan: render.Plan) -> Result(String, String) {
+  case sink.post_blocks(plan.title, plan_blocks(plan)) {
+    Ok(ts) -> Ok(ts)
+    Error(_) -> {
+      let markdown = render.plan_markdown(plan)
+      sink.post_blocks(markdown, markdown_blocks(markdown))
+    }
+  }
+}
+
+fn update_plan(
+  sink: Sink,
+  ts: String,
+  plan: render.Plan,
+) -> Result(Nil, String) {
+  case sink.update_blocks(ts, plan.title, plan_blocks(plan)) {
+    Ok(Nil) -> Ok(Nil)
+    Error(_) -> {
+      let markdown = render.plan_markdown(plan)
+      sink.update_blocks(ts, markdown, markdown_blocks(markdown))
+    }
+  }
+}
+
+/// A run's reply streams where Slack can, and falls back to a plan card and
+/// messages where it can't; slackline's stream handles both.
+fn open_reply(
+  client: slackline.Client,
+  team: String,
+  here: Conversation,
+  from: String,
+) -> thread_sink.Reply {
+  let builder =
+    stream.new(client, channel: here.channel)
+    |> stream.to(user: from, team:)
+  let builder = case here.thread {
+    Some(ts) -> stream.in_thread(builder, ts)
+    None -> builder
+  }
+  case reply.open(builder) {
+    Error(error) -> {
+      sys.warn("crushling: couldn't open a reply: " <> string.inspect(error))
+      thread_sink.Reply(show: fn(_, _, _) { Nil }, finish: fn(_) { [] })
+    }
+    Ok(opened) ->
+      thread_sink.Reply(
+        show: fn(text, tasks, title) {
+          reply.text(opened, text)
+          list.each(tasks, fn(task) { reply.task(opened, stream_task(task)) })
+          reply.title(opened, title)
+        },
+        finish: fn(closing) {
+          case reply.finish(opened, closing:) {
+            Ok(finished) -> {
+              case finished.problem {
+                Some(problem) ->
+                  sys.warn("crushling: the reply didn't stream: " <> problem)
+                None -> Nil
+              }
+              finished.messages
+            }
+            Error(Nil) -> {
+              sys.warn("crushling: the reply's writer stopped answering")
+              []
+            }
+          }
+        },
+      )
+  }
+}
+
+fn session(
+  client: slackline.Client,
+  here: Conversation,
+) -> thread_sink.Session {
+  thread_sink.Session(
+    // Slack shows "Working…" with its Stop control until the session is
+    // set back to active; posting doesn't clear it.
+    working: fn(working) {
+      session_status(client, here, case working {
+        True -> agents.Processing
+        False -> agents.Active
+      })
+    },
+    title: fn(title) {
+      let call =
+        agents.sessions_rename(title:)
+        |> sessions_rename.channel_id(here.channel)
+      let _ =
+        case here.thread {
+          Some(ts) -> sessions_rename.thread_ts(call, ts)
+          None -> call
         }
-        _ -> Nil
-      }
+        |> httpc.send(client)
+      Nil
+    },
+  )
+}
+
+/// Open a code channel called `name` from the thread at `root` in
+/// `channel`. Slack's answer has no ts, so the time it came back stands in
+/// for when the channel opened.
+fn open_code_channel(
+  client: slackline.Client,
+  channel: String,
+  root: String,
+  name: String,
+) -> Result(thread_sink.Opened, String) {
+  use opened <- result.try(
+    agents.conversations_create()
+    |> conversations_create.name(string.slice(name, 0, 80))
+    |> conversations_create.origin_channel_id(channel)
+    |> conversations_create.origin_message_ts(root)
+    // A session that was archived and picked up again gets a new
+    // channel, so the id can't be the thread alone; kept short.
+    |> conversations_create.session_id(sys.uuid())
+    |> httpc.send(client)
+    |> result.map_error(fn(error) {
+      describe(error) <> " creating a code channel named " <> name
+    }),
+  )
+  let ts = float.to_string(int.to_float(sys.system_ms()) /. 1000.0)
+  set_code_commands(client, opened.channel_id)
+  Ok(thread_sink.Opened(channel: opened.channel_id, ts:))
+}
+
+fn code_view(
+  client: slackline.Client,
+  channel: String,
+) -> thread_sink.CodeView {
+  thread_sink.CodeView(
+    context: fn(items) {
+      let items =
+        list.take(items, 5)
+        |> list.map(fn(item) {
+          agents.ContextBarItem(
+            key: item.key,
+            label: item.label,
+            icon: Some(item.icon),
+            url: case item.url {
+              "" -> None
+              url -> Some(url)
+            },
+            item_type: None,
+          )
+        })
+      let _ =
+        agents.conversations_set_properties(channel_id: channel)
+        |> conversations_set_properties.code_channel(
+          agents.CodeChannelProperties(
+            context_bar_items: Some(items),
+            summary_message: None,
+          ),
+        )
+        |> httpc.send(client)
+      Nil
     },
     code: fn(diff, base, head) {
-      case place, string.trim(diff) {
-        InCodeChannel, "" -> {
+      case string.trim(diff) {
+        "" -> {
           let _ =
             agents.conversations_remove_view(channel_id: channel)
             |> httpc.send(client)
           Nil
         }
-        InCodeChannel, _ -> {
-          let call =
-            agents.conversations_set_view(channel_id: channel)
-            |> conversations_set_view.type_("diff")
-            |> conversations_set_view.content(diff)
-          let call = case base {
-            "" -> call
-            base -> conversations_set_view.base_branch(call, base)
-          }
-          let call = case head {
-            "" | "HEAD" -> call
-            head -> conversations_set_view.head_branch(call, head)
-          }
-          let attempt = fn() {
-            httpc.send(call, client)
-            |> result.map_error(describe)
-          }
-          // A brand-new channel can refuse its first view for a moment.
-          let sent = case attempt() {
-            Error(reason) ->
-              case string.contains(reason, "view_creation_failed") {
-                True -> {
-                  process.sleep(2000)
-                  attempt()
-                }
-                False -> Error(reason)
-              }
-            ok -> ok
-          }
-          case sent {
-            Ok(_) -> Nil
-            Error(reason) ->
-              sys.warn("crushling: Code tab update failed: " <> reason)
-          }
-        }
-        _, _ -> Nil
+        _ -> set_code_view(client, channel, diff, base, head)
       }
     },
   )
+}
+
+fn set_code_view(
+  client: slackline.Client,
+  channel: String,
+  diff: String,
+  base: String,
+  head: String,
+) -> Nil {
+  let call =
+    agents.conversations_set_view(channel_id: channel)
+    |> conversations_set_view.type_("diff")
+    |> conversations_set_view.content(diff)
+  let call = case base {
+    "" -> call
+    base -> conversations_set_view.base_branch(call, base)
+  }
+  let call = case head {
+    "" | "HEAD" -> call
+    head -> conversations_set_view.head_branch(call, head)
+  }
+  let attempt = fn() {
+    httpc.send(call, client)
+    |> result.map_error(describe)
+  }
+  // A brand-new channel can refuse its first view for a moment.
+  let sent = case attempt() {
+    Error(reason) ->
+      case string.contains(reason, "view_creation_failed") {
+        True -> {
+          process.sleep(2000)
+          attempt()
+        }
+        False -> Error(reason)
+      }
+    ok -> ok
+  }
+  case sent {
+    Ok(_) -> Nil
+    Error(reason) -> sys.warn("crushling: Code tab update failed: " <> reason)
+  }
 }
 
 /// A Slack error for logs and the agent; slackline includes the detail

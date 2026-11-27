@@ -10,7 +10,7 @@ pub fn assistant_message_test() {
       session_id: "s1",
       role: event.Assistant,
       text: "Hello world",
-      tool_calls: [event.ToolCall("c1", "bash", "{\"command\":\"ls\"}", True)],
+      tool_calls: [event.ToolCall("c1", "bash", "{\"command\":\"ls\"}")],
       tool_results: [],
       reports: [],
     ),
@@ -33,7 +33,6 @@ pub fn run_complete_test() {
   let assert Ok(event.RunCompleteEvent(event.RunComplete(
     "s1",
     "r1",
-    "m1",
     "done",
     "",
     False,
@@ -51,17 +50,16 @@ pub fn run_complete_with_missing_fields_test() {
   ))) = event.parse(frame)
 }
 
-pub fn agent_error_test() {
+pub fn agent_events_are_not_read_test() {
   let frame =
     "{\"type\":\"agent_event\",\"payload\":{\"type\":\"created\",\"payload\":{\"type\":\"error\",\"session_id\":\"s1\",\"run_id\":\"r1\",\"error\":\"rate limited\"}}}"
-  let assert Ok(event.AgentError("s1", "r1", "rate limited")) =
-    event.parse(frame)
+  let assert Ok(event.Other("agent_event")) = event.parse(frame)
 }
 
 pub fn agent_other_test() {
   let frame =
     "{\"type\":\"agent_event\",\"payload\":{\"type\":\"created\",\"payload\":{\"type\":\"agent_finished\"}}}"
-  let assert Ok(event.Other("agent_event:agent_finished")) = event.parse(frame)
+  let assert Ok(event.Other("agent_event")) = event.parse(frame)
 }
 
 pub fn file_test() {

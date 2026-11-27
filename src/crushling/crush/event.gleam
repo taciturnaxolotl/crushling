@@ -2,7 +2,8 @@
 ////
 //// Every frame is `data: {"type": kind, "payload": {"type": op, "payload": body}}`.
 //// Only the kinds the bridge acts on are decoded; everything else becomes
-//// `Other` so a new server version never breaks the stream.
+//// `Other` so a new server version never breaks the stream. A turn ends on
+//// `run_complete` alone, so `agent_event` is left as `Other` too.
 
 import gleam/dynamic/decode.{type Decoder}
 import gleam/json
@@ -18,7 +19,7 @@ pub type Role {
 }
 
 pub type ToolCall {
-  ToolCall(id: String, name: String, input: String, finished: Bool)
+  ToolCall(id: String, name: String, input: String)
 }
 
 pub type ToolResult {
@@ -51,7 +52,6 @@ pub type RunComplete {
   RunComplete(
     session_id: String,
     run_id: String,
-    message_id: String,
     text: String,
     error: String,
     cancelled: Bool,
@@ -67,7 +67,6 @@ pub type Event {
   /// A session was created or changed; subagents run in child sessions.
   SessionEvent(id: String, parent_session_id: String, title: String)
   RunCompleteEvent(RunComplete)
-  AgentError(session_id: String, run_id: String, error: String)
   FileEvent(FileVersion)
   /// The stream could not resume from the `Last-Event-ID` it was opened
   /// with, so events may have been missed. `reason` is one of `invalid_id`,
@@ -108,7 +107,6 @@ fn operation_decoder(kind: String) -> Decoder(Event) {
         use title <- str("title")
         decode.success(SessionEvent(id:, parent_session_id:, title:))
       })
-    "agent_event" -> body(agent_event_decoder(kind))
     _ -> decode.success(Other(kind))
   }
 }
@@ -212,8 +210,7 @@ fn part_decoder() -> Decoder(Part) {
         use id <- str("id")
         use name <- str("name")
         use input <- str("input")
-        use finished <- decode.optional_field("finished", False, decode.bool)
-        decode.success(CallPart(ToolCall(id:, name:, input:, finished:)))
+        decode.success(CallPart(ToolCall(id:, name:, input:)))
       })
     "tool_result" ->
       data({
@@ -239,18 +236,10 @@ fn part_decoder() -> Decoder(Part) {
 fn run_complete_decoder() -> Decoder(RunComplete) {
   use session_id <- str("session_id")
   use run_id <- str("run_id")
-  use message_id <- str("message_id")
   use text <- str("text")
   use error <- str("error")
   use cancelled <- decode.optional_field("cancelled", False, decode.bool)
-  decode.success(RunComplete(
-    session_id:,
-    run_id:,
-    message_id:,
-    text:,
-    error:,
-    cancelled:,
-  ))
+  decode.success(RunComplete(session_id:, run_id:, text:, error:, cancelled:))
 }
 
 fn file_decoder() -> Decoder(FileVersion) {
@@ -259,15 +248,4 @@ fn file_decoder() -> Decoder(FileVersion) {
   use content <- str("content")
   use version <- decode.optional_field("version", 0, decode.int)
   decode.success(FileVersion(session_id:, path:, content:, version:))
-}
-
-fn agent_event_decoder(kind: String) -> Decoder(Event) {
-  use agent_type <- str("type")
-  use session_id <- str("session_id")
-  use run_id <- str("run_id")
-  use error <- str("error")
-  case agent_type {
-    "error" -> decode.success(AgentError(session_id:, run_id:, error:))
-    _ -> decode.success(Other(kind <> ":" <> agent_type))
-  }
 }

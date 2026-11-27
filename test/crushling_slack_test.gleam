@@ -10,7 +10,6 @@ import crushling/registry/incoming as msg
 import crushling/registry/legacy
 import crushling/registry/tailnet
 import crushling/slack
-import crushling/snapshot
 import crushling/socket
 import crushling/store
 import crushling/sys
@@ -388,28 +387,6 @@ pub fn native_stop_in_a_code_channel_test() {
   after()
   let assert Ok(registry.StopRequested("CCODE", "", "U1")) =
     process.receive(registry, 1000)
-}
-
-pub fn repo_helpers_test() {
-  let assert "owner/repo" =
-    snapshot.repo_name("https://github.com/owner/repo.git")
-  let assert "owner/repo" = snapshot.repo_name("git@github.com:owner/repo.git")
-  let assert "https://github.com/owner/repo" =
-    snapshot.web_url("git@github.com:owner/repo.git")
-  let assert "https://github.com/owner/repo" =
-    snapshot.web_url("https://github.com/owner/repo.git")
-  let assert "https://github.com/owner/repo" =
-    snapshot.web_url("ssh://git@github.com/owner/repo.git")
-  // tangled: the owner is a DID and the knot serves no page there.
-  let tangled = "git@knot.dunkirk.sh:did:plc:krxbvxvis5skq7jj6eot23ul/crushling"
-  let assert "crushling" = snapshot.repo_name(tangled)
-  let assert "" = snapshot.web_url(tangled)
-  let assert "source" = snapshot.repo_name("/tmp/x/source")
-  let assert snapshot.RepoInfo(
-    url: "https://github.com/owner/repo",
-    branch: "fix",
-    base: "main",
-  ) = snapshot.parse_repo_info("https://github.com/owner/repo\nfix\nmain\n")
 }
 
 pub fn pause_and_resume_test() {

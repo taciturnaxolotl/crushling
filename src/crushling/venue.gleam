@@ -3,6 +3,7 @@
 
 import gleam/dynamic/decode
 import gleam/json
+import gleam/option.{type Option, None, Some}
 
 pub type Venue {
   /// The Slack thread. This is where every thread starts.
@@ -58,5 +59,17 @@ pub fn decoder() -> decode.Decoder(Venue) {
     }
     "thread" -> decode.success(Thread)
     _ -> decode.failure(Thread, "Venue")
+  }
+}
+
+/// The workspace directory of the repository the work is on, if any.
+pub fn repo(venue: Venue) -> Option(String) {
+  case venue {
+    Thread -> None
+    ThreadOnly(repo:) | CodeChannel(repo:, ..) | Archived(repo:) ->
+      case repo {
+        "" -> None
+        repo -> Some(repo)
+      }
   }
 }

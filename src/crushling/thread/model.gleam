@@ -16,6 +16,7 @@ import crushling/models.{type Current, type Model}
 import crushling/sink.{type Sink}
 import crushling/sys
 import crushling/thread/conn.{type Connection}
+import crushling/thread/say
 import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{type Option, None, Some}
@@ -55,13 +56,25 @@ pub fn run(
   case connection {
     Some(connection) -> step(Context(connection:, sink:, home:, catalog:))
     None -> {
-      let _ =
-        sink.post(
-          "_the agent isn't connected right now; try again in a moment._",
-        )
+      let _ = sink.post(say.not_connected)
       Done(catalog:, change: Keep)
     }
   }
+}
+
+/// Run `step` as `run` does, and say what the thread's choice is after it
+/// and whether that changed.
+pub fn choose(
+  connection: Option(Connection),
+  sink: Sink,
+  home: #(String, String),
+  catalog: Option(List(Model)),
+  choice: Option(ModelChoice),
+  step: fn(Context) -> Done,
+) -> #(Option(List(Model)), Option(ModelChoice), Bool) {
+  let done = run(connection, sink, home, catalog, step)
+  let after = apply(done.change, choice)
+  #(done.catalog, after, after != choice)
 }
 
 /// The thread's choice after `change`.
@@ -196,24 +209,14 @@ pub fn restore(context: Context, saved: Option(ModelChoice)) -> Done {
       use context, catalog <- with_catalog(context, failed)
       case models.find(catalog, choice.model) {
         Error(_) -> {
-          say(
-            context,
-            "_this thread was set to `"
-              <> choice.model
-              <> "`, which isn't offered anymore, so it's back on the default model._",
-          )
+          tell(context, say.model_gone(choice.model))
           BackToDefault
         }
         Ok(model) -> {
           let #(choice, change) = case models.fits(model, choice.reasoning) {
             True -> #(choice, Keep)
             False -> {
-              say(
-                context,
-                "_`"
-                  <> model.id
-                  <> "` doesn't take the reasoning level this thread had anymore, so it's on the model's own default._",
-              )
+              tell(context, say.reasoning_dropped(model.id))
               let choice = ModelChoice(..choice, reasoning: DefaultReasoning)
               #(choice, Picked(choice))
             }
@@ -221,14 +224,7 @@ pub fn restore(context: Context, saved: Option(ModelChoice)) -> Done {
           case pin(context, catalog, choice) {
             Ok(_) -> change
             Error(Refused(reason)) | Error(NotTaken(reason)) -> {
-              say(
-                context,
-                "_crush wouldn't run `"
-                  <> choice.model
-                  <> "` ("
-                  <> reason
-                  <> "), so this thread is back on the default model._",
-              )
+              tell(context, say.model_refused(choice.model, reason))
               BackToDefault
             }
             // Couldn't ask: keep the choice (as corrected) for the next connect.
@@ -261,14 +257,12 @@ pub fn command(
 }
 
 fn show(context: Context) -> Done {
-  let failed = fn(reason) {
-    say(context, "_couldn't show the model: " <> reason <> "._")
-  }
+  let failed = fn(reason) { tell(context, say.no_model_card(reason)) }
   use context, catalog <- with_catalog(context, failed)
   let shown = {
     use current <- result.try(current(context))
     context.sink.post_blocks(
-      "Model: " <> current.model.name,
+      say.model_card_text(current),
       models.card(current, current, catalog, context.home, ""),
     )
   }
@@ -285,9 +279,7 @@ fn set(
   user: String,
   target: fn(Context) -> Result(#(ModelChoice, Change), String),
 ) -> Done {
-  let failed = fn(reason) {
-    say(context, "_couldn't switch the model: " <> reason <> "._")
-  }
+  let failed = fn(reason) { tell(context, say.not_switched(reason)) }
   use context, catalog <- with_catalog(context, failed)
   let switched = {
     use #(choice, change) <- result.try(target(context))
@@ -298,7 +290,7 @@ fn set(
   }
   case switched {
     Ok(#(after, change)) -> {
-      say(context, switched_note(user, after))
+      tell(context, say.switched(user, after))
       change
     }
     Error(reason) -> {
@@ -317,9 +309,7 @@ pub fn pick(
   card_ts: String,
   user: String,
 ) -> Done {
-  let failed = fn(reason) {
-    say(context, "_couldn't switch the model: " <> reason <> "._")
-  }
+  let failed = fn(reason) { tell(context, say.not_switched(reason)) }
   use context, catalog <- with_catalog(context, failed)
   case current(context) {
     Error(reason) -> {
@@ -346,15 +336,15 @@ pub fn pick(
               case context.sink.delete(card_ts) {
                 Ok(Nil) -> Nil
                 Error(_) -> {
-                  let fallback = switched_note(user, after)
+                  let fallback = say.switched(user, after)
                   redraw(context, card_ts, catalog, after, after, "", fallback)
                 }
               }
               Picked(choice)
             }
             Error(reason) -> {
-              let note = "couldn't switch: " <> reason <> "."
-              let fallback = "_" <> note <> "_"
+              let note = say.refused_note(reason)
+              let fallback = say.aside(note)
               redraw(context, card_ts, catalog, before, before, note, fallback)
               Keep
             }
@@ -378,24 +368,16 @@ fn redraw(
   let updated =
     context.sink.update_blocks(
       card_ts,
-      "Model: " <> current.model.name,
+      say.model_card_text(current),
       models.card(current, shown, catalog, context.home, note),
     )
   case updated, fallback {
     Ok(Nil), _ | Error(_), "" -> Nil
-    Error(_), fallback -> say(context, fallback)
+    Error(_), fallback -> tell(context, fallback)
   }
 }
 
-fn switched_note(user: String, current: Current) -> String {
-  "_<@"
-  <> user
-  <> "> switched the model to "
-  <> models.summary(current)
-  <> ". It applies from the next turn._"
-}
-
-fn say(context: Context, text: String) -> Nil {
+fn tell(context: Context, text: String) -> Nil {
   let _ = context.sink.post(text)
   Nil
 }
