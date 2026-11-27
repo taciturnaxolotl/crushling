@@ -1,9 +1,9 @@
 //// Code channel commands: what's offered, what they mean, and `!info`'s
 //// answer from the repository.
 
+import crushling/commands
 import crushling/conversation
 import crushling/sink
-import crushling/slack
 import crushling/thread/repo
 import gleam/erlang/process
 import gleam/list
@@ -12,9 +12,9 @@ import gleam/string
 import test_fs
 
 pub fn info_is_a_command_test() {
-  let assert slack.InfoCommand = slack.command("!info")
-  let assert slack.InfoCommand = slack.command(" !INFO ")
-  let assert True = string.contains(slack.help, "`/info`")
+  let assert commands.InfoCommand = commands.parse("!info")
+  let assert commands.InfoCommand = commands.parse(" !INFO ")
+  let assert True = string.contains(commands.help(), "`/info`")
 }
 
 /// Slack refuses the whole set if one name is its own, or too long.
@@ -25,18 +25,57 @@ pub fn offered_commands_are_ours_to_offer_test() {
     "shortcuts", "collapse", "expand", "apps", "call", "me", "shrug", "rename",
     "remove", "kick", "prefs", "help",
   ]
-  let names = list.map(slack.code_commands, fn(command) { command.0 })
+  let names = list.map(commands.slash_commands(), fn(slash) { slash.name })
   let assert True = list.length(names) <= 10
-  list.each(slack.code_commands, fn(command) {
-    let #(name, description, _) = command
+  list.each(commands.slash_commands(), fn(slash) {
+    let commands.Slash(name:, description:, ..) = slash
     let assert False = list.contains(builtins, name)
     let assert True = string.length(name) >= 1 && string.length(name) <= 31
     let assert False = string.starts_with(name, "/")
     let assert True = description != ""
     // Each stands for a `!` command.
-    let assert False = slack.command("!" <> name) == slack.NotACommand
+    let assert False = commands.parse("!" <> name) == commands.NotACommand
   })
   let assert True = list.unique(names) == names
+}
+
+/// Help names every command, by its first name.
+pub fn help_lists_every_command_test() {
+  let help = commands.help()
+  list.each(commands.specs, fn(spec) {
+    let assert [name, ..] = spec.names
+    let assert True = string.contains(help, "`" <> name <> "`")
+  })
+  list.each(commands.slash_commands(), fn(slash) {
+    let assert True = string.contains(help, "`/" <> slash.name <> "`")
+  })
+}
+
+/// Every slash command, with or without text, is the `!` command it
+/// stands for.
+pub fn slash_commands_parse_test() {
+  list.each(commands.slash_commands(), fn(slash) {
+    let assert False =
+      commands.parse(commands.from_slash(slash.name, ""))
+      == commands.NotACommand
+  })
+  let assert commands.PrCommand("Fix It") =
+    commands.parse(commands.from_slash("pr", " Fix It "))
+  let assert commands.ModelCommand("Org/X high") =
+    commands.parse(commands.from_slash("model", "Org/X high"))
+  let assert commands.StopCommand =
+    commands.parse(commands.from_slash("stop", ""))
+}
+
+/// Names that take no argument don't swallow longer words.
+pub fn parse_is_exact_test() {
+  let assert commands.NotACommand = commands.parse("!prfoo")
+  let assert commands.NotACommand = commands.parse("!stop now")
+  let assert commands.NotACommand = commands.parse("!tailnet maybe")
+  let assert commands.TailnetCommand(False) = commands.parse("!Tailscale OFF")
+  let assert commands.ResumeCommand = commands.parse("!unpause")
+  let assert commands.DoneCommand = commands.parse("!archive")
+  let assert commands.SideComment = commands.parse("##aside")
 }
 
 /// A shell that answers each script by what it asks.

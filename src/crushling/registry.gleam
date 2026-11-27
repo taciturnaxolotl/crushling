@@ -21,6 +21,7 @@
 //// stop has finished and the agent can start again. Shutdown waits for
 //// launches in flight and stops what they started.
 
+import crushling/commands
 import crushling/connections
 import crushling/conversation.{Conversation}
 import crushling/crush/client
@@ -738,13 +739,13 @@ fn route(
   let config = state.config
   let id = incoming.channel <> ":" <> incoming.ts
   let prompt = slack.prompt_text(incoming.text, config.bot_user)
-  let command = slack.command(prompt)
+  let command = commands.parse(prompt)
   // Whether this message is for the agent at all. In a code channel people
   // are talking to the agent, mentioned or not; a paused agent hears only
   // mentions, and `!resume`.
   let addressed = case known, origin {
     _, _ if incoming.mention -> True
-    Some(_), _ if command == slack.ResumeCommand -> True
+    Some(_), _ if command == commands.ResumeCommand -> True
     Some(Entry(meta: Meta(paused: True, ..), ..)), _ -> False
     Some(_), Some(_) -> True
     Some(entry), None -> entry.meta.follow
@@ -779,12 +780,12 @@ fn route(
 }
 
 /// Do what a message asks for.
-fn act(state: State, route: Route, command: slack.Command) -> State {
+fn act(state: State, route: Route, command: commands.Command) -> State {
   let config = state.config
   case command, route.known {
-    slack.SideComment, _ -> state
+    commands.SideComment, _ -> state
     // Works anywhere the bot hears it, with or without an agent.
-    slack.GitHubCommand(connect:), _ -> {
+    commands.GitHubCommand(connect:), _ -> {
       let user = route.incoming.user
       let from =
         Some(connections.Place(
@@ -800,11 +801,11 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
         }
       }
     }
-    slack.HelpCommand, _ -> {
-      whisper(config, route.incoming, slack.help)
+    commands.HelpCommand, _ -> {
+      whisper(config, route.incoming, commands.help())
       state
     }
-    slack.PauseCommand, Some(entry) -> {
+    commands.PauseCommand, Some(entry) -> {
       announce(
         config,
         route.incoming,
@@ -813,7 +814,7 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       )
       set_meta(state, route.key, entry, Meta(..entry.meta, paused: True))
     }
-    slack.ResumeCommand, Some(entry) -> {
+    commands.ResumeCommand, Some(entry) -> {
       announce(
         config,
         route.incoming,
@@ -823,8 +824,8 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       let meta = Meta(..entry.meta, paused: False, follow: True)
       set_meta(state, route.key, entry, meta)
     }
-    slack.DoneCommand, Some(entry) -> done(state, route, entry)
-    slack.PrCommand(title), Some(entry) -> {
+    commands.DoneCommand, Some(entry) -> done(state, route, entry)
+    commands.PrCommand(title), Some(entry) -> {
       let incoming = route.incoming
       deliver(
         state,
@@ -839,7 +840,7 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
         }),
       )
     }
-    slack.InfoCommand, Some(Entry(agent: Live(thread:, ..), ..)) -> {
+    commands.InfoCommand, Some(Entry(agent: Live(thread:, ..), ..)) -> {
       let incoming = route.incoming
       process.spawn_unlinked(fn() {
         let asked = process.new_subject()
@@ -851,7 +852,7 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       })
       state
     }
-    slack.InfoCommand, Some(_) -> {
+    commands.InfoCommand, Some(_) -> {
       whisper(
         config,
         route.incoming,
@@ -859,17 +860,17 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       )
       state
     }
-    slack.StopCommand, Some(Entry(agent: Live(thread:, ..), ..) as entry)
+    commands.StopCommand, Some(Entry(agent: Live(thread:, ..), ..) as entry)
       if entry.in_flight > 0 || entry.working
     -> {
       process.send(thread, thread.Cancel(None))
       state
     }
-    slack.StopCommand, _ -> {
+    commands.StopCommand, _ -> {
       whisper(config, route.incoming, "_nothing is running in this thread._")
       state
     }
-    slack.TailnetCommand(on: True), Some(entry) -> {
+    commands.TailnetCommand(on: True), Some(entry) -> {
       let #(tailnets, asked) =
         tailnet.ask(
           state.tailnets,
@@ -885,7 +886,7 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
       }
       state
     }
-    slack.TailnetCommand(on: False), Some(entry) ->
+    commands.TailnetCommand(on: False), Some(entry) ->
       tailnet.end(
         state.tailnets,
         route.key,
@@ -893,7 +894,7 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
         "_<@" <> route.incoming.user <> "> took the sandbox off the tailnet._",
       )
       |> apply_tailnet(state, route.key, Some(entry), _)
-    slack.ModelCommand(argument), Some(entry) ->
+    commands.ModelCommand(argument), Some(entry) ->
       case models.parse_argument(argument) {
         Ok(request) ->
           deliver(
@@ -911,21 +912,22 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
           state
         }
       }
-    slack.PauseCommand, None
-    | slack.ResumeCommand, None
-    | slack.DoneCommand, None
-    | slack.InfoCommand, None
-    | slack.PrCommand(..), None
-    | slack.TailnetCommand(..), None
-    | slack.ModelCommand(..), None
+    commands.PauseCommand, None
+    | commands.ResumeCommand, None
+    | commands.DoneCommand, None
+    | commands.InfoCommand, None
+    | commands.PrCommand(..), None
+    | commands.TailnetCommand(..), None
+    | commands.ModelCommand(..), None
     -> {
       whisper(config, route.incoming, "_I'm not working in this thread._")
       state
     }
     // A bare mention with nothing attached has nothing to say.
-    slack.NotACommand, _ if route.prompt == "" && route.incoming.files == [] ->
-      state
-    slack.NotACommand, known -> queue(state, route, known)
+    commands.NotACommand, _
+      if route.prompt == "" && route.incoming.files == []
+    -> state
+    commands.NotACommand, known -> queue(state, route, known)
   }
 }
 

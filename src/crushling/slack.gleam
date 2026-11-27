@@ -2,6 +2,7 @@
 //// session (Slack's "Working…" and Stop), a plan card and markdown replies, and the helpers that turn a Slack
 //// message back into a prompt.
 
+import crushling/commands
 import crushling/conversation.{type Conversation, Conversation}
 import crushling/crush/client
 import crushling/files
@@ -496,23 +497,12 @@ pub fn whisper(
   Nil
 }
 
-/// The slash commands crushling offers in its code channels, by name
-/// without the slash, each standing for its `!` command. None may be one of
-/// Slack's own (`/status`, `/archive`…): a clash fails the whole set.
-pub const code_commands = [
-  #("pr", "Propose a pull request for the pushed branch", "[title]"),
-  #("info", "Show the branch, what changed, and whether it's pushed", ""),
-  #("done", "Wrap up: archive this channel", ""),
-  #("stop", "Stop the current run", ""),
-  #("model", "Show or switch the agent's model", "[model] [reasoning]"),
-]
-
-/// Offer `code_commands` in code channel `channel`. Best effort: the `!`
-/// commands work regardless.
+/// Offer the slash commands in code channel `channel`. Best effort: the
+/// `!` commands work regardless.
 pub fn set_code_commands(client: slackline.Client, channel: String) -> Nil {
   let commands =
-    list.map(code_commands, fn(command) {
-      let #(name, description, hint) = command
+    list.map(commands.slash_commands(), fn(slash) {
+      let commands.Slash(name:, description:, hint:) = slash
       agents.AgentCommand(name:, description:, argument_hint: case hint {
         "" -> None
         hint -> Some(hint)
@@ -627,57 +617,6 @@ fn is_link(inside: String) -> Bool {
   || string.starts_with(inside, "https://")
   || string.starts_with(inside, "mailto:")
 }
-
-pub type Command {
-  StopCommand
-  HelpCommand
-  /// Stop following: only mentions reach the agent until `!resume`.
-  PauseCommand
-  ResumeCommand
-  /// Archive the code channel: the work is done.
-  DoneCommand
-  /// Where the work stands: branch, changes, pushed or not.
-  InfoCommand
-  /// Post a card proposing a PR for the pushed branch, titled `title` if
-  /// given.
-  PrCommand(title: String)
-  /// `!tailnet` asks to put the sandbox on the tailnet; `!tailnet off`
-  /// takes it off.
-  TailnetCommand(on: Bool)
-  /// `!model` shows the model card; `!model <id> [level]` switches.
-  ModelCommand(argument: String)
-  /// `!github connect` or `!github disconnect`; `!github` alone connects.
-  GitHubCommand(connect: Bool)
-  /// A `##` aside meant for the people in the thread, not the agent.
-  SideComment
-  NotACommand
-}
-
-pub fn command(prompt: String) -> Command {
-  let trimmed = string.trim(prompt)
-  case string.lowercase(trimmed) {
-    "!stop" | "stop" | "cancel" | "stop!" -> StopCommand
-    "!help" -> HelpCommand
-    "!pause" -> PauseCommand
-    "!resume" | "!unpause" -> ResumeCommand
-    "!done" | "!archive" -> DoneCommand
-    "!info" -> InfoCommand
-    "!pr" -> PrCommand("")
-    "!tailnet" | "!tailscale" -> TailnetCommand(on: True)
-    "!tailnet off" | "!tailscale off" -> TailnetCommand(on: False)
-    "!github" | "!github connect" -> GitHubCommand(connect: True)
-    "!github disconnect" -> GitHubCommand(connect: False)
-    "!model" -> ModelCommand("")
-    // Model ids keep their case: take the argument from the original.
-    "!model " <> _ -> ModelCommand(string.trim(string.drop_start(trimmed, 7)))
-    "!pr " <> _ -> PrCommand(string.trim(string.drop_start(trimmed, 4)))
-    "##" <> _ -> SideComment
-    _ -> NotACommand
-  }
-}
-
-pub const help =
-  "*crushling* runs a coding agent for this thread.\n• Reply in the thread to keep going; messages sent while it works run next.\n• `!stop` stops the current run.\n• `!pause` makes it answer only when mentioned; `!resume` has it follow along again.\n• `!pr [title]` posts a card proposing a pull request for the agent's pushed branch; whoever presses Open PR opens it, as themselves.\n• `!info` shows the branch, what changed, and whether it's pushed.\n• `!done` in a code channel archives it. In a code channel these are slash commands too: `/pr`, `/info`, `/done`, `/stop`, `/model`.\n• `!tailnet` asks to put the agent's sandbox on your tailnet for a while; `!tailnet off` ends it.\n• `!model` shows the model and lets you pick another and its reasoning; `!model <id> [level]` switches directly, and `!model default` goes back.\n• `!github` connects your GitHub account so agents can work in your repos as you; `!github disconnect` forgets it. The App Home has both too.\n• Start a line with `##` to talk without the agent seeing it.\n• `!help` shows this."
 
 /// A file attached to a Slack message. `size` is what Slack says, if it
 /// says.
@@ -1009,8 +948,8 @@ pub fn catch_up(
       case message.user, message.text, message.ts, message.bot_id {
         Some(user), Some(text), Some(ts), None if user != bot_user -> {
           let at = ts_value(ts)
-          case at >. after && at <. before, command(text) {
-            True, NotACommand -> {
+          case at >. after && at <. before, commands.parse(text) {
+            True, commands.NotACommand -> {
               let files = attachments(message.files)
               Ok(#(
                 "[<@"

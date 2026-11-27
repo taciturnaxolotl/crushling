@@ -3,6 +3,7 @@
 //// server` (test/fake_crush_ffi.erl), and the registry waking and putting
 //// to sleep a thread that only got `!model`.
 
+import crushling/commands
 import crushling/conversation
 import crushling/crush/client
 import crushling/key
@@ -14,7 +15,6 @@ import crushling/registry
 import crushling/registry/incoming as msg
 import crushling/render
 import crushling/sink
-import crushling/slack
 import crushling/socket
 import crushling/store
 import crushling/thread
@@ -151,15 +151,15 @@ pub fn argument_test() {
 }
 
 pub fn command_test() {
-  let assert slack.ModelCommand("") = slack.command("!model")
-  let assert slack.ModelCommand("") = slack.command(" !Model ")
-  let assert slack.ModelCommand("kimi-k3 high") =
-    slack.command("!model  kimi-k3 high")
+  let assert commands.ModelCommand("") = commands.parse("!model")
+  let assert commands.ModelCommand("") = commands.parse(" !Model ")
+  let assert commands.ModelCommand("kimi-k3 high") =
+    commands.parse("!model  kimi-k3 high")
   // The argument keeps its case; the command doesn't care about it.
-  let assert slack.ModelCommand("Org/Model-X") =
-    slack.command("!MODEL Org/Model-X")
-  let assert slack.NotACommand = slack.command("!models")
-  let assert True = string.contains(slack.help, "`!model`")
+  let assert commands.ModelCommand("Org/Model-X") =
+    commands.parse("!MODEL Org/Model-X")
+  let assert commands.NotACommand = commands.parse("!models")
+  let assert True = string.contains(commands.help(), "`!model`")
 }
 
 pub fn choice_survives_the_store_json_test() {

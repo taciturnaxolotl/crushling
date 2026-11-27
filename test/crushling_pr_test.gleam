@@ -1,9 +1,9 @@
 //// Staged pull requests: what a proposal is made from, its card, and
 //// opening it on GitHub as whoever pressed.
 
+import crushling/commands
 import crushling/github
 import crushling/pr
-import crushling/slack
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
@@ -100,9 +100,9 @@ pub fn card_test() {
 }
 
 pub fn pr_command_test() {
-  let assert slack.PrCommand("") = slack.command("!pr")
-  let assert slack.PrCommand("Fix the thing") =
-    slack.command("!pr Fix the thing")
+  let assert commands.PrCommand("") = commands.parse("!pr")
+  let assert commands.PrCommand("Fix the thing") =
+    commands.parse("!pr Fix the thing")
 }
 
 fn github(

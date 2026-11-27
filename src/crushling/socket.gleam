@@ -1,6 +1,7 @@
 //// Socket Mode: one WebSocket to Slack, reopened whenever Slack asks or the
 //// connection drops, with every event turned into a `msg.Incoming`.
 
+import crushling/commands
 import crushling/connections
 import crushling/home
 import crushling/key as thread_key
@@ -121,7 +122,8 @@ fn pr_buttons(app: app.App, find: Find) -> app.App {
 /// The slash commands offered in code channels: each is its `!` command,
 /// said in the channel by whoever typed it.
 fn code_commands(app: app.App, find: Find) -> app.App {
-  use app, #(name, _, _) <- list.fold(slack.code_commands, app)
+  use app, slash <- list.fold(commands.slash_commands(), app)
+  let name = slash.name
   use command <- app.command(app, "/" <> name)
   case target(find, command.team_id, command.enterprise_id) {
     Ok(Target(registry:, ..)) ->
@@ -130,9 +132,7 @@ fn code_commands(app: app.App, find: Find) -> app.App {
         registry.Slash(
           channel: command.channel_id,
           user: command.user_id,
-          text: string.trim(
-            "!" <> name <> " " <> option.unwrap(command.text, ""),
-          ),
+          text: commands.from_slash(name, option.unwrap(command.text, "")),
         ),
       )
     Error(Nil) -> Nil

@@ -3,6 +3,7 @@
 //// and the registry connecting and disconnecting someone against a fake
 //// Slack.
 
+import crushling/commands
 import crushling/connections
 import crushling/crush/client
 import crushling/github
@@ -13,7 +14,6 @@ import crushling/people
 import crushling/proxy/meter
 import crushling/registry
 import crushling/registry/incoming as msg
-import crushling/slack
 import crushling/store
 import crushling/store/github as accounts
 import crushling/store/usage
@@ -472,10 +472,11 @@ pub fn nudge_test() {
 }
 
 pub fn github_command_test() {
-  let assert slack.GitHubCommand(True) = slack.command("!github")
-  let assert slack.GitHubCommand(True) = slack.command("!GitHub connect")
-  let assert slack.GitHubCommand(False) = slack.command("!github disconnect")
-  let assert True = string.contains(slack.help, "`!github`")
+  let assert commands.GitHubCommand(True) = commands.parse("!github")
+  let assert commands.GitHubCommand(True) = commands.parse("!GitHub connect")
+  let assert commands.GitHubCommand(False) =
+    commands.parse("!github disconnect")
+  let assert True = string.contains(commands.help(), "`!github`")
 }
 
 // The registry, against a fake Slack.

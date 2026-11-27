@@ -1,3 +1,4 @@
+import crushling/commands
 import crushling/crush/client
 import crushling/events
 import crushling/key
@@ -47,14 +48,14 @@ pub fn prompt_text_test() {
 }
 
 pub fn command_test() {
-  let assert slack.StopCommand = slack.command("!stop")
-  let assert slack.StopCommand = slack.command("Cancel")
-  let assert slack.HelpCommand = slack.command(" !help ")
-  let assert slack.PauseCommand = slack.command("!pause")
-  let assert slack.ResumeCommand = slack.command("!Resume")
-  let assert slack.DoneCommand = slack.command("!done")
-  let assert slack.SideComment = slack.command("## not for the bot")
-  let assert slack.NotACommand = slack.command("stop the server")
+  let assert commands.StopCommand = commands.parse("!stop")
+  let assert commands.StopCommand = commands.parse("Cancel")
+  let assert commands.HelpCommand = commands.parse(" !help ")
+  let assert commands.PauseCommand = commands.parse("!pause")
+  let assert commands.ResumeCommand = commands.parse("!Resume")
+  let assert commands.DoneCommand = commands.parse("!done")
+  let assert commands.SideComment = commands.parse("## not for the bot")
+  let assert commands.NotACommand = commands.parse("stop the server")
 }
 
 fn decode_event(raw: String) -> event.Event {
