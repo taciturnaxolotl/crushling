@@ -55,23 +55,12 @@ fn button(
 
 /// The card asking to put the sandbox on the tailnet; `by` is who asked, or "" for the agent.
 pub fn ask_blocks(
-  by: String,
+  _by: String,
   reason: String,
   key: String,
   tag: String,
   thread: #(String, String),
 ) -> List(block.Block) {
-  let who = case by {
-    "" -> "The agent wants"
-    user -> "<@" <> user <> "> wants"
-  }
-  let why = case string.trim(reason) {
-    "" -> ""
-    reason ->
-      string.split(reason, "\n")
-      |> list.map(fn(line) { "\n> " <> line })
-      |> string.concat
-  }
   let allow =
     list.map(offers, fn(hours) {
       button(
@@ -82,19 +71,17 @@ pub fn ask_blocks(
       )
     })
   [
-    blocks.markdown(
-      who
-      <> " this sandbox on the tailnet."
-      <> why
-      <> "\nIt would join as `"
-      <> tailscale.hostname(key)
-      <> "`, tagged `"
-      <> tag
-      <> "`. The tailnet's access rules decide which machines it can reach.",
-    ),
-    block.actions(
-      elements: list.append(allow, [button("Deny", deny_action, thread, [])]),
-      with: [],
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconGlobe, "*Put the sandbox on the tailnet?*"),
+        body: string.replace(string.trim(reason), "\n", " "),
+        subtext: "Joins as `"
+          <> tailscale.hostname(key)
+          <> "`, tagged `"
+          <> tag
+          <> "`.",
+        actions: list.append(allow, [button("Deny", deny_action, thread, [])]),
+      ),
     ),
   ]
 }
@@ -103,26 +90,25 @@ pub fn ask_blocks(
 pub fn on_blocks(
   until_ms: Int,
   by: String,
+  key: String,
+  tag: String,
   thread: #(String, String),
 ) -> List(block.Block) {
   [
-    blocks.markdown(
-      "The sandbox is on the tailnet until "
-      <> when(until_ms)
-      <> ". <@"
-      <> by
-      <> "> allowed it.",
-    ),
-    block.actions(
-      elements: [
-        button("Turn off", off_action, thread, [button.style(block.Danger)]),
-      ],
-      with: [],
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconGlobe, "*The sandbox is on the tailnet*"),
+        subtitle: "Until " <> when(until_ms),
+        body: "Joined as `"
+          <> tailscale.hostname(key)
+          <> "`, tagged `"
+          <> tag
+          <> "`.",
+        subtext: "Approved by <@" <> by <> ">",
+        actions: [
+          button("Turn off", off_action, thread, [button.style(block.Danger)]),
+        ],
+      ),
     ),
   ]
-}
-
-/// A card with nothing left to press.
-pub fn done_blocks(text: String) -> List(block.Block) {
-  [blocks.markdown(text)]
 }

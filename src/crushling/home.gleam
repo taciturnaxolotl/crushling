@@ -75,7 +75,7 @@ pub fn view(home: Home) -> view.View {
 fn blocks(home: Home) -> List(block.Block) {
   case home {
     NotAllowed -> [
-      text("You can't use crushling in this workspace. Ask whoever runs it."),
+      text("You can't use crushling in this workspace."),
     ]
     Home(github: state, threads:, thread_count:, today:, month:, default_model:) ->
       list.flatten([

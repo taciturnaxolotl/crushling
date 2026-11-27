@@ -9,9 +9,7 @@ import crushling/meta.{
   Thinking,
 }
 import crushling/registry/tailnet
-import crushling/slack/action_ref.{
-  CardRef, ConfirmButton, ModelMenu, ReasoningMenu, ReasoningOption,
-}
+import crushling/slack/action_ref.{CardRef, ConfirmButton, ReasoningOption}
 import crushling/slack/blocks
 import gleam/dict
 import gleam/list
@@ -20,7 +18,7 @@ import gleam/result
 import gleam/string
 import slackline/block
 import slackline/block/actions
-import slackline/block/input
+import slackline/block/container
 import slackline/element
 import slackline/element/button
 import slackline/element/static_select
@@ -204,15 +202,11 @@ pub fn card(
     offered(catalog, model)
     |> list.map(fn(model) { block.option(fit(model.name, max_label), model.id) })
   let model_menu =
-    block.input(
-      label: "Model",
-      element: element.static_select(action_id: model_action, with: [
-        static_select.options(model_options),
-        static_select.placeholder("Pick a model"),
-        ..selected(model_options, model.id)
-      ]),
-      with: [input.block_id(card_ref(ModelMenu)), input.dispatch_action(True)],
-    )
+    element.static_select(action_id: model_action, with: [
+      static_select.options(model_options),
+      static_select.placeholder("Pick a model"),
+      ..selected(model_options, model.id)
+    ])
   let reasoning_menu = case reasoning_options(model) {
     [] -> []
     choices -> {
@@ -224,40 +218,45 @@ pub fn card(
           )
         })
       [
-        block.input(
-          label: "Reasoning",
-          element: element.static_select(action_id: reasoning_action, with: [
-            static_select.options(options),
-            static_select.placeholder("Reasoning"),
-            ..selected(options, reasoning_value(model.id, shown.reasoning))
-          ]),
-          with: [input.block_id(action_ref.encode(ReasoningMenu(model.id)))],
-        ),
+        element.static_select(action_id: reasoning_action, with: [
+          static_select.options(options),
+          static_select.placeholder("Reasoning"),
+          ..selected(options, reasoning_value(model.id, shown.reasoning))
+        ]),
       ]
     }
   }
   let confirm =
+    element.button(text: "Confirm", action_id: confirm_action, with: [
+      button.style(block.Primary),
+    ])
+  // One row: the menus and Confirm. Its id names the thread and the model
+  // shown, in case Slack leaves an untouched menu out of the state it
+  // sends; a redraw for another model, under another id, starts clean.
+  let row =
     block.actions(
-      elements: [
-        element.button(text: "Confirm", action_id: confirm_action, with: [
-          button.style(block.Primary),
-        ]),
+      elements: [model_menu, ..list.append(reasoning_menu, [confirm])],
+      with: [
+        actions.block_id(card_ref(ConfirmButton)),
       ],
-      // The model shown, in case Slack leaves an untouched menu out of the
-      // state it sends.
-      with: [actions.block_id(card_ref(ConfirmButton))],
     )
   [
-    blocks.text("Model: " <> catalog.summary(current)),
-    model_menu,
-    ..list.flatten([
-      reasoning_menu,
-      [confirm],
-      case note {
-        "" -> []
-        note -> [blocks.context(note)]
-      },
-    ])
+    block.container(
+      child_blocks: [
+        row,
+        ..case note {
+          "" -> []
+          note -> [blocks.context(note)]
+        }
+      ],
+      with: [
+        container.title(current.model.name),
+        ..case catalog.reasoning_words(current) {
+          "" -> []
+          words -> [container.subtitle(block.mrkdwn(words))]
+        }
+      ],
+    ),
   ]
 }
 

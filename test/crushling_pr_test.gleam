@@ -109,7 +109,11 @@ pub fn card_test() {
   list.each(pr.actions(), fn(action) {
     let assert True = string.contains(shown, action)
   })
-  let #(_, settled) = pr.settled(p, "<@U1> opened #7")
+  let #(line, settled) =
+    pr.opened(p, "U1", "https://github.com/o/r/pull/7", 7, True)
+  let assert True =
+    string.starts_with(line, "<@U1> opened <https://github.com/o/r/pull/7|#7 ")
+  let assert True = string.ends_with(line, "> as a draft")
   let assert False = string.contains(string.inspect(settled), pr.open_action)
 }
 

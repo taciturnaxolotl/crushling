@@ -4,6 +4,7 @@
 import crushling/agent/post_mortem.{type PostMortem}
 import crushling/crush/catalog.{type Current}
 import crushling/git.{type PushState, type RepoInfo}
+import crushling/meta
 import crushling/render
 import crushling/slack/blocks
 import crushling/snapshot.{type Change}
@@ -14,6 +15,8 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import slackline/block
+import slackline/element
+import slackline/element/button
 
 /// A line in italics, as the bridge's own remarks are.
 pub fn aside(line: String) -> String {
@@ -169,29 +172,47 @@ pub fn status(
 
 // Models ----------------------------------------------------------------------
 
-pub fn model_gone(model: String) -> String {
-  aside(
-    "this thread was set to `"
-    <> model
-    <> "`, which isn't offered anymore, so it's back on the default model.",
+/// A model card for a change nobody picked: what the thread runs now, and
+/// why. The text, and the blocks.
+fn model_updated(now: String, why: String) -> #(String, List(block.Block)) {
+  #("Model updated: " <> why, [
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconSparkle, "*Model updated*"),
+        subtitle: now,
+        subtext: why,
+      ),
+    ),
+  ])
+}
+
+pub fn model_gone(model: String) -> #(String, List(block.Block)) {
+  model_updated(
+    "Default model",
+    "Switched to the default because `" <> model <> "` is no longer offered.",
   )
 }
 
-pub fn reasoning_dropped(model: String) -> String {
-  aside(
-    "`"
-    <> model
-    <> "` doesn't take the reasoning level this thread had anymore, so it's on the model's own default.",
+pub fn reasoning_dropped(model: String) -> #(String, List(block.Block)) {
+  model_updated(
+    "`" <> model <> "` · default reasoning",
+    "Switched to the default reasoning because `"
+      <> model
+      <> "` no longer takes the level this thread had.",
   )
 }
 
-pub fn model_refused(model: String, reason: String) -> String {
-  aside(
-    "`"
-    <> model
-    <> "` failed to start ("
-    <> reason
-    <> "), so this thread is back on the default model.",
+pub fn model_refused(
+  model: String,
+  reason: String,
+) -> #(String, List(block.Block)) {
+  model_updated(
+    "Default model",
+    "Switched to the default because `"
+      <> model
+      <> "` failed to start: "
+      <> reason
+      <> ".",
   )
 }
 
@@ -209,13 +230,34 @@ pub fn refused_note(reason: String) -> String {
 }
 
 pub fn switched(user: String, current: Current) -> String {
-  aside(
-    "<@"
-    <> user
-    <> "> switched the model to "
-    <> catalog.summary(current)
-    <> ". It applies from the next turn.",
-  )
+  "<@"
+  <> user
+  <> "> switched the model to `"
+  <> current.model.name
+  <> "`"
+  <> case reasoning(current) {
+    "" -> ""
+    how -> " with " <> how
+  }
+}
+
+fn reasoning(current: Current) -> String {
+  case current.reasoning {
+    meta.Thinking(False) -> ""
+    _ -> catalog.reasoning_words(current)
+  }
+}
+
+/// A model card once someone confirmed: the model it runs now.
+pub fn switched_card(_user: String, current: Current) -> List(block.Block) {
+  [
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconSparkle, "*" <> current.model.name <> "*"),
+        subtitle: catalog.reasoning_words(current),
+      ),
+    ),
+  ]
 }
 
 /// The fallback text of a model card.
@@ -233,7 +275,15 @@ pub fn subagent_card(
   status: String,
 ) -> #(String, List(block.Block)) {
   let line = "*" <> who <> "* · " <> scope
-  #(line, [blocks.text(line), blocks.context(status)])
+  #(line, [
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconBot, "*" <> who <> "*"),
+        body: scope,
+        subtext: status,
+      ),
+    ),
+  ])
 }
 
 pub const subagent_working = "Subagent · working"
@@ -276,13 +326,29 @@ pub fn subagent_done(
   status: String,
   link: String,
 ) -> #(String, List(block.Block)) {
-  let verb = case failed {
-    True -> "stopped on"
-    False -> "finished"
+  let #(verb, icon) = case failed {
+    True -> #("stopped on", block.IconWarning)
+    False -> #("finished", block.IconCheck)
   }
   let line = "*" <> who <> "* " <> verb <> " " <> scope
+  let open = case link {
+    "" -> []
+    link -> [
+      element.button(
+        text: "Open thread",
+        action_id: "crushling_open_thread",
+        with: [button.url(link)],
+      ),
+    ]
+  }
   #(line, [
-    blocks.text(line <> " · <" <> link <> "|open its thread>"),
-    blocks.context(status),
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(icon, "*" <> who <> "* " <> verb),
+        body: scope,
+        subtext: status,
+        actions: open,
+      ),
+    ),
   ])
 }

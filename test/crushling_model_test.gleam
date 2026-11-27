@@ -183,12 +183,18 @@ pub fn choice_survives_the_store_json_test() {
 
 // The card.
 
-/// The menus on a card, from its input blocks, in order.
+/// What a card holds inside its one container: its row and any note.
+fn parts(blocks: List(block.Block)) -> List(block.Block) {
+  let assert [block.Container(box)] = blocks
+  box.child_blocks
+}
+
+/// The menus on a card, in order.
 fn menus(blocks: List(block.Block)) -> List(block.StaticSelectElement) {
-  list.filter_map(blocks, fn(block) {
-    case block {
-      block.Input(block.InputBlock(element: block.StaticSelect(menu), ..)) ->
-        Ok(menu)
+  let assert [block.Actions(row), ..] = parts(blocks)
+  list.filter_map(row.elements, fn(element) {
+    case element {
+      block.StaticSelect(menu) -> Ok(menu)
       _ -> Error(Nil)
     }
   })
@@ -203,26 +209,31 @@ fn card(current: catalog.Current, catalog, note) {
   model_card.card(current, current, catalog, #("C1", "1.5"), note)
 }
 
+/// The card's title and subtitle, the title in bold as it shows.
 fn header(blocks: List(block.Block)) -> String {
-  let assert [block.Section(block.SectionBlock(text: Some(text), ..)), ..] =
-    blocks
-  string.inspect(text)
+  let assert [block.Container(box)] = blocks
+  "*"
+  <> option.unwrap(box.title, block.plain_text("")).text
+  <> "* "
+  <> string.inspect(box.subtitle)
 }
 
 pub fn card_test() {
   let blocks =
     card(catalog.Current(model("alpha"), Effort("low")), catalog(), "")
   // The model and reasoning in words; no prices.
-  let assert True = string.contains(header(blocks), "*Alpha* · reasoning Low")
+  let assert True = string.contains(header(blocks), "*Alpha*")
+  let assert True = string.contains(header(blocks), "`low` reasoning")
   let assert False = string.contains(header(blocks), "$")
-  let assert [_, block.Input(m), block.Input(_), block.Actions(confirm)] =
-    blocks
-  // The model menu dispatches on change, so the reasoning menu can follow;
-  // Confirm names the thread.
-  let assert Some(True) = m.dispatch_action
-  let assert Some(id) = confirm.block_id
+  // One row: both menus and Confirm, whose id names the thread.
+  let assert [block.Actions(row)] = parts(blocks)
+  let assert Some(id) = row.block_id
   let assert Ok(action_ref.CardRef(_, "C1", "1.5", _)) = action_ref.decode(id)
-  let assert [block.Button(button)] = confirm.elements
+  let assert [
+    block.StaticSelect(_),
+    block.StaticSelect(_),
+    block.Button(button),
+  ] = row.elements
   let assert Some(block.Primary) = button.style
   let assert [menu, reasoning] = menus(blocks)
   let assert Some(options) = menu.options
@@ -244,7 +255,7 @@ pub fn card_test() {
       catalog(),
       "couldn't",
     )
-  let assert [_, _, block.Actions(_), block.Context(_)] = blocks
+  let assert [block.Actions(_), block.Context(_)] = parts(blocks)
   let assert [_] = menus(blocks)
 }
 
@@ -537,9 +548,10 @@ pub fn no_saved_model_pins_nothing_test() {
 pub fn a_saved_model_that_left_the_catalog_is_dropped_test() {
   let #(server, t, seen) =
     start("stale", Some(ModelChoice("gone", DefaultReasoning)))
-  let assert Posted(text) = receive(seen)
-  let assert True = string.contains(text, "`gone`")
-  let assert True = string.contains(text, "back on the default model")
+  let assert Card(blocks) = receive(seen)
+  let text = string.inspect(blocks)
+  let assert True = string.contains(text, "Model updated")
+  let assert True = string.contains(text, "`gone` is no longer offered")
   let assert Chosen(None) = receive(seen)
   no("model")
   process.send(t, thread.Stop)
@@ -551,9 +563,9 @@ pub fn a_saved_level_the_model_dropped_keeps_the_model_test() {
   // the model kept.
   let #(server, t, seen) =
     start("level", Some(ModelChoice("beta", Effort("max"))))
-  let assert Posted(text) = receive(seen)
+  let assert Card(blocks) = receive(seen)
   let assert True =
-    string.contains(text, "`beta` doesn't take the reasoning level")
+    string.contains(string.inspect(blocks), "`beta` no longer takes the level")
   let assert Chosen(Some(ModelChoice("beta", DefaultReasoning))) = receive(seen)
   let fields = pinned(expect("model"))
   let assert Ok("beta") = dict.get(fields, "model")
@@ -565,8 +577,9 @@ pub fn a_saved_level_the_model_dropped_keeps_the_model_test() {
 pub fn a_saved_model_crush_refuses_goes_back_to_the_default_test() {
   let #(server, t, seen) =
     start("broken", Some(ModelChoice("broken", DefaultReasoning)))
-  let assert Posted(text) = receive(seen)
-  let assert True = string.contains(text, "`broken` failed to start")
+  let assert Card(blocks) = receive(seen)
+  let assert True =
+    string.contains(string.inspect(blocks), "`broken` failed to start")
   let assert Chosen(None) = receive(seen)
   process.send(t, thread.Stop)
   stop_server(server)
@@ -602,8 +615,10 @@ pub fn card_shows_and_switches_test() {
   let fields = pinned(expect("model"))
   let assert Ok("beta") = dict.get(fields, "model")
   let assert Error(Nil) = dict.get(fields, "think")
-  // The card has done its job and goes.
-  let assert Deleted("card") = receive(seen)
+  // The card has done its job and shrinks to the model and who chose it.
+  let assert CardUpdated("card", [block.Card(section)]) = receive(seen)
+  let shown = string.inspect(section)
+  let assert True = string.contains(shown, "*Beta*")
   let assert Chosen(Some(ModelChoice("beta", DefaultReasoning))) = receive(seen)
   // Then its reasoning.
   process.send(
@@ -615,7 +630,8 @@ pub fn card_shows_and_switches_test() {
     ),
   )
   let assert Ok("True") = dict.get(pinned(expect("model")), "think")
-  let assert Deleted("card") = receive(seen)
+  let assert CardUpdated("card", [block.Card(section)]) = receive(seen)
+  let assert True = string.contains(string.inspect(section), "thinking on")
   let assert Chosen(Some(ModelChoice("beta", Thinking(True)))) = receive(seen)
   process.send(t, thread.Stop)
   stop_server(server)
@@ -634,7 +650,7 @@ pub fn a_refused_confirm_puts_the_card_back_test() {
     ),
   )
   let assert CardUpdated("card", blocks) = receive(seen)
-  let assert [_, _, _, _, block.Context(note)] = blocks
+  let assert [_, block.Context(note)] = parts(blocks)
   let assert True =
     string.contains(string.inspect(note), "`alpha` takes low, high")
   let assert [menu, reasoning] = menus(blocks)
@@ -657,9 +673,8 @@ pub fn command_switches_refuses_and_resets_test() {
     ),
   )
   let assert Ok("low") = dict.get(pinned(expect("model")), "reasoning_effort")
-  let assert Posted(text) = receive(seen)
-  let assert True = string.contains(text, "*Alpha*")
-  let assert True = string.contains(text, "reasoning Low")
+  let assert Card(blocks) = receive(seen)
+  let assert True = string.contains(string.inspect(blocks), "*Alpha*")
   let assert Chosen(Some(ModelChoice("alpha", Effort("low")))) = receive(seen)
   // A model that isn't there is refused before crush hears of it.
   process.send(
@@ -677,7 +692,7 @@ pub fn command_switches_refuses_and_resets_test() {
   let fields = pinned(expect("model"))
   let assert Ok("alpha") = dict.get(fields, "model")
   let assert Error(Nil) = dict.get(fields, "reasoning_effort")
-  let assert Posted(_) = receive(seen)
+  let assert Card(_) = receive(seen)
   let assert Chosen(None) = receive(seen)
   process.send(t, thread.Stop)
   stop_server(server)

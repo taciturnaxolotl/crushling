@@ -9,7 +9,7 @@ import crushling/github/nudge
 import crushling/github/repo
 import crushling/home/publisher
 import crushling/pr
-import crushling/registry/core.{type State, PrSettled, State}
+import crushling/registry/core.{type State, GitHubAskPosted, PrSettled, State}
 import crushling/registry/entry.{Entry, Live}
 import crushling/registry/text
 import crushling/slack/workspace
@@ -21,9 +21,6 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set
-
-/// Asked to connect GitHub at most this often per person and thread.
-const nudge_every_ms = 600_000
 
 /// How long the thread may take to say whose it is.
 pub const requester_ms = 5000
@@ -111,18 +108,10 @@ pub fn press(
     }
     Some(github) -> {
       let workspace = state.config.workspace
-      let settle = fn(outcome) {
-        let #(text, blocks) = pr.settled(proposal, outcome)
-        workspace.update_later(
-          workspace,
-          channel,
-          card_ts,
-          workspace.Message(text, blocks),
-        )
-      }
       case choice {
+        // Nothing to remember a dismissed card by: it goes.
         "dismiss" -> {
-          settle(text.pr_dismissed(user))
+          workspace.delete_later(workspace, channel, card_ts)
           State(..state, proposals: dict.delete(state.proposals, card_ts))
         }
         _ -> {
@@ -142,7 +131,14 @@ pub fn press(
               Ok(broker.AsPerson(token:, ..)) ->
                 case pr.open(github.config, token, proposal, draft) {
                   Ok(#(number, url)) -> {
-                    settle(text.pr_opened(user, url, number, draft))
+                    let #(text, blocks) =
+                      pr.opened(proposal, user, url, number, draft)
+                    workspace.update_later(
+                      workspace,
+                      channel,
+                      card_ts,
+                      workspace.Message(text, blocks),
+                    )
                     tell(PrSettled(card_ts))
                   }
                   Error(why) -> say(text.could_not_open_pr(why))
@@ -158,61 +154,115 @@ pub fn press(
   }
 }
 
-/// Ask `user` to connect GitHub or install the App, at most every `nudge_every_ms` per thread and need.
+/// Ask in thread `key`, publicly, for what its GitHub request needs: one
+/// card per need, which anyone who may use crushling can press, and which
+/// goes once the need is met. `user` is whose request it was.
 pub fn nudge(
   state: State(msg),
   key: String,
-  user: String,
+  _user: String,
   need: broker.Need,
 ) -> State(msg) {
-  let now = sys.monotonic_ms()
-  // A connect and then an install are both asked.
-  let asked = case need {
-    broker.Connect(..) -> Ok(#(key, user, "connect"))
-    broker.Install(repo:) -> Ok(#(key, user, "install:" <> repo.key(repo)))
-    broker.Unavailable(..) -> Error(Nil)
-  }
-  let recently = case asked {
-    Ok(asked) ->
-      case dict.get(state.nudged, asked) {
-        Ok(at) -> now - at < nudge_every_ms
-        Error(Nil) -> False
+  case need_name(need), dict.get(state.threads, key) {
+    Ok(name), Ok(entry) ->
+      case dict.has_key(state.asks, #(key, name)) {
+        True -> state
+        False -> {
+          let workspace = state.config.workspace
+          let broker = state.broker
+          let tell = core.teller(state)
+          let #(channel, thread_ts) = #(entry.channel, entry.thread_ts)
+          process.spawn_unlinked(fn() {
+            let ask = case need {
+              broker.Connect(repo:) ->
+                Some(nudge.ask_connect(channel, thread_ts, repo))
+              broker.Install(repo:) ->
+                broker.accounts(broker)
+                |> option.map(fn(accounts) {
+                  nudge.ask_install(repo, accounts.install_url)
+                })
+              broker.Unavailable(..) -> None
+            }
+            let posted = case ask {
+              Some(#(text, blocks)) ->
+                workspace.post(
+                  workspace,
+                  Conversation(channel, Some(thread_ts)),
+                  workspace.Message(text, blocks),
+                )
+                |> result.unwrap("")
+              None -> ""
+            }
+            tell(GitHubAskPosted(key, name, channel, posted))
+          })
+          State(
+            ..state,
+            asks: dict.insert(state.asks, #(key, name), #(channel, "")),
+          )
+        }
       }
-    Error(Nil) -> True
+    _, _ -> state
   }
-  case recently, asked, dict.get(state.threads, key) {
-    False, Ok(asked), Ok(entry) -> {
-      let workspace = state.config.workspace
-      let broker = state.broker
-      let #(channel, thread_ts) = #(entry.channel, entry.thread_ts)
-      process.spawn_unlinked(fn() {
-        let ask = case need {
-          broker.Connect(repo:) ->
-            Some(nudge.ask_connect(channel, thread_ts, repo))
-          broker.Install(repo:) ->
-            broker.accounts(broker)
-            |> option.map(fn(accounts) {
-              nudge.ask_install(repo, accounts.install_url)
-            })
-          broker.Unavailable(..) -> None
-        }
-        case ask {
-          Some(#(text, blocks)) ->
-            workspace.whisper_later(
-              workspace,
-              Conversation(channel, Some(thread_ts)),
-              user,
-              workspace.Message(text, blocks),
-            )
-          None -> Nil
-        }
-      })
-      let nudged =
-        dict.filter(state.nudged, fn(_, at) { now - at < nudge_every_ms })
-        |> dict.insert(asked, now)
-      State(..state, nudged:)
+}
+
+/// A thread's ask went up as `ts` ("" if it couldn't): remember it, or
+/// forget it so the next request asks again.
+pub fn ask_posted(
+  state: State(msg),
+  key: String,
+  name: String,
+  channel: String,
+  ts: String,
+) -> State(msg) {
+  case ts, dict.get(state.asks, #(key, name)) {
+    "", _ -> State(..state, asks: dict.delete(state.asks, #(key, name)))
+    _, Ok(_) ->
+      State(
+        ..state,
+        asks: dict.insert(state.asks, #(key, name), #(channel, ts)),
+      )
+    // Met while it posted: it has nothing left to ask.
+    _, Error(Nil) -> {
+      workspace.delete_later(state.config.workspace, channel, ts)
+      state
     }
-    _, _, _ -> state
+  }
+}
+
+/// Thread `key`'s `need` was met: its card goes. A connection met by a
+/// stand-in also clears the thread's install asks it no longer blocks on.
+pub fn ask_met(
+  state: State(msg),
+  key: String,
+  need: broker.Need,
+) -> State(msg) {
+  case need_name(need) {
+    Ok(name) -> clear_ask(state, key, name)
+    Error(Nil) -> state
+  }
+}
+
+/// Every ask thread `key` has up goes: its agent stopped.
+pub fn clear_asks(state: State(msg), key: String) -> State(msg) {
+  dict.keys(state.asks)
+  |> list.filter(fn(asked) { asked.0 == key })
+  |> list.fold(state, fn(state, asked) { clear_ask(state, key, asked.1) })
+}
+
+fn clear_ask(state: State(msg), key: String, name: String) -> State(msg) {
+  case dict.get(state.asks, #(key, name)) {
+    Ok(#(channel, ts)) if ts != "" ->
+      workspace.delete_later(state.config.workspace, channel, ts)
+    _ -> Nil
+  }
+  State(..state, asks: dict.delete(state.asks, #(key, name)))
+}
+
+fn need_name(need: broker.Need) -> Result(String, Nil) {
+  case need {
+    broker.Connect(..) -> Ok("connect")
+    broker.Install(repo:) -> Ok("install:" <> repo.key(repo))
+    broker.Unavailable(..) -> Error(Nil)
   }
 }
 

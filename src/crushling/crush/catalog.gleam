@@ -241,6 +241,17 @@ pub fn summary(current: Current) -> String {
   }
 }
 
+/// How `current` reasons, in words for a card: "`high` reasoning",
+/// "thinking on", or "" for the model's default.
+pub fn reasoning_words(current: Current) -> String {
+  case current.model.kind, current.reasoning {
+    Levels(..), Effort(level) -> "`" <> level <> "` reasoning"
+    Toggle, Thinking(True) -> "thinking on"
+    Toggle, Thinking(False) -> "thinking off"
+    _, _ -> ""
+  }
+}
+
 fn reasoning_label(kind: Kind, reasoning: Reasoning) -> Option(String) {
   case kind, reasoning {
     Levels(levels:, ..), Effort(level) ->

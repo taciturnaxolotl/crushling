@@ -211,44 +211,73 @@ fn summary(p: Proposal) -> String {
   <> int.to_string(p.removed)
 }
 
-fn heading(p: Proposal) -> String {
-  "*"
-  <> p.title
-  <> "*\n`"
-  <> p.head
-  <> "` → `"
-  <> p.base
-  <> "` in "
-  <> repo.full(p.repo)
-}
-
 /// The card proposing `p`: its buttons open it as whoever presses.
 pub fn card(p: Proposal) -> #(String, List(block.Block)) {
   let text = "Pull request ready: " <> p.title
   #(text, [
-    blocks.markdown(heading(p)),
-    blocks.context(summary(p) <> " · opens as whoever presses"),
-    block.actions(
-      elements: [
-        element.button(text: "Open PR", action_id: open_action, with: [
-          button.style(block.Primary),
-          button.value("open"),
-        ]),
-        element.button(text: "Open as draft", action_id: draft_action, with: [
-          button.value("draft"),
-        ]),
-        element.button(text: "Dismiss", action_id: dismiss_action, with: [
-          button.value("dismiss"),
-        ]),
-      ],
-      with: [],
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconCode, "*" <> p.title <> "*"),
+        subtitle: repo.full(p.repo),
+        body: branches(p),
+        subtext: summary(p),
+        actions: [
+          element.button(text: "Open PR", action_id: open_action, with: [
+            button.style(block.Primary),
+            button.value("open"),
+          ]),
+          element.button(text: "Open as draft", action_id: draft_action, with: [
+            button.value("draft"),
+          ]),
+          element.button(text: "Dismiss", action_id: dismiss_action, with: [
+            button.value("dismiss"),
+          ]),
+        ],
+      ),
     ),
   ])
 }
 
-/// The card once something happened to it: `outcome` says what.
-pub fn settled(p: Proposal, outcome: String) -> #(String, List(block.Block)) {
-  #(p.title, [blocks.markdown(heading(p)), blocks.context(outcome)])
+/// The card once someone opened it: the PR, linked, and who opened it.
+pub fn opened(
+  p: Proposal,
+  user: String,
+  url: String,
+  number: Int,
+  draft: Bool,
+) -> #(String, List(block.Block)) {
+  let how = case draft {
+    True -> " as a draft"
+    False -> ""
+  }
+  let line =
+    "<@"
+    <> user
+    <> "> opened <"
+    <> url
+    <> "|#"
+    <> int.to_string(number)
+    <> " "
+    <> p.title
+    <> ">"
+    <> how
+  #(line, [
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(
+          block.IconCheck,
+          "*<" <> url <> "|#" <> int.to_string(number) <> " " <> p.title <> ">*",
+        ),
+        subtitle: repo.full(p.repo),
+        body: "Opened by <@" <> user <> ">" <> how,
+        subtext: branches(p) <> "\n" <> summary(p),
+      ),
+    ),
+  ])
+}
+
+fn branches(p: Proposal) -> String {
+  "`" <> p.head <> "` → `" <> p.base <> "`"
 }
 
 // Opening it ----------------------------------------------------------------

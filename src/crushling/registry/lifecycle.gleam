@@ -3,7 +3,9 @@
 
 import crushling/agents
 import crushling/conversation.{Conversation}
+import crushling/github/broker
 import crushling/launcher
+import crushling/registry/accounts
 import crushling/registry/backlog.{pump}
 import crushling/registry/core.{
   type State, FromThread, IdleCheck, JobsUncounted, RetryStop, Started, State,
@@ -168,6 +170,9 @@ pub fn stop_agent(state: State(msg), key: String) -> State(msg) {
       process.demonitor_process(monitor)
       process.send(thread, thread.Stop)
       run_stop(state, key)
+      // Its GitHub stand-in and asks go with it.
+      broker.forget(state.broker, key)
+      let state = accounts.clear_asks(state, key)
       let tailnets = tailnet.stopped(state.tailnets, key)
       // Its turn and idle timer go with `Live`.
       let entry = Entry(..entry, agent: Stopping(0))

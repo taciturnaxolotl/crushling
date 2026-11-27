@@ -61,6 +61,10 @@ pub type Event {
   PrSettled(card_ts: String)
   /// Ask `user`, in thread `key`, for what a GitHub request needs.
   GitHubNudgeTo(key: String, user: String, need: broker.Need)
+  /// Thread `key`'s ask for `need` went up as the message at `ts`.
+  GitHubAskPosted(key: String, need: String, channel: String, ts: String)
+  /// Thread `key`'s `need` was met: its ask goes.
+  GitHubAskMet(key: String, need: broker.Need)
   /// A join finishing, or a grant's timer, for thread `key`.
   TailnetLater(key: String, event: tailnet.Event)
 }
@@ -98,8 +102,9 @@ pub type State(msg) {
     home: Subject(publisher.Message),
     /// Whose GitHub credentials a request uses.
     broker: Broker,
-    /// When each person was last asked to connect GitHub, by thread, user and need, in monotonic ms.
-    nudged: Dict(#(String, String, String), Int),
+    /// The GitHub asks up in threads, by thread key and need, with their
+    /// channel and ts ("" while it posts).
+    asks: Dict(#(String, String), #(String, String)),
     /// PR cards awaiting a press, by ts; lost on restart, when `/pr` posts a new one.
     proposals: Dict(String, #(String, pr.Proposal)),
   )

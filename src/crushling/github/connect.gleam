@@ -22,6 +22,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
+import gleam/string
 
 pub type Setup {
   Setup(
@@ -396,17 +397,20 @@ fn revoke(config: Option(github.Config), tokens: Tokens) -> Revoke {
 fn code_note(code: github.DeviceCode) -> String {
   "Enter *`"
   <> code.user_code
-  <> "`* at "
+  <> "`* at <"
   <> code.verification_uri
-  <> " to connect your GitHub account."
+  <> "|"
+  <> string.replace(code.verification_uri, "https://", "")
+  <> "> to connect your GitHub account."
 }
 
-/// Answer privately where a `!github` command was given.
+/// Answer privately where a `!github` command or an ask's Connect was
+/// given: never in place of the ask, which others may still need.
 fn reply(state: State, from: Option(Place), user: String, text: String) -> Nil {
   let workspace = state.setup.workspace
   case from {
     Some(Place(respond: Some(url), ..)) ->
-      workspace.respond_later(workspace, url, text, True)
+      workspace.respond_later(workspace, url, text, False)
     Some(Place(channel:, thread_ts:, respond: None)) ->
       workspace.whisper_later(
         workspace,

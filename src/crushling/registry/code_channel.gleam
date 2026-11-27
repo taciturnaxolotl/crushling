@@ -94,12 +94,7 @@ pub fn archive(
   workspace.archive_later(state.config.workspace, channel, note, summary_ts)
   case entry {
     Some(entry) ->
-      tailnet.end(
-        state.tailnets,
-        key,
-        tailnet_view(entry),
-        text.tailnet_ended_with_channel,
-      )
+      tailnet.end(state.tailnets, key, tailnet_view(entry))
       |> apply_tailnet(state, key, Some(entry), _)
       |> set_meta(
         key,

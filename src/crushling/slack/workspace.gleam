@@ -499,6 +499,15 @@ pub fn update_later(
   })
 }
 
+/// Delete the bot's message at `ts` in `channel`, through the outbox.
+pub fn delete_later(workspace: Workspace, channel: String, ts: String) -> Nil {
+  later(workspace, "deleting a message in " <> channel, fn() {
+    chat.delete(channel:, ts:)
+    |> httpc.send(workspace.client)
+    |> result.replace(Nil)
+  })
+}
+
 /// `ephemeral`, through the outbox.
 pub fn whisper_later(
   workspace: Workspace,

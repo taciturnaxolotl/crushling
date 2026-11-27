@@ -971,3 +971,25 @@ fn real_clone() -> Nil {
   let assert True = string.contains(text(resp), "\"full_name\"")
   Nil
 }
+
+pub fn graphql_target_test() {
+  let full = fn(body) {
+    route.graphql_target(bit_array.from_string(body))
+    |> option.map(repo.full)
+  }
+  // gh's own queries pass the repo as variables.
+  let assert Some("octo/hyper") =
+    full(
+      "{\"query\":\"query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){id}}\",\"variables\":{\"owner\":\"octo\",\"repo\":\"hyper\",\"first\":5}}",
+    )
+  let assert Some("octo/hyper") =
+    full(
+      "{\"query\":\"{ repository(owner: \\\"octo\\\", name: \\\"hyper\\\") { id } }\"}",
+    )
+  // Nothing to go by, or two repos: no guess.
+  let assert None = full("{\"query\":\"{ viewer { login } }\"}")
+  let assert None =
+    full(
+      "{\"query\":\"{ a: repository(owner: \\\"o\\\", name: \\\"x\\\") { id } b: repository(owner: \\\"o\\\", name: \\\"y\\\") { id } }\"}",
+    )
+}

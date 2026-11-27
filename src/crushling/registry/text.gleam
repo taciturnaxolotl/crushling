@@ -1,7 +1,5 @@
 //// What the registry says in Slack, outside the `!` command replies.
 
-import gleam/int
-
 pub const broken_thread =
   "_Failed to migrate this thread's workspace. An admin should check the bridge logs._"
 
@@ -34,9 +32,6 @@ pub const still_working =
 
 pub const no_code_channel = "_there's no code channel to wrap up._"
 
-pub const tailnet_ended_with_channel =
-  "_The tailnet access ended with the channel._"
-
 pub const card_expired = "_This card has expired; `/pr` posts a new one._"
 
 pub const github_not_set_up = "_GitHub isn't set up for this crushling._"
@@ -48,27 +43,4 @@ pub const no_connection = "_Failed to load your GitHub connection. Try again._"
 
 pub fn could_not_open_pr(why: String) -> String {
   "_Failed to open the PR: " <> why <> "._"
-}
-
-pub fn pr_dismissed(user: String) -> String {
-  "Dismissed by <@" <> user <> ">"
-}
-
-pub fn pr_opened(
-  user: String,
-  url: String,
-  number: Int,
-  draft: Bool,
-) -> String {
-  "<@"
-  <> user
-  <> "> opened <"
-  <> url
-  <> "|#"
-  <> int.to_string(number)
-  <> ">"
-  <> case draft {
-    True -> " as a draft"
-    False -> ""
-  }
 }

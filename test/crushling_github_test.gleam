@@ -473,11 +473,13 @@ pub fn nudge_test() {
   let assert Ok(hyper) = repo.parse_path("octo", "hyper")
   let #(text, blocks) = nudge.ask_connect("C1", "1.5", Some(hyper))
   let assert True =
-    text
-    == "crushling would like private access to `octo/hyper`. Would you like to connect crushling to your GitHub account?"
+    text == "The agent needs GitHub access to reach `octo/hyper`."
   let assert True = string.contains(string.inspect(blocks), "C1|1.5")
   let #(text, blocks) = nudge.ask_install(hyper, "https://x/install")
-  let assert True = string.contains(text, "isn't set up on *octo*")
+  let assert True = string.contains(text, "isn't on *octo*")
+  let #(text, _) = nudge.ask_connect("C1", "1.5", None)
+  let assert "The agent needs GitHub access to reach a private repository." =
+    text
   let assert True = string.contains(string.inspect(blocks), "https://x/install")
   let assert Ok(action_ref.ThreadRef("C1", "1.5")) =
     action_ref.decode(action_ref.encode(action_ref.ThreadRef("C1", "1.5")))
@@ -670,7 +672,7 @@ pub fn only_allowed_people_connect_test() {
   let assert False = asked_github(seen, "/login/device/code", 300)
   // Someone listed does, in the same registry. Pressed on the note in a
   // thread, the code is said there too.
-  // The code replaces the message whose button they pressed.
+  // The code goes to them alone; the ask stays up for anyone else.
   process.send(
     r,
     registry.GitHubConnectIn(
@@ -683,7 +685,7 @@ pub fn only_allowed_people_connect_test() {
   let got = calls_until(calls, ["respond", "views.publish"], [], 3000)
   let assert Ok(said) = list.key_find(got, "respond")
   let assert True = string.contains(said, "ABCD-1234")
-  let assert True = string.contains(said, "\"replace_original\":true")
+  let assert True = string.contains(said, "\"replace_original\":false")
   let assert True =
     list.any(got, fn(call) {
       call.0 == "views.publish" && string.contains(call.1, "ABCD-1234")

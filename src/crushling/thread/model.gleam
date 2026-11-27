@@ -23,6 +23,7 @@ import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import slackline/block
 
 pub type Context {
   Context(
@@ -211,14 +212,14 @@ pub fn restore(context: Context, saved: Option(ModelChoice)) -> Done {
       use context, catalog <- with_catalog(context, failed)
       case catalog.find(catalog, choice.model) {
         Error(_) -> {
-          tell(context, say.model_gone(choice.model))
+          tell_card(context, say.model_gone(choice.model))
           BackToDefault
         }
         Ok(model) -> {
           let #(choice, change) = case catalog.fits(model, choice.reasoning) {
             True -> #(choice, Keep)
             False -> {
-              tell(context, say.reasoning_dropped(model.id))
+              tell_card(context, say.reasoning_dropped(model.id))
               let choice = ModelChoice(..choice, reasoning: DefaultReasoning)
               #(choice, Picked(choice))
             }
@@ -226,7 +227,7 @@ pub fn restore(context: Context, saved: Option(ModelChoice)) -> Done {
           case pin(context, catalog, choice) {
             Ok(_) -> change
             Error(Refused(reason)) | Error(NotTaken(reason)) -> {
-              tell(context, say.model_refused(choice.model, reason))
+              tell_card(context, say.model_refused(choice.model, reason))
               BackToDefault
             }
             // Couldn't ask: keep the choice (as corrected) for the next connect.
@@ -292,7 +293,10 @@ fn set(
   }
   case switched {
     Ok(#(after, change)) -> {
-      tell(context, say.switched(user, after))
+      tell_card(context, #(
+        say.switched(user, after),
+        say.switched_card(user, after),
+      ))
       change
     }
     Error(reason) -> {
@@ -332,15 +336,19 @@ pub fn pick(
         }
         model_card.Confirm(choice) ->
           case pin(context, catalog, choice) |> result.map_error(describe) {
-            // The card has done its job. If it can't be deleted (it may
-            // be somewhere the sink can't reach), show the new model on it.
+            // The card has done its job and shrinks to what changed. If it
+            // is somewhere the sink can't reach, the thread hears instead.
             Ok(after) -> {
-              case context.sink.delete(card_ts) {
+              let line = say.switched(user, after)
+              case
+                context.sink.update_blocks(
+                  card_ts,
+                  line,
+                  say.switched_card(user, after),
+                )
+              {
                 Ok(Nil) -> Nil
-                Error(_) -> {
-                  let fallback = say.switched(user, after)
-                  redraw(context, card_ts, catalog, after, after, "", fallback)
-                }
+                Error(_) -> tell(context, line)
               }
               Picked(choice)
             }
@@ -377,6 +385,11 @@ fn redraw(
     Ok(Nil), _ | Error(_), "" -> Nil
     Error(_), fallback -> tell(context, fallback)
   }
+}
+
+fn tell_card(context: Context, card: #(String, List(block.Block))) -> Nil {
+  let _ = context.sink.post_blocks(card.0, card.1)
+  Nil
 }
 
 fn tell(context: Context, text: String) -> Nil {

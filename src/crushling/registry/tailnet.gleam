@@ -9,6 +9,7 @@ import crushling/meta.{type Card, type Grant}
 import crushling/people.{type People}
 import crushling/registry/tailnet/card as tailnet_card
 import crushling/slack/action_ref.{ThreadRef}
+import crushling/slack/blocks
 import crushling/slack/workspace.{type Workspace, Message}
 import crushling/sys
 import crushling/tailscale
@@ -191,6 +192,11 @@ pub fn ask(
   }
 }
 
+/// A finished card goes.
+fn clear(t: Tailnets, card: Card) -> Nil {
+  workspace.delete_later(t.workspace, card.channel, card.ts)
+}
+
 fn show(t: Tailnets, card: Card, blocks: List(block.Block)) -> Nil {
   workspace.update_later(
     t.workspace,
@@ -221,32 +227,33 @@ fn pressed(
       keep(t)
     }
     True, None, _ -> {
-      show(t, card, tailnet_card.done_blocks("_This thread is gone._"))
+      clear(t, card)
       keep(t)
     }
     True, Some(_), Deny -> {
-      show(
-        t,
-        card,
-        tailnet_card.done_blocks(
-          "_<@" <> user <> "> kept the sandbox off the tailnet._",
-        ),
-      )
+      clear(t, card)
       keep(t)
     }
     True, Some(thread), TurnOff -> {
-      let text = "_<@" <> user <> "> took the sandbox off the tailnet._"
       case thread.grant {
-        Some(_) -> end(t, key, thread, text)
+        Some(_) -> end(t, key, thread)
         None -> {
-          show(t, card, tailnet_card.done_blocks(text))
+          clear(t, card)
           keep(t)
         }
       }
     }
     True, Some(thread), Allow(hours) -> {
       let until_ms = sys.system_ms() + hours * 3_600_000
-      show(t, card, tailnet_card.on_blocks(until_ms, user, thread.home))
+      let tag = case t.setup {
+        Some(setup) -> setup.api.tag
+        None -> ""
+      }
+      show(
+        t,
+        card,
+        tailnet_card.on_blocks(until_ms, user, key, tag, thread.home),
+      )
       let grant = meta.Grant(until_ms:, card:)
       Outcome(
         ..check(t, key, Thread(..thread, grant: Some(grant)), Some(user)),
@@ -270,18 +277,18 @@ pub fn check(
           t.later(key, Tick, left)
           keep(sync(t, key, thread.running, thread.grant, tell))
         }
-        _ -> end(t, key, thread, "_The sandbox's tailnet access ended._")
+        _ -> end(t, key, thread)
       }
     None -> keep(sync(t, key, thread.running, None, tell))
   }
 }
 
-/// End a thread's access, and say why on its card.
-pub fn end(t: Tailnets, key: String, thread: Thread, text: String) -> Outcome {
+/// End a thread's access; its card has done its job and goes.
+pub fn end(t: Tailnets, key: String, thread: Thread) -> Outcome {
   case thread.grant {
     None -> keep(t)
     Some(grant) -> {
-      show(t, grant.card, tailnet_card.done_blocks(text))
+      clear(t, grant.card)
       Outcome(sync(t, key, thread.running, None, None), Revoked, None)
     }
   }
@@ -349,12 +356,23 @@ fn joined(
     }
     Error(reason), Some(thread) if thread.running -> {
       sys.warn("crushling: " <> key <> " couldn't join the tailnet: " <> reason)
-      end(
-        gone,
-        key,
-        thread,
-        "_Failed to put the sandbox on the tailnet: " <> reason <> "._",
-      )
+      // A failure stays on the card, so the people who allowed it see why.
+      case thread.grant {
+        Some(grant) ->
+          show(gone, grant.card, [
+            blocks.card(
+              blocks.Card(
+                ..blocks.new_card(
+                  block.IconWarning,
+                  "*Failed to put the sandbox on the tailnet*",
+                ),
+                body: reason,
+              ),
+            ),
+          ])
+        None -> Nil
+      }
+      Outcome(sync(gone, key, thread.running, None, None), Revoked, None)
     }
     // The agent stopped while it joined; its access waits for the next one.
     _, _ -> keep(gone)

@@ -1,6 +1,7 @@
-//// Asks in a thread when its agent needs GitHub access the person hasn't
-//// given: Connect, answered there with the code, or adding crushling's
-//// GitHub App to an account. Only the person asked sees them.
+//// Asks in a thread when its agent needs GitHub access nobody has given:
+//// Connect, answered privately with the code, or adding crushling's GitHub
+//// App to an account. Public cards anyone who may use crushling can
+//// press; they go once the need is met.
 
 import crushling/github/connect
 import crushling/github/repo.{type Repo}
@@ -56,64 +57,83 @@ pub fn decode(
   }
 }
 
-/// Asked in a thread when its agent couldn't read `repo` on GitHub for
-/// want of the person's connection: Connect answers there, with the code.
-/// The text, and the blocks.
+/// Asked in a thread when its agent couldn't reach `repo` on GitHub for
+/// want of a connection: whoever presses Connect gets the code, and the
+/// agent works as them once they're in. The text, and the blocks.
 pub fn ask_connect(
   channel: String,
   thread_ts: String,
   on: Option(Repo),
 ) -> #(String, List(block.Block)) {
-  let what = case on {
-    Some(target) -> "`" <> repo.full(target) <> "`"
-    option.None -> "your private repositories"
+  let text = case on {
+    Some(target) ->
+      "The agent needs GitHub access to reach `" <> repo.full(target) <> "`."
+    option.None ->
+      "The agent needs GitHub access to reach a private repository."
   }
-  let text =
-    "crushling would like private access to "
-    <> what
-    <> ". Would you like to connect crushling to your GitHub account?"
   #(text, [
-    blocks.with_button(
-      text,
-      element.button(text: "Connect GitHub", action_id: connect_action, with: [
-        button.style(block.Primary),
-        button.value(action_ref.encode(ThreadRef(channel, thread_ts))),
-      ]),
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconKey, "*Connect GitHub*"),
+        subtitle: case on {
+          Some(target) -> repo.full(target)
+          option.None -> ""
+        },
+        body: text,
+        actions: [
+          element.button(
+            text: "Connect GitHub",
+            action_id: connect_action,
+            with: [
+              button.style(block.Primary),
+              button.value(action_ref.encode(ThreadRef(channel, thread_ts))),
+            ],
+          ),
+        ],
+      ),
     ),
   ])
 }
 
-/// Asked when the person is connected but crushling's GitHub App isn't on
-/// the account `target` belongs to: the button opens GitHub's page to
-/// add it.
+/// Asked when the agent works as someone connected but crushling's GitHub
+/// App isn't on the account `target` belongs to: the button opens GitHub's
+/// page to add it.
 pub fn ask_install(
   target: Repo,
   install_url: String,
 ) -> #(String, List(block.Block)) {
   let owner = repo.owner(target)
   let text =
-    "crushling would like access to `"
+    "crushling's GitHub App isn't on *"
+    <> owner
+    <> "*, so the agent can't reach `"
     <> repo.full(target)
-    <> "`, but it isn't set up on *"
-    <> owner
-    <> "* yet. Would you like to add it? If you don't own "
-    <> owner
-    <> ", GitHub asks its owners to approve."
+    <> "`."
   #(text, [
-    blocks.with_button(
-      text,
-      element.button(text: "Add to " <> owner, action_id: install_action, with: [
-        button.style(block.Primary),
-        button.url(install_url),
-        button.value(owner),
-      ]),
+    blocks.card(
+      blocks.Card(
+        ..blocks.new_card(block.IconLink, "*Add crushling to " <> owner <> "*"),
+        subtitle: repo.full(target),
+        body: text,
+        actions: [
+          element.button(
+            text: "Add to " <> owner,
+            action_id: install_action,
+            with: [
+              button.style(block.Primary),
+              button.url(install_url),
+              button.value(owner),
+            ],
+          ),
+        ],
+      ),
     ),
   ])
 }
 
 /// Said in place of the install ask once its button is pressed.
 pub fn installing(owner: String) -> String {
-  "Once crushling is on *"
+  "_Waiting for crushling to be added to *"
   <> owner
-  <> "*, the agent carries on by itself. If an owner has to approve it, the agent waits up to 10 minutes."
+  <> "*. The agent carries on by itself once it is, for up to 10 minutes._"
 }

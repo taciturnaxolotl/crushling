@@ -19,10 +19,11 @@ import crushling/registry/backlog.{prepared, pump}
 import crushling/registry/code_channel
 import crushling/registry/config.{type Config}
 import crushling/registry/core.{
-  type Event, Deferred, FromThread, GitHubNudgeTo, IdleCheck, JobsUncounted,
-  Member, PrSettled, Prepared, RetryStop, ShutdownDeadline, ShutdownFinal,
-  ShutdownGiveUp, Started, State, Stopped, Sweep, TailnetLater, ThreadDown,
-  announce, apply_tailnet, busy, entry_for, key, put, set_meta, whisper,
+  type Event, Deferred, FromThread, GitHubAskMet, GitHubAskPosted, GitHubNudgeTo,
+  IdleCheck, JobsUncounted, Member, PrSettled, Prepared, RetryStop,
+  ShutdownDeadline, ShutdownFinal, ShutdownGiveUp, Started, State, Stopped,
+  Sweep, TailnetLater, ThreadDown, announce, apply_tailnet, busy, entry_for, key,
+  put, set_meta, whisper,
 }
 import crushling/registry/entry.{
   type Entry, Asleep, Entry, Live, Starting, Stopping, Turn, already_read,
@@ -176,6 +177,9 @@ fn init(
         ask: fn(key, user, need) {
           process.send(self, Internal(Own(GitHubNudgeTo(key, user, need))))
         },
+        met: fn(key, need) {
+          process.send(self, Internal(Own(GitHubAskMet(key, need))))
+        },
         install_poll_ms: broker.default_install_poll_ms,
       ))
       |> result.replace_error("the GitHub broker could not start"),
@@ -233,7 +237,7 @@ fn init(
       connect:,
       home:,
       broker:,
-      nudged: dict.new(),
+      asks: dict.new(),
       proposals: dict.new(),
     )
     |> actor.initialised
@@ -316,6 +320,10 @@ fn own(state: State, event: Event) -> actor.Next(State, Message) {
       )
     GitHubNudgeTo(key, user, need) ->
       actor.continue(accounts.nudge(state, key, user, need))
+    GitHubAskPosted(key, need, channel, ts) ->
+      actor.continue(accounts.ask_posted(state, key, need, channel, ts))
+    GitHubAskMet(key, need) ->
+      actor.continue(accounts.ask_met(state, key, need))
     JobsUncounted(key, token) ->
       actor.continue(jobs_uncounted(state, key, token))
     ThreadDown(down) -> actor.continue(thread_down(state, down))
@@ -360,8 +368,18 @@ fn serve(state: State, message: Message) -> State {
       stop_requested(state, channel, thread_ts, user)
     HomeOpened(user) -> home_ask(state, message, user, ShowHome)
     GitHubConnect(user) -> home_ask(state, message, user, Connect(None))
-    GitHubConnectIn(user, place) ->
-      home_ask(state, message, user, Connect(Some(place)))
+    GitHubConnectIn(user, place) -> {
+      use <- admit(state, user, message, fn() {
+        accounts.show_home(state, user, Connect(Some(place)), False)
+      })
+      // Whoever connects from a thread's ask stands in for its requester.
+      broker.vouch(
+        state.broker,
+        key(core.team(state), place.channel, place.thread_ts),
+        user,
+      )
+      accounts.show_home(state, user, Connect(Some(place)), True)
+    }
     GitHubDisconnect(user) -> {
       process.send(state.connect, connect.Disconnect(user, None))
       state
@@ -621,12 +639,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
       state
     }
     commands.TailnetCommand(on: False), Some(entry) ->
-      tailnet.end(
-        state.tailnets,
-        route.key,
-        tailnet_view(entry),
-        "_<@" <> route.incoming.user <> "> took the sandbox off the tailnet._",
-      )
+      tailnet.end(state.tailnets, route.key, tailnet_view(entry))
       |> apply_tailnet(state, route.key, Some(entry), _)
     commands.ModelCommand(argument), Some(entry) ->
       case catalog.parse_argument(argument) {

@@ -1,7 +1,8 @@
 //// Whose GitHub credentials a request uses, one broker per workspace.
 ////
 //// A request from a thread's sandbox goes as the person whose prompt the
-//// agent is on, when they've connected; a read nobody connected for goes
+//// agent is on, when they've connected, or as whoever connected from that
+//// thread's ask instead; a read nobody connected for goes
 //// with the app's own token on a public repo, else with none. Pushes and
 //// opening pull requests only ever go as a person. What's missing comes
 //// back as a `Need`, which the caller can ask for and `await`.
@@ -23,6 +24,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
+import gleam/string
 
 /// The GitHub App people connect through, and its own key when known.
 pub type GitHub {
@@ -64,6 +66,8 @@ pub type Setup {
     requester: fn(String) -> Result(String, String),
     /// Ask `user`, in thread `key`, for what a request needs.
     ask: fn(String, String, Need) -> Nil,
+    /// Thread `key`'s `need` was met: its ask has done its job.
+    met: fn(String, Need) -> Nil,
     /// How often an awaited install is looked for.
     install_poll_ms: Int,
   )
@@ -96,7 +100,8 @@ type Person =
   Result(Option(#(String, String)), String)
 
 type Waited {
-  ForConnection(user: String)
+  /// A connection for thread `key`: `user`'s, or a stand-in's.
+  ForConnection(key: String, user: String)
   ForInstall(repo: Repo)
 }
 
@@ -116,6 +121,11 @@ type Message {
   Unwait(waited: Waited, reply: Subject(Nil))
   Changed(connect.Event)
   InstallSeen(repo: Repo)
+  /// `user` pressed Connect on thread `key`'s ask: once connected, the
+  /// thread's requests go as them.
+  Vouch(key: String, user: String)
+  ActingFor(key: String, requester: String, reply: Subject(String))
+  Forget(key: String)
 }
 
 type State {
@@ -129,6 +139,10 @@ type State {
     waiters: Dict(String, List(Subject(Nil))),
     /// One process per awaited install, looking for it.
     watchers: Dict(String, Pid),
+    /// Who a thread's requests go as instead of its requester, by key.
+    stand_ins: Dict(String, String),
+    /// Threads each person vouched for, until they are connected.
+    vouched: Dict(String, List(String)),
   )
 }
 
@@ -143,6 +157,8 @@ pub fn start(setup: Setup) -> Result(Broker, actor.StartError) {
       refreshers: dict.new(),
       waiters: dict.new(),
       watchers: dict.new(),
+      stand_ins: dict.new(),
+      vouched: dict.new(),
     )
     |> actor.initialised
     |> actor.selecting(
@@ -215,8 +231,18 @@ pub fn await(
   need: Need,
   timeout_ms: Int,
 ) -> Bool {
+  await_for(broker, "", requester, need, timeout_ms)
+}
+
+fn await_for(
+  broker: Broker,
+  key: String,
+  requester: String,
+  need: Need,
+  timeout_ms: Int,
+) -> Bool {
   let waited = case need {
-    Connect(_) -> Ok(ForConnection(requester))
+    Connect(_) -> Ok(ForConnection(key, requester))
     Install(repo) -> Ok(ForInstall(repo))
     Unavailable(_) -> Error(Nil)
   }
@@ -246,7 +272,7 @@ pub fn thread(broker: Broker, key: String) -> Result(Access, String) {
   use requester <- result.map(broker.setup.requester(key))
   Access(
     credential: fn(repo, purpose) {
-      credential(broker, key, requester, repo, purpose)
+      credential(broker, key, acting(broker, key, requester), repo, purpose)
     },
     refused: fn(credential, repo) { refused(broker, credential, repo) },
     ask: fn(need) {
@@ -255,8 +281,33 @@ pub fn thread(broker: Broker, key: String) -> Result(Access, String) {
         user -> broker.setup.ask(key, user, need)
       }
     },
-    await: fn(need, timeout_ms) { await(broker, requester, need, timeout_ms) },
+    await: fn(need, timeout_ms) {
+      let met = await_for(broker, key, requester, need, timeout_ms)
+      case met {
+        True -> broker.setup.met(key, need)
+        False -> Nil
+      }
+      met
+    },
   )
+}
+
+/// Let `user`, who pressed Connect on thread `key`'s ask, stand in for its
+/// requester once they're connected.
+pub fn vouch(broker: Broker, key: String, user: String) -> Nil {
+  process.send(broker.subject, Vouch(key, user))
+}
+
+/// Forget who thread `key` goes as: its agent stopped.
+pub fn forget(broker: Broker, key: String) -> Nil {
+  process.send(broker.subject, Forget(key))
+}
+
+/// Who thread `key`'s requests go as: its stand-in, else `requester`.
+fn acting(broker: Broker, key: String, requester: String) -> String {
+  let reply = process.new_subject()
+  process.send(broker.subject, ActingFor(key, requester, reply))
+  process.receive(reply, person_ms) |> result.unwrap(requester)
 }
 
 fn app_of(broker: Broker) -> Option(App) {
@@ -331,17 +382,55 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
         |> list.filter(fn(other) { other != reply })
       settle_waiters(state, named, left)
     }
-    Changed(connect.ConnectionChanged(user:, ..)) -> {
-      let named = waited_name(ForConnection(user))
-      case dict.get(state.waiters, named) {
-        Ok(waiting) ->
-          case connected(state, user) {
-            True -> wake(state, named, waiting)
-            False -> state
-          }
-        Error(Nil) -> state
+    Changed(connect.ConnectionChanged(user:, ..)) ->
+      case connected(state, user) {
+        False -> state
+        True -> {
+          // Threads they vouched for go as them now.
+          let keys = dict.get(state.vouched, user) |> result.unwrap([])
+          let state =
+            list.fold(
+              keys,
+              State(..state, vouched: dict.delete(state.vouched, user)),
+              fn(state, key) { stand_in(state, key, user) },
+            )
+          wake_matching(state, fn(waited) {
+            case waited {
+              ForConnection(user: waiting_on, ..) -> waiting_on == user
+              ForInstall(..) -> False
+            }
+          })
+        }
       }
+    Vouch(key, user) ->
+      case connected(state, user) {
+        True -> stand_in(state, key, user)
+        False -> {
+          let keys = dict.get(state.vouched, user) |> result.unwrap([])
+          State(
+            ..state,
+            vouched: dict.insert(state.vouched, user, [
+              key,
+              ..list.filter(keys, fn(k) { k != key })
+            ]),
+          )
+        }
+      }
+    ActingFor(key, requester, reply) -> {
+      process.send(
+        reply,
+        dict.get(state.stand_ins, key) |> result.unwrap(requester),
+      )
+      state
     }
+    Forget(key) ->
+      State(
+        ..state,
+        stand_ins: dict.delete(state.stand_ins, key),
+        vouched: dict.map_values(state.vouched, fn(_, keys) {
+          list.filter(keys, fn(k) { k != key })
+        }),
+      )
     InstallSeen(repo) -> {
       let named = waited_name(ForInstall(repo))
       let state = State(..state, watchers: dict.delete(state.watchers, named))
@@ -465,7 +554,7 @@ fn connected(state: State, user: String) -> Bool {
 
 fn waited_name(waited: Waited) -> String {
   case waited {
-    ForConnection(user) -> "connect:" <> user
+    ForConnection(key:, user:) -> "connect:" <> key <> ":" <> user
     ForInstall(repo) -> "install:" <> repo.key(repo)
   }
 }
@@ -474,9 +563,10 @@ fn wait(state: State, waited: Waited, reply: Subject(Nil)) -> State {
   let named = waited_name(waited)
   let waiting = dict.get(state.waiters, named) |> result.unwrap([])
   case waited {
-    // Connected between being refused and waiting: nothing to wait for.
-    ForConnection(user) ->
-      case connected(state, user) {
+    // Connected between being refused and waiting, or someone stood in:
+    // nothing to wait for.
+    ForConnection(key:, user:) ->
+      case connected(state, user) || dict.has_key(state.stand_ins, key) {
         True -> {
           process.send(reply, Nil)
           state
@@ -547,5 +637,50 @@ fn settle_waiters(
       )
     }
     left -> State(..state, waiters: dict.insert(state.waiters, named, left))
+  }
+}
+
+/// Thread `key`'s requests go as `user` from now on; whoever waited on a
+/// connection for it goes ahead.
+fn stand_in(state: State, key: String, user: String) -> State {
+  let state = State(..state, stand_ins: dict.insert(state.stand_ins, key, user))
+  wake_matching(state, fn(waited) {
+    case waited {
+      ForConnection(key: waiting_for, ..) -> waiting_for == key
+      ForInstall(..) -> False
+    }
+  })
+}
+
+/// Wake everyone whose wait `matches`.
+fn wake_matching(state: State, matches: fn(Waited) -> Bool) -> State {
+  dict.fold(state.waiters, state, fn(state, named, waiting) {
+    case parse_waited(named) {
+      Ok(waited) ->
+        case matches(waited) {
+          True -> wake(state, named, waiting)
+          False -> state
+        }
+      Error(Nil) -> state
+    }
+  })
+}
+
+/// A connection wait from its name; installs aren't woken this way.
+fn parse_waited(named: String) -> Result(Waited, Nil) {
+  case named {
+    "connect:" <> rest -> {
+      use #(key, user) <- result.map(split_last(rest, ":"))
+      ForConnection(key:, user:)
+    }
+    _ -> Error(Nil)
+  }
+}
+
+fn split_last(text: String, on: String) -> Result(#(String, String), Nil) {
+  case string.split(text, on) |> list.reverse {
+    [last, ..rest] if rest != [] ->
+      Ok(#(string.join(list.reverse(rest), on), last))
+    _ -> Error(Nil)
   }
 }

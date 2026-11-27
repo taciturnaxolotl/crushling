@@ -71,6 +71,7 @@ fn start(s: store.Store, config: github.Config) -> broker.Broker {
       connect: c,
       requester: fn(_) { Ok("U1") },
       ask: fn(_, _, _) { Nil },
+      met: fn(_, _) { Nil },
       install_poll_ms: 20,
     ))
   b
@@ -239,6 +240,7 @@ pub fn waiting_for_a_connection_is_told_test() {
       connect: c,
       requester: fn(_) { Ok("U1") },
       ask: fn(_, _, _) { Nil },
+      met: fn(_, _) { Nil },
       install_poll_ms: 20,
     ))
   // Not connected, nobody connects: no.
@@ -254,5 +256,63 @@ pub fn waiting_for_a_connection_is_told_test() {
   let assert True = broker.await(b, "U1", Connect(None), 1000)
   let assert Ok(access) = broker.thread(b, "k")
   let assert Ok(AsPerson("octo", "ghu_a")) = access.credential(None, Read)
+  store.close(s)
+}
+
+/// Someone else who connects from a thread's ask stands in for its
+/// requester: the waiting request goes ahead, as them, and the ask is met.
+pub fn a_stand_in_unblocks_the_thread_test() {
+  let s = fresh_store()
+  let seen = process.new_subject()
+  let config =
+    fake(seen, fn(path) {
+      case path {
+        "/login/device/code" -> #(200, code_body)
+        "/login/oauth/access_token" -> #(200, granted_body)
+        _ -> #(200, "{\"login\":\"octo\"}")
+      }
+    })
+  let assert Ok(client) =
+    slackline.new("xoxb-test") |> slackline.with_base_url("http://127.0.0.1:1")
+  let assert Ok(c) =
+    connect.start(connect.Setup(
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
+      store: s,
+      github: Some(config),
+    ))
+  let met = process.new_subject()
+  let assert Ok(b) =
+    broker.start(broker.Setup(
+      store: s,
+      team: "T1",
+      github: Some(broker.GitHub(config, None)),
+      connect: c,
+      requester: fn(_) { Ok("U1") },
+      ask: fn(_, _, _) { Nil },
+      met: fn(key, need) { process.send(met, #(key, need)) },
+      install_poll_ms: 20,
+    ))
+  let assert Ok(access) = broker.thread(b, "k")
+  let assert Error(Connect(None)) = access.credential(None, Push)
+  let done = process.new_subject()
+  process.spawn(fn() { process.send(done, access.await(Connect(None), 10_000)) })
+  process.sleep(50)
+  // U2, not the requester, presses Connect on the ask and connects.
+  broker.vouch(b, "k", "U2")
+  process.send(c, connect.Connect("U2", None))
+  let assert Ok(True) = process.receive(done, 8000)
+  let assert Ok(#("k", Connect(None))) = process.receive(met, 1000)
+  let assert Ok(AsPerson("octo", "ghu_a")) = access.credential(None, Push)
+  // Another thread still goes as its own requester.
+  let assert Ok(other) = broker.thread(b, "k2")
+  let assert Error(Connect(None)) = other.credential(None, Push)
+  // Once the thread's agent stops, so does the stand-in.
+  broker.forget(b, "k")
+  let assert Error(Connect(None)) = access.credential(None, Push)
   store.close(s)
 }

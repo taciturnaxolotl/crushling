@@ -28,6 +28,7 @@ import crushling/sandbox_http
 import crushling/sys
 import crushling/token
 import gleam/bit_array
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/http
 import gleam/http/request.{type Request}
@@ -499,6 +500,8 @@ fn api(
               case only_reads(body) {
                 True -> {
                   use access <- with_access(setup, key)
+                  // A query names its repo inside, so an ask can say which.
+                  let target = option.or(target, graphql_target(body))
                   api_forward(setup, req, key, access, target, Some(body))
                 }
                 False -> read_only()
@@ -618,6 +621,62 @@ pub fn only_reads(body: BitArray) -> Bool {
     Ok(query) ->
       words(string.to_graphemes(query), [])
       |> list.all(fn(word) { word != "mutation" && word != "subscription" })
+  }
+}
+
+/// The repository a GraphQL query reads, when it names exactly one: by
+/// `owner` and `name` (or `repo`) variables, as `gh` sends them, or by
+/// `repository(owner: "…", name: "…")` written into the query.
+pub fn graphql_target(body: BitArray) -> Option(Repo) {
+  let parsed = {
+    use text <- result.try(bit_array.to_string(body))
+    json.parse(text, {
+      use query <- decode.field("query", decode.string)
+      use variables <- decode.optional_field(
+        "variables",
+        [],
+        decode.dict(decode.string, decode.dynamic)
+          |> decode.map(fn(vars) {
+            dict.to_list(vars)
+            |> list.filter_map(fn(pair) {
+              decode.run(pair.1, decode.string)
+              |> result.map(fn(value) { #(pair.0, value) })
+            })
+          }),
+      )
+      decode.success(#(query, variables))
+    })
+    |> result.replace_error(Nil)
+  }
+  case parsed {
+    Error(Nil) -> None
+    Ok(#(query, variables)) -> {
+      let by_variables = {
+        use owner <- result.try(list.key_find(variables, "owner"))
+        use name <- result.try(
+          list.key_find(variables, "name")
+          |> result.lazy_or(fn() { list.key_find(variables, "repo") }),
+        )
+        repo.from_api_segments(owner, name)
+      }
+      let by_literal = {
+        use owner <- result.try(literal_argument(query, "owner"))
+        use name <- result.try(literal_argument(query, "name"))
+        repo.from_api_segments(owner, name)
+      }
+      result.or(by_variables, by_literal) |> option.from_result
+    }
+  }
+}
+
+/// The string given for argument `name` in `query`, as in `owner: "x"`,
+/// when it is given exactly once.
+fn literal_argument(query: String, name: String) -> Result(String, Nil) {
+  let squashed = string.replace(query, " ", "")
+  case string.split(squashed, name <> ":\"") {
+    [_, rest] ->
+      string.split_once(rest, "\"") |> result.map(fn(pair) { pair.0 })
+    _ -> Error(Nil)
   }
 }
 
