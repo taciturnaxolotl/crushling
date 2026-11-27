@@ -10,6 +10,7 @@ import crushling/registry/config as registry_config
 import crushling/registry/gate
 import crushling/registry/incoming as msg
 import crushling/store
+import crushling/store/schema
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process.{type Subject}
@@ -193,7 +194,7 @@ fn start_registry(
 ) -> process.Subject(registry.Message) {
   let assert Ok(key) =
     store.parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
-  let assert Ok(s) = store.start(":memory:", key)
+  let assert Ok(s) = schema.open(":memory:", key)
   let assert Ok(r) =
     registry.start(registry_config.Config(
       launcher: launcher_reporting(launches),

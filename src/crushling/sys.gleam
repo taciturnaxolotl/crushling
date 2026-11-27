@@ -33,3 +33,8 @@ pub fn write_private(path: String, content: String) -> Result(Nil, String)
 
 @external(erlang, "crushling_ffi", "sha256_hex")
 pub fn sha256_hex(data: String) -> String
+
+/// Seconds since the epoch, as GitHub's token lifetimes count.
+pub fn now() -> Int {
+  system_ms() / 1000
+}

@@ -3,6 +3,7 @@
 
 import crushling/github
 import crushling/github/app
+import crushling/github/repo
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
@@ -56,40 +57,33 @@ pub fn jwt_test() {
 /// A GitHub with one installation, where `octo/public` is public and
 /// `octo/private` isn't.
 fn fake(seen: Subject(Request(String))) -> github.Config {
-  github.Config(
-    client_id: "Iv23.test",
-    client_secret: None,
-    accounts: github.no_accounts,
-    send: fn(req) {
-      process.send(seen, req)
-      let #(status, body) = case req.path {
-        "/app/installations" -> #(200, "[{\"id\":7}]")
-        "/app/installations/7/access_tokens" -> #(201, "{\"token\":\"ghs_x\"}")
-        "/repos/octo/public" -> #(200, "{\"private\":false}")
-        "/repos/octo/private" -> #(200, "{\"private\":true}")
-        "/repos/octo/hyper/installation" -> #(200, "{}")
-        "/users/octo/installation" -> #(
-          200,
-          "{\"repository_selection\":\"all\"}",
-        )
-        "/users/picky/installation" -> #(
-          200,
-          "{\"repository_selection\":\"selected\"}",
-        )
-        _ -> #(404, "{}")
-      }
-      Ok(response.new(status) |> response.set_body(body))
-    },
-  )
+  github.Config(client_id: "Iv23.test", client_secret: None, send: fn(req) {
+    process.send(seen, req)
+    let #(status, body) = case req.path {
+      "/app/installations" -> #(200, "[{\"id\":7}]")
+      "/app/installations/7/access_tokens" -> #(201, "{\"token\":\"ghs_x\"}")
+      "/repos/octo/public" -> #(200, "{\"private\":false}")
+      "/repos/octo/private" -> #(200, "{\"private\":true}")
+      "/repos/octo/flaky" -> #(502, "")
+      "/repos/octo/hyper/installation" -> #(200, "{}")
+      "/users/octo/installation" -> #(200, "{\"repository_selection\":\"all\"}")
+      "/users/picky/installation" -> #(
+        200,
+        "{\"repository_selection\":\"selected\"}",
+      )
+      _ -> #(404, "{}")
+    }
+    Ok(response.new(status) |> response.set_body(body))
+  })
 }
 
 pub fn only_public_repos_get_the_token_test() {
   let seen = process.new_subject()
   let assert Ok(key) = app.parse_key(rsa_pem())
   let assert Ok(a) = app.start(fake(seen), key)
-  let assert Some("ghs_x") = app.token(a, "octo", "public")
-  let assert None = app.token(a, "octo", "private")
-  let assert None = app.token(a, "octo", "missing")
+  let assert Some("ghs_x") = app.token(a, r("octo", "public"))
+  let assert None = app.token(a, r("octo", "private"))
+  let assert None = app.token(a, r("octo", "missing"))
   // The JWT was used for the app's own calls, the token for the rest.
   let assert Ok(first) = process.receive(seen, 100)
   let assert "/app/installations" = first.path
@@ -100,8 +94,8 @@ pub fn only_public_repos_get_the_token_test() {
   let assert Ok("Bearer ghs_x") = request.get_header(asked, "authorization")
   drain(seen)
   // Answers and the token are remembered.
-  let assert Some("ghs_x") = app.token(a, "octo", "public")
-  let assert None = app.token(a, "OCTO", "Private")
+  let assert Some("ghs_x") = app.token(a, r("octo", "public"))
+  let assert None = app.token(a, r("OCTO", "Private"))
   let assert Error(Nil) = process.receive(seen, 50)
 }
 
@@ -117,11 +111,49 @@ fn drain(seen: Subject(a)) -> Nil {
 pub fn installed_test() {
   let assert Ok(key) = app.parse_key(rsa_pem())
   let assert Ok(a) = app.start(fake(process.new_subject()), key)
-  let assert Some(True) = app.installed(a, "octo", "hyper")
+  let assert Ok(True) = app.installed(a, r("octo", "hyper"))
   // No such repo, on an account with every repo: nothing to install.
-  let assert Some(True) = app.installed(a, "octo", "nope")
+  let assert Ok(True) = app.installed(a, r("octo", "nope"))
   // On an account with some repos: it may need adding.
-  let assert Some(False) = app.installed(a, "picky", "nope")
+  let assert Ok(False) = app.installed(a, r("picky", "nope"))
   // On an account without the app.
-  let assert Some(False) = app.installed(a, "stranger", "repo")
+  let assert Ok(False) = app.installed(a, r("stranger", "repo"))
+}
+
+fn r(owner: String, name: String) -> repo.Repo {
+  let assert Ok(found) = repo.parse_path(owner, name)
+  found
+}
+
+/// GitHub not answering is neither public nor private, and isn't
+/// remembered as either.
+pub fn unknown_is_not_no_test() {
+  let seen = process.new_subject()
+  let assert Ok(key) = app.parse_key(rsa_pem())
+  let assert Ok(a) = app.start(fake(seen), key)
+  let assert Error(app.Unknown(_)) = app.public(a, r("octo", "flaky"))
+  let assert Ok(True) = app.public(a, r("octo", "public"))
+  drain(seen)
+  let assert Error(app.Unknown(_)) = app.public(a, r("octo", "flaky"))
+  let assert Ok(flaky) = process.receive(seen, 100)
+  let assert "/repos/octo/flaky" = flaky.path
+}
+
+/// Everyone asking the same thing at once shares one request.
+pub fn questions_are_shared_test() {
+  let seen = process.new_subject()
+  let assert Ok(key) = app.parse_key(rsa_pem())
+  let assert Ok(a) = app.start(fake(seen), key)
+  let answers = process.new_subject()
+  list.each([1, 2, 3, 4], fn(_) {
+    process.spawn(fn() {
+      process.send(answers, app.installed(a, r("octo", "hyper")))
+    })
+  })
+  list.each([1, 2, 3, 4], fn(_) {
+    let assert Ok(Ok(True)) = process.receive(answers, 5000)
+  })
+  let assert Ok(asked) = process.receive(seen, 100)
+  let assert "/repos/octo/hyper/installation" = asked.path
+  let assert Error(Nil) = process.receive(seen, 100)
 }

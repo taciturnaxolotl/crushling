@@ -7,6 +7,7 @@
 import crushling/key
 import crushling/launcher.{type Launcher}
 import crushling/store.{type Store}
+import crushling/store/threads
 import crushling/sys
 import gleam/list
 import gleam/option.{None, Some}
@@ -26,7 +27,7 @@ pub fn migrate(
   root: String,
   team: String,
 ) -> Set(String) {
-  let rows = case store.team_threads(store, team) {
+  let rows = case threads.team_threads(store, team) {
     Ok(rows) ->
       list.filter_map(rows, fn(row) {
         case key.parse(row.key) {
@@ -78,13 +79,13 @@ fn move(
 ) -> Result(Nil, String) {
   // An old row of another workspace (a channel shared with it) isn't this
   // one's to take, and neither is its directory.
-  use old_row <- result.try(case store.thread(store, old) {
+  use old_row <- result.try(case threads.thread(store, old) {
     Ok(Some(thread)) -> Ok(Some(thread.team == "" || thread.team == team))
     Ok(None) -> Ok(None)
     Error(reason) -> Error("reading " <> old <> ": " <> reason)
   })
   use new_row <- result.try(
-    store.thread(store, new)
+    threads.thread(store, new)
     |> result.map(option.is_some)
     |> result.map_error(fn(reason) { "reading " <> new <> ": " <> reason }),
   )
@@ -101,7 +102,7 @@ fn move(
       })
       case move_row {
         True ->
-          store.rename_thread(store, old:, new:, team:)
+          threads.rename_thread(store, old:, new:, team:)
           |> result.replace(Nil)
         False -> Ok(Nil)
       }

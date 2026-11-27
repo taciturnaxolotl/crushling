@@ -1,13 +1,15 @@
 //// People's GitHub accounts and App Homes, as the registry sees them:
 //// what their Home shows, PR card presses that open PRs as them, nudges to
-//// connect, and the token an agent reads GitHub with.
+//// connect, and who a thread's agent works for.
 
-import crushling/connections
 import crushling/conversation.{Conversation}
-import crushling/github/route as github_route
+import crushling/github/broker
+import crushling/github/connect
+import crushling/github/repo
 import crushling/home
+import crushling/home/publisher
 import crushling/pr
-import crushling/registry/core.{type State, GitHubNudgeTo, PrSettled, State}
+import crushling/registry/core.{type State, PrSettled, State}
 import crushling/registry/entry.{Entry, Live}
 import crushling/registry/say
 import crushling/registry/text
@@ -20,7 +22,6 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set
-import gleam/string
 import slackline/api/chat
 import slackline/api/chat/update
 import slackline/httpc
@@ -28,13 +29,13 @@ import slackline/httpc
 /// Asked to connect GitHub at most this often per person and thread.
 const nudge_every_ms = 600_000
 
-/// How long a token may take, a refresh with GitHub included.
-pub const github_access_ms = 30_000
+/// How long the thread may take to say whose it is.
+pub const requester_ms = 5000
 
 /// What someone asked of the App Home or `!github`.
 pub type HomeAsk {
   ShowHome
-  Connect(from: Option(connections.Place))
+  Connect(from: Option(connect.Place))
 }
 
 /// Do what `user` asked of their Home, and show it, with their threads if they may use crushling.
@@ -46,8 +47,8 @@ pub fn show_home(
 ) -> State(msg) {
   case ask, allowed {
     Connect(from:), True ->
-      process.send(state.connections, connections.Connect(user, from))
-    Connect(from: Some(connections.Place(channel:, thread_ts:, ..))), False ->
+      process.send(state.connect, connect.Connect(user, from))
+    Connect(from: Some(connect.Place(channel:, thread_ts:, ..))), False ->
       say.privately(
         state.config.client,
         conversation.from_slack(channel, thread_ts),
@@ -58,8 +59,8 @@ pub fn show_home(
   }
   // Either way their Home shows where they stand.
   process.send(
-    state.connections,
-    connections.Show(user, case allowed {
+    state.home,
+    publisher.Show(user, case allowed {
       True -> Some(threads_of(state, user))
       False -> None
     }),
@@ -111,7 +112,7 @@ pub fn press(
       say(text.github_not_set_up)
       state
     }
-    Some(config) -> {
+    Some(github) -> {
       let client = state.config.client
       let settle = fn(outcome) {
         let #(text, blocks) = pr.settled(proposal, outcome)
@@ -128,23 +129,29 @@ pub fn press(
           State(..state, proposals: dict.delete(state.proposals, card_ts))
         }
         _ -> {
-          let connections = state.connections
+          let broker = state.broker
           let draft = choice == "draft"
           let tell = core.teller(state)
           process.spawn_unlinked(fn() {
-            let asked = process.new_subject()
-            process.send(connections, connections.Access(user, asked))
-            case process.receive(asked, github_access_ms) {
-              Ok(Ok(Some(token))) ->
-                case pr.open(config, token, proposal, draft) {
+            let credential =
+              broker.credential(
+                broker,
+                card_ts,
+                user,
+                Some(proposal.repo),
+                broker.OpenPr,
+              )
+            case credential {
+              Ok(broker.AsPerson(token:, ..)) ->
+                case pr.open(github.config, token, proposal, draft) {
                   Ok(#(number, url)) -> {
                     settle(text.pr_opened(user, url, number, draft))
                     tell(PrSettled(card_ts))
                   }
                   Error(why) -> say(text.could_not_open_pr(why))
                 }
-              Ok(Ok(None)) -> say(text.connect_first)
-              _ -> say(text.no_connection)
+              Error(broker.Unavailable(_)) -> say(text.no_connection)
+              _ -> say(text.connect_first)
             }
           })
           state
@@ -154,61 +161,43 @@ pub fn press(
   }
 }
 
-/// Find out, off the registry, whose agent it is.
-pub fn nudge_who(
-  state: State(msg),
-  key: String,
-  want: github_route.Want,
-) -> Nil {
-  case dict.get(state.threads, key) {
-    Ok(Entry(agent: Live(thread:, ..), ..)) -> {
-      let tell = core.teller(state)
-      process.spawn_unlinked(fn() {
-        let asked = process.new_subject()
-        process.send(thread, thread.Requester(asked))
-        case process.receive(asked, 5000) {
-          Ok("") | Error(Nil) -> Nil
-          Ok(user) -> tell(GitHubNudgeTo(key, user, want))
-        }
-      })
-      Nil
-    }
-    _ -> Nil
-  }
-}
-
-/// Ask `user` to connect GitHub or install the App, at most every `nudge_every_ms` per thread and want.
+/// Ask `user` to connect GitHub or install the App, at most every `nudge_every_ms` per thread and need.
 pub fn nudge(
   state: State(msg),
   key: String,
   user: String,
-  want: github_route.Want,
+  need: broker.Need,
 ) -> State(msg) {
   let now = sys.monotonic_ms()
   // A connect and then an install are both asked.
-  let asked = #(key, user, case want {
-    github_route.Connection(..) -> "connect"
-    github_route.Install(owner:, ..) -> "install:" <> string.lowercase(owner)
-  })
-  let recently = case dict.get(state.nudged, asked) {
-    Ok(at) -> now - at < nudge_every_ms
-    Error(Nil) -> False
+  let asked = case need {
+    broker.Connect(..) -> Ok(#(key, user, "connect"))
+    broker.Install(repo:) -> Ok(#(key, user, "install:" <> repo.key(repo)))
+    broker.Unavailable(..) -> Error(Nil)
   }
-  case recently, dict.get(state.threads, key) {
-    False, Ok(entry) -> {
+  let recently = case asked {
+    Ok(asked) ->
+      case dict.get(state.nudged, asked) {
+        Ok(at) -> now - at < nudge_every_ms
+        Error(Nil) -> False
+      }
+    Error(Nil) -> True
+  }
+  case recently, asked, dict.get(state.threads, key) {
+    False, Ok(asked), Ok(entry) -> {
       let client = state.config.client
-      let github = state.config.github
+      let broker = state.broker
       let #(channel, thread_ts) = #(entry.channel, entry.thread_ts)
       process.spawn_unlinked(fn() {
-        let ask = case want {
-          github_route.Connection(repo:) ->
+        let ask = case need {
+          broker.Connect(repo:) ->
             Some(home.ask_connect(channel, thread_ts, repo))
-          github_route.Install(owner:, repo:) ->
-            github
-            |> option.then(fn(config) { config.accounts() })
+          broker.Install(repo:) ->
+            broker.accounts(broker)
             |> option.map(fn(accounts) {
-              home.ask_install(owner, repo, accounts.install_url)
+              home.ask_install(repo, accounts.install_url)
             })
+          broker.Unavailable(..) -> None
         }
         case ask {
           Some(#(text, blocks)) ->
@@ -227,51 +216,44 @@ pub fn nudge(
         |> dict.insert(asked, now)
       State(..state, nudged:)
     }
-    _, _ -> state
+    _, _, _ -> state
   }
 }
 
-/// Answered off the registry, since asking the thread and connections (which may refresh) is slow.
-pub fn github_access(
+/// Who thread `key`'s agent works for, "" for nobody; answered off the
+/// registry, since asking the thread may be slow.
+pub fn requester(
   state: State(msg),
   key: String,
-  reply: Subject(Result(Option(String), String)),
+  reply: Subject(Result(String, String)),
 ) -> Nil {
   case dict.get(state.threads, key) {
     Ok(Entry(agent: Live(thread:, ..), ..)) -> {
-      let connections = state.connections
       process.spawn_unlinked(fn() {
-        process.send(reply, {
-          // Sent and received rather than called, so a gone thread or actor is a timeout, not a crash.
-          let asked = process.new_subject()
-          process.send(thread, thread.Requester(asked))
-          case process.receive(asked, 5000) {
-            Error(Nil) -> Error("the thread didn't say whose it is")
-            Ok("") -> Ok(None)
-            Ok(user) -> {
-              let answer = process.new_subject()
-              process.send(connections, connections.Access(user, answer))
-              process.receive(answer, github_access_ms)
-              |> result.unwrap(Error("GitHub took too long"))
-            }
-          }
-        })
+        // Sent and received rather than called, so a gone thread is a timeout, not a crash.
+        let asked = process.new_subject()
+        process.send(thread, thread.Requester(asked))
+        process.send(
+          reply,
+          process.receive(asked, requester_ms)
+            |> result.replace_error("the thread didn't say whose it is"),
+        )
       })
       Nil
     }
-    _ -> process.send(reply, Ok(None))
+    _ -> process.send(reply, Ok(""))
   }
 }
 
 /// `user`'s threads with a running agent: ones they've sent a prompt in.
-fn threads_of(state: State(msg), user: String) -> List(connections.Thread) {
+fn threads_of(state: State(msg), user: String) -> List(publisher.Thread) {
   dict.to_list(state.threads)
   |> list.filter_map(fn(pair) {
     let #(key, entry) = pair
     case entry.agent, set.contains(entry.people, user) {
       Live(..), True ->
         Ok(
-          connections.Thread(
+          publisher.Thread(
             key:,
             channel: entry.channel,
             thread_ts: entry.thread_ts,

@@ -11,6 +11,7 @@ import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
 import crushling/registry/shutdown
 import crushling/store
+import crushling/store/schema
 import crushling/thread
 import gleam/erlang/process.{type Subject}
 import gleam/option.{None, Some}
@@ -91,7 +92,7 @@ fn race_store() -> store.Store {
   let path = ":memory:"
   let assert Ok(key) =
     store.parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
-  let assert Ok(s) = store.start(path, key)
+  let assert Ok(s) = schema.open(path, key)
   s
 }
 

@@ -10,6 +10,9 @@ import crushling/registry/shutdown
 import crushling/slack_tools
 import crushling/socket
 import crushling/store
+import crushling/store/schema
+import crushling/store/teams
+import crushling/store/threads
 import crushling/sys
 import gleam/bytes_tree
 import gleam/erlang/process.{type Subject}
@@ -75,7 +78,7 @@ fn open_store(dir: String) -> store.Store {
   let assert Ok(key) =
     store.parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
   let _ = dir
-  let assert Ok(s) = store.start(":memory:", key)
+  let assert Ok(s) = schema.open(":memory:", key)
   s
 }
 
@@ -121,8 +124,8 @@ fn shared(
   )
 }
 
-fn team(id: String, token: String) -> store.Team {
-  store.Team(
+fn team(id: String, token: String) -> teams.Team {
+  teams.Team(
     id:,
     bot_token: token,
     bot_user: "UBOT" <> id,
@@ -163,11 +166,11 @@ pub fn events_reach_only_their_own_workspace_test() {
   let calls = process.new_subject()
   let #(api, server) = fake_slack(calls)
   let launches = process.new_subject()
-  let assert Ok(Nil) = store.put_team(s, team("TA", "xoxb-a"))
-  let assert Ok(Nil) = store.put_team(s, team("TB", "xoxb-b"))
+  let assert Ok(Nil) = teams.put_team(s, team("TA", "xoxb-a"))
+  let assert Ok(Nil) = teams.put_team(s, team("TB", "xoxb-b"))
   // Each workspace allows its own people.
-  let assert Ok(Nil) = store.set_setting(s, "TA", store.allowed_users, "U1")
-  let assert Ok(Nil) = store.set_setting(s, "TB", store.allowed_users, "U1")
+  let assert Ok(Nil) = teams.set_setting(s, "TA", teams.allowed_users, "U1")
+  let assert Ok(Nil) = teams.set_setting(s, "TB", teams.allowed_users, "U1")
   let assert Ok(teams) = instance.start(shared(s, dir, launches, api, None))
   let assert Ok([]) = instance.start_stored(teams, s)
   let assert 2 = list.length(instance.all(teams))
@@ -197,8 +200,8 @@ pub fn events_reach_only_their_own_workspace_test() {
 pub fn settings_come_from_the_store_or_the_environment_test() {
   let dir = tmp()
   let s = open_store(dir)
-  let assert Ok(Nil) = store.put_team(s, team("TA", "xoxb-a"))
-  let assert Ok(Nil) = store.put_team(s, team("TB", "xoxb-b"))
+  let assert Ok(Nil) = teams.put_team(s, team("TA", "xoxb-a"))
+  let assert Ok(Nil) = teams.put_team(s, team("TB", "xoxb-b"))
   let env =
     instance.EnvTeam(
       id: "TA",
@@ -213,11 +216,11 @@ pub fn settings_come_from_the_store_or_the_environment_test() {
   // Another workspace gets nobody until its settings say.
   let assert Ok(#(allowed, _)) = instance.people(shared, "TB")
   let assert True = people.is_empty(allowed)
-  let assert Ok(Nil) = store.set_setting(s, "TB", store.allowed_users, "U7, U8")
+  let assert Ok(Nil) = teams.set_setting(s, "TB", teams.allowed_users, "U7, U8")
   let assert Ok(#(allowed, _)) = instance.people(shared, "TB")
   let assert True = allowed == people.only(["U7", "U8"])
   // Settings win over the environment.
-  let assert Ok(Nil) = store.set_setting(s, "TA", store.allowed_users, "U9")
+  let assert Ok(Nil) = teams.set_setting(s, "TA", teams.allowed_users, "U9")
   let assert Ok(#(allowed, _)) = instance.people(shared, "TA")
   let assert True = allowed == people.only(["U9"])
 }
@@ -235,7 +238,7 @@ pub fn self_host_seeds_its_workspace_test() {
   let assert "Team A" = me.team
   let assert Ok(#("auth.test", "xoxb-env")) = process.receive(calls, 1000)
   // It is in the store, token and all, and starts like any other.
-  let assert Ok(Some(stored)) = store.team(s, "TA")
+  let assert Ok(Some(stored)) = teams.team(s, "TA")
   let assert "xoxb-env" = stored.bot_token
   let launches = process.new_subject()
   let env =
@@ -256,8 +259,8 @@ pub fn self_host_seeds_its_workspace_test() {
 pub fn tools_reach_the_thread_s_own_workspace_test() {
   let dir = tmp()
   let s = open_store(dir)
-  let assert Ok(Nil) = store.put_team(s, team("TA", "xoxb-a"))
-  let assert Ok(Nil) = store.put_team(s, team("TB", "xoxb-b"))
+  let assert Ok(Nil) = teams.put_team(s, team("TA", "xoxb-a"))
+  let assert Ok(Nil) = teams.put_team(s, team("TB", "xoxb-b"))
   let assert Ok(teams) =
     instance.start(shared(s, dir, process.new_subject(), "http://x/api", None))
   let assert Ok([]) = instance.start_stored(teams, s)
@@ -277,8 +280,8 @@ pub fn tools_reach_the_thread_s_own_workspace_test() {
 pub fn a_crashed_registry_is_restarted_alone_test() {
   let dir = tmp()
   let s = open_store(dir)
-  let assert Ok(Nil) = store.put_team(s, team("TA", "xoxb-a"))
-  let assert Ok(Nil) = store.put_team(s, team("TB", "xoxb-b"))
+  let assert Ok(Nil) = teams.put_team(s, team("TA", "xoxb-a"))
+  let assert Ok(Nil) = teams.put_team(s, team("TB", "xoxb-b"))
   let assert Ok(teams) =
     instance.start(shared(s, dir, process.new_subject(), "http://x/api", None))
   let assert Ok([]) = instance.start_stored(teams, s)
@@ -307,21 +310,21 @@ pub fn a_crashed_registry_is_restarted_alone_test() {
 /// starts, and only for the self-host workspace, which alone had them.
 pub fn old_threads_move_only_for_the_self_host_workspace_test() {
   let dir = tmp()
-  let old = store.Thread("C9-1.0", "", "C9", "1.0", meta.new(True))
+  let old = threads.Thread("C9-1.0", "", "C9", "1.0", meta.new(True))
   let launches = process.new_subject()
 
   let s = open_store(dir)
-  let assert Ok(Nil) = store.put_thread(s, old)
+  let assert Ok(Nil) = threads.put_thread(s, old)
   let assert Ok(_) = instance.start(shared(s, dir, launches, "", None))
-  let assert Ok(Some(_)) = store.thread(s, "C9-1.0")
+  let assert Ok(Some(_)) = threads.thread(s, "C9-1.0")
 
   let s = open_store(dir)
-  let assert Ok(Nil) = store.put_thread(s, old)
+  let assert Ok(Nil) = threads.put_thread(s, old)
   let env =
     instance.EnvTeam(id: "TA", allowed: people.nobody(), admins: set.new())
   let assert Ok(_) = instance.start(shared(s, dir, launches, "", Some(env)))
-  let assert Ok(None) = store.thread(s, "C9-1.0")
-  let assert Ok(Some(store.Thread(team: "TA", ..))) =
-    store.thread(s, "TA-C9-1.0")
+  let assert Ok(None) = threads.thread(s, "C9-1.0")
+  let assert Ok(Some(threads.Thread(team: "TA", ..))) =
+    threads.thread(s, "TA-C9-1.0")
   Nil
 }

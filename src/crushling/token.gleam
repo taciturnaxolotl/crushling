@@ -2,9 +2,15 @@
 ////
 //// Every token is an HMAC of the thread's key under the instance secret,
 //// with the purpose as a prefix, so a token minted for one endpoint never
-//// opens another.
+//// opens another. A `bound_at` token also carries the sandbox's epoch (when
+//// it started), so a sandbox started again gets a token the old one's
+//// copies can't stand in for.
 
+import gleam/bool
+import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 
 pub type Purpose {
@@ -57,19 +63,48 @@ pub fn bound(secret: String, purpose: Purpose, key: String) -> String {
   key <> "." <> mint(secret, purpose, key)
 }
 
-/// The thread a `bound` token is for, if it is one.
+/// The thread a `bound` or `bound_at` token is for, if it is one.
 pub fn opened(
   secret: String,
   purpose: Purpose,
   token: String,
 ) -> Result(String, Nil) {
-  // The mac is hex, so the key is everything before the last dot.
+  opened_at(secret, purpose, token) |> result.map(fn(found) { found.0 })
+}
+
+/// Like `bound`, for the sandbox started at `epoch` (any number that
+/// changes with each start, such as its start time in ms).
+pub fn bound_at(
+  secret: String,
+  purpose: Purpose,
+  key: String,
+  epoch: Int,
+) -> String {
+  let named = key <> "@" <> int.to_string(epoch)
+  named <> "." <> mint(secret, purpose, named)
+}
+
+/// The thread a token is for and the epoch it was minted for: None for a
+/// `bound` token, which has none.
+pub fn opened_at(
+  secret: String,
+  purpose: Purpose,
+  token: String,
+) -> Result(#(String, Option(Int)), Nil) {
+  // The mac is hex, so what it signs is everything before the last dot.
   case string.split(token, ".") |> list.reverse {
     [mac, ..rest] if rest != [] -> {
-      let key = list.reverse(rest) |> string.join(".")
-      case equal_constant_time(mac, mint(secret, purpose, key)) {
-        True -> Ok(key)
-        False -> Error(Nil)
+      let named = list.reverse(rest) |> string.join(".")
+      use <- bool.guard(
+        !equal_constant_time(mac, mint(secret, purpose, named)),
+        Error(Nil),
+      )
+      // Keys never hold an @, so one names the epoch.
+      case string.split_once(named, "@") {
+        Error(Nil) -> Ok(#(named, None))
+        Ok(#(key, epoch)) ->
+          int.parse(epoch)
+          |> result.map(fn(epoch) { #(key, Some(epoch)) })
       }
     }
     _ -> Error(Nil)

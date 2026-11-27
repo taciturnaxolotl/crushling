@@ -4,13 +4,35 @@
 //// drained into it in batches (`record`).
 
 import crushling/key as thread_key
-import crushling/store.{type Store}
+import crushling/store.{type Migration, type Store, Migration}
 import crushling/usage.{type Usage, Usage, zero}
 import gleam/dynamic/decode
 import gleam/list
 import gleam/result
 import gleam/string
 import sqlight
+
+/// No foreign key to `teams`: spend from before keys carried a workspace
+/// is kept under none.
+pub fn migrations() -> List(Migration) {
+  [
+    Migration(
+      id: "usage.1",
+      legacy_version: 3,
+      sql: "CREATE TABLE usage (
+        team_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        day TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        cost_usd REAL NOT NULL,
+        requests INTEGER NOT NULL,
+        PRIMARY KEY (key, day)
+      );
+      CREATE INDEX usage_team_day ON usage (team_id, day);",
+    ),
+  ]
+}
 
 /// Add what threads spent to their totals for today, in one transaction.
 /// A key without a workspace (from before keys carried one) counts under

@@ -1,17 +1,16 @@
-//// GitHub reads through the bridge, so a sandbox never holds a token.
+//// GitHub through the bridge, so a sandbox never holds a token.
 ////
 //// The sandbox's git sends every `https://github.com/` URL here, as
 //// `/git/<owner>/<repo>/...` (see `env`), and its `gh` talks to
 //// `api.github.com` here over a unix socket the image forwards to the
 //// bridge. Both carry the thread's `bound` token, which names the thread.
-//// The bridge looks up whose GitHub the thread's agent works with (the
-//// person whose prompt it's on) and sends the request on with their token,
-//// or with none when they haven't connected, which still reads public
-//// repos.
 ////
-//// Only reads go through:
+//// This module is HTTP policy only: what may go through, checked before
+//// anyone's token is looked up. Whose token a request goes with is the
+//// workspace's broker's call (`github/broker`).
 ////
-//// - git: fetches and clones (`git-upload-pack`); pushes and LFS are
+//// - git: fetches and clones (`git-upload-pack`), and pushes
+////   (`git-receive-pack`) that only touch `crushling/…` branches; LFS is
 ////   refused.
 //// - the API: GET and HEAD, and GraphQL queries; any other method, and any
 ////   GraphQL mutation or subscription, is refused.
@@ -19,13 +18,17 @@
 //// Responses stream back through `relay`. A git error is answered in
 //// words git shows the agent, so it can say what to do.
 
+import crushling/github/broker.{
+  type Access, type Credential, type Need, type Purpose, Anonymous, AsApp,
+  AsPerson, Connect, Install, OpenPr, Push, Read, Unavailable,
+}
+import crushling/github/repo.{type Repo}
 import crushling/relay
 import crushling/sandbox_http
 import crushling/sys
 import crushling/token
 import gleam/bit_array
 import gleam/dynamic/decode
-import gleam/erlang/process
 import gleam/http
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
@@ -41,42 +44,24 @@ pub type Setup {
   Setup(
     /// The instance secret thread tokens are derived from.
     secret: String,
-    /// The GitHub token thread `key`'s agent reads with: None when whoever
-    /// it works for hasn't connected.
-    access: fn(String) -> Result(Option(String), String),
+    /// What thread `key` can get from its workspace's broker.
+    access: fn(String) -> Result(Access, String),
     /// Where git and the API go: github.com and api.github.com, or fakes.
     web: relay.Upstream,
     api: relay.Upstream,
     /// How sandboxes reach the bridge, for redirects.
     bridge_url: String,
-    /// The app's own token for reading `owner/repo`, when nobody connected:
-    /// only for a public repo (`github/app`). None without the app's key.
-    app_token: fn(String, String) -> Option(String),
-    /// Whether the GitHub App is installed where `owner/repo` is: None
-    /// when unknown (no app key, or GitHub didn't say).
-    installed: fn(String, String) -> Option(Bool),
-    /// Ask whoever thread `key`'s agent works for, in its thread, for what
-    /// a read is missing.
-    ask: fn(String, Want) -> Nil,
-    /// How long a read waits for them, and how often it looks.
+    /// How long a request waits for someone to connect or install.
     wait_ms: Int,
-    poll_ms: Int,
+    /// The epoch of thread `key`'s running sandbox, when known: then only
+    /// a token minted for it (`env_at`) gets through. None takes any.
+    epoch: fn(String) -> Option(Int),
   )
-}
-
-/// What a read is missing.
-pub type Want {
-  /// The person's GitHub connection, to read `repo` (if known) as them.
-  Connection(repo: Option(String))
-  /// The GitHub App on `owner`, to read `owner/repo` at all.
-  Install(owner: String, repo: String)
 }
 
 /// How long a read waits for someone to connect or install: a little under
 /// the fifteen minutes GitHub's device code lasts.
 pub const default_wait_ms = 600_000
-
-pub const default_poll_ms = 2000
 
 pub fn github() -> relay.Upstream {
   relay.Upstream("github.com", 443, True)
@@ -94,8 +79,22 @@ pub fn github_api() -> relay.Upstream {
 /// uses, not `GIT_CONFIG_COUNT`/`KEY_n`: crush's shell sets those for its
 /// own gpg wrapper and would replace ours, sending git straight to GitHub.
 pub fn env(bridge_url: String, secret: String, key: String) -> List(String) {
+  env_with(bridge_url, token.bound(secret, token.GitHub, key))
+}
+
+/// `env` for the sandbox started at `epoch`: its token stops working once
+/// `Setup.epoch` says a newer sandbox runs.
+pub fn env_at(
+  bridge_url: String,
+  secret: String,
+  key: String,
+  epoch: Int,
+) -> List(String) {
+  env_with(bridge_url, token.bound_at(secret, token.GitHub, key, epoch))
+}
+
+fn env_with(bridge_url: String, bound: String) -> List(String) {
   let base = git_base(bridge_url)
-  let bound = token.bound(secret, token.GitHub, key)
   let config = [
     #("url." <> base <> ".insteadOf", "https://github.com/"),
     #("url." <> base <> ".insteadOf", "git@github.com:"),
@@ -132,11 +131,9 @@ pub fn route(setup: Setup) -> sandbox_http.Route {
   fn(req: Request(mist.Connection)) {
     case request.path_segments(req), host(req) {
       ["git", ..rest], _ ->
-        Some(
-          authorized(setup, req, fn(thread) { git(setup, req, rest, thread) }),
-        )
+        Some(authorized(setup, req, fn(key) { git(setup, req, rest, key) }))
       _, "api.github.com" ->
-        Some(authorized(setup, req, fn(thread) { api(setup, req, thread) }))
+        Some(authorized(setup, req, fn(key) { api(setup, req, key) }))
       _, _ -> None
     }
   }
@@ -150,11 +147,12 @@ fn host(req: Request(mist.Connection)) -> String {
   }
 }
 
-/// Find the thread from its token, and whose GitHub it reads with.
+/// Find the thread from its token. Whose GitHub it uses is only looked up
+/// once the request has passed the route's own checks.
 fn authorized(
   setup: Setup,
   req: Request(mist.Connection),
-  next: fn(Thread) -> Response(mist.ResponseData),
+  next: fn(String) -> Response(mist.ResponseData),
 ) -> Response(mist.ResponseData) {
   let presented = case request.get_header(req, "authorization") {
     Ok("Bearer " <> bound) | Ok("token " <> bound) -> bound
@@ -167,21 +165,38 @@ fn authorized(
       |> result.unwrap("")
     _ -> ""
   }
-  case token.opened(setup.secret, token.GitHub, presented) {
-    Error(Nil) -> plain(401, "crushling: not a thread's GitHub token")
-    Ok(key) ->
-      case setup.access(key) {
-        Error(reason) -> {
-          sys.warn("crushling: GitHub for " <> key <> ": " <> reason)
-          plain(503, "crushling: couldn't get a GitHub token; try again")
-        }
-        Ok(access) -> next(Thread(key:, access:))
+  let current = fn(key, minted) {
+    case setup.epoch(key), minted {
+      None, _ -> True
+      Some(epoch), Some(minted) -> epoch == minted
+      Some(_), None -> False
+    }
+  }
+  case token.opened_at(setup.secret, token.GitHub, presented) {
+    Ok(#(key, minted)) ->
+      case current(key, minted) {
+        True -> next(key)
+        False -> plain(401, "crushling: that token is from an earlier sandbox")
       }
+    Error(Nil) -> plain(401, "crushling: not a thread's GitHub token")
   }
 }
 
-type Thread {
-  Thread(key: String, access: Option(String))
+/// What thread `key` can get, or a 503 when its workspace can't say.
+fn with_access(
+  setup: Setup,
+  key: String,
+  next: fn(Access) -> Response(mist.ResponseData),
+) -> Response(mist.ResponseData) {
+  case setup.access(key) {
+    Ok(access) -> next(access)
+    Error(reason) -> unavailable(key, reason)
+  }
+}
+
+fn unavailable(key: String, reason: String) -> Response(mist.ResponseData) {
+  sys.warn("crushling: GitHub for " <> key <> ": " <> reason)
+  plain(503, "crushling: couldn't get a GitHub token; try again")
 }
 
 // git ----------------------------------------------------------------------
@@ -189,91 +204,67 @@ type Thread {
 /// Packs are big, and negotiation for a big repo can be too.
 const max_git_body = 64_000_000
 
+/// Packs pushed can be large; a pack past this goes in pieces.
+const max_push_body = 256_000_000
+
 const git_headers = [
   "accept", "accept-encoding", "content-type", "content-encoding",
   "git-protocol", "user-agent",
 ]
 
+/// What a git request is: its repo's path parts, what it's for, and whether
+/// its body is a push to check.
+type GitRequest {
+  GitRequest(owner: String, name: String, purpose: Purpose, pushing: Bool)
+}
+
 fn git(
   setup: Setup,
   req: Request(mist.Connection),
   rest: List(String),
-  thread: Thread,
+  key: String,
 ) -> Response(mist.ResponseData) {
   let service = case req.query {
     Some("service=" <> service) -> service
     _ -> ""
   }
-  case rest, req.method, service {
-    [owner, repo, "info", "refs"], http.Get, "git-upload-pack"
-    | [owner, repo, "git-upload-pack"], http.Post, _
-    ->
-      case valid(owner) && valid(repo) {
-        False -> plain(404, "crushling: that isn't a GitHub repository")
-        True -> fetch(setup, req, thread, owner, repo)
-      }
-    [owner, repo, "info", "refs"], http.Get, "git-receive-pack" ->
-      case valid(owner) && valid(repo) {
-        False -> plain(404, "crushling: that isn't a GitHub repository")
-        True -> fetch(setup, req, thread, owner, repo)
-      }
-    [owner, repo, "git-receive-pack"], http.Post, _ ->
-      case valid(owner) && valid(repo) {
-        False -> plain(404, "crushling: that isn't a GitHub repository")
-        True -> push(setup, req, thread, owner, repo)
-      }
-    _, _, _ ->
+  let wanted = case rest, req.method, service {
+    [owner, name, "info", "refs"], http.Get, "git-upload-pack"
+    | [owner, name, "git-upload-pack"], http.Post, _
+    -> Ok(GitRequest(owner, name, Read, False))
+    [owner, name, "info", "refs"], http.Get, "git-receive-pack" ->
+      Ok(GitRequest(owner, name, Push, False))
+    [owner, name, "git-receive-pack"], http.Post, _ ->
+      Ok(GitRequest(owner, name, Push, True))
+    _, _, _ -> Error(Nil)
+  }
+  case wanted {
+    Error(Nil) ->
       plain(
         404,
         "crushling: only cloning, fetching and pushing go through to GitHub (no LFS)",
       )
+    Ok(GitRequest(owner:, name:, purpose:, pushing:)) ->
+      case repo.parse_path(owner, name) {
+        Error(Nil) -> plain(404, "crushling: that isn't a GitHub repository")
+        Ok(target) -> {
+          let max = case pushing {
+            True -> max_push_body
+            False -> max_git_body
+          }
+          use body <- read(req, max)
+          // The fence comes before anyone's token is looked up.
+          case pushing, pushable(option.unwrap(body, <<>>)) {
+            True, Error(why) -> plain(403, "crushling: " <> why)
+            _, _ -> {
+              use access <- with_access(setup, key)
+              forward_git(setup, req, key, access, target, body, purpose)
+            }
+          }
+        }
+      }
   }
 }
-
-fn valid(name: String) -> Bool {
-  name != ""
-  && name != "."
-  && name != ".."
-  && string.to_graphemes(name)
-  |> list.all(fn(c) {
-    string.contains(
-      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.",
-      c,
-    )
-  })
-}
-
-fn fetch(
-  setup: Setup,
-  req: Request(mist.Connection),
-  thread: Thread,
-  owner: String,
-  repo: String,
-) -> Response(mist.ResponseData) {
-  use body <- read(req, max_git_body)
-  forward_git(setup, req, thread, owner, repo, body, False)
-}
-
-/// Pushes as the person, only to `crushling/…` branches, the bridge
-/// reading the push's ref updates before any of it reaches GitHub.
-/// Overwriting such a branch is fine; deleting one, or touching any other
-/// ref, is refused.
-fn push(
-  setup: Setup,
-  req: Request(mist.Connection),
-  thread: Thread,
-  owner: String,
-  repo: String,
-) -> Response(mist.ResponseData) {
-  use body <- read(req, max_push_body)
-  case pushable(option.unwrap(body, <<>>)) {
-    Error(why) -> plain(403, "crushling: " <> why)
-    Ok(Nil) -> forward_git(setup, req, thread, owner, repo, body, True)
-  }
-}
-
-/// Packs pushed can be large; a pack past this goes in pieces.
-const max_push_body = 256_000_000
 
 pub const branch_prefix = "refs/heads/crushling/"
 
@@ -345,51 +336,30 @@ fn commands(body: BitArray, found: List(String)) -> Result(List(String), Nil) {
   }
 }
 
-/// Send a git request on as the person, or, for a read nobody connected
-/// for, with the app's token on a public repo or none. `writes` (a push)
-/// only ever goes as the person.
+/// Send a git request on with the credential the broker gives for it.
 fn forward_git(
   setup: Setup,
   req: Request(mist.Connection),
-  thread: Thread,
-  owner: String,
-  repo: String,
+  key: String,
+  access: Access,
+  target: Repo,
   body: Option(BitArray),
-  writes: Bool,
+  purpose: Purpose,
 ) -> Response(mist.ResponseData) {
-  let repo = case string.ends_with(repo, ".git") {
-    True -> string.drop_end(repo, 4)
-    False -> repo
-  }
-  let name = owner <> "/" <> repo
   let path =
     string.drop_start(req.path, string.length("/git"))
     <> option.map(req.query, fn(q) { "?" <> q }) |> option.unwrap("")
   let method = http.method_to_string(req.method)
-  let first = case thread.access, writes {
-    Some(access), _ -> Some(access)
-    None, True -> None
-    None, False -> setup.app_token(owner, repo)
-  }
-  let say = fn(missing) {
-    plain(
-      403,
-      "crushling: "
-        <> case writes, missing {
-        True, NoAccess ->
-          "the GitHub account of the person you're working for can't push to "
-          <> name
-          <> ". They may not have write access to it."
-        True, NotConnected ->
-          "pushing to "
-          <> name
-          <> " needs the GitHub account of the person you're working for, and they haven't connected it. crushling asked them in this thread and waited, but they didn't connect in time. Tell them; it works once they connect."
-        _, missing -> refused(missing, name)
-      },
-    )
-  }
-  use token, refuse <- reading(setup, thread, Some(#(owner, repo)), first, say)
-  let auth = case token {
+  let answer = fn(text) { plain(403, "crushling: " <> text) }
+  use credential, deny <- reading(
+    setup,
+    key,
+    access,
+    Some(target),
+    purpose,
+    answer,
+  )
+  let auth = case secret_of(credential) {
     Some(token) -> [
       #(
         "authorization",
@@ -404,27 +374,31 @@ fn forward_git(
   }
   let headers = list.append(auth, kept(req.headers, git_headers))
   let hooks =
-    hooks(thread, fn(status, headers) {
+    hooks(key, fn(status, headers) {
       case status {
         _ if status >= 300 && status < 400 ->
           Ok(list.map(headers, redirect(setup, _)))
-        401 | 403 | 404 ->
-          case refuse() {
-            Some(answer) -> Error(answer)
-            None -> Ok(headers)
-          }
+        // Not taken over by `deny`: GitHub's own answer stands.
+        401 | 403 | 404 -> Ok(headers)
         _ if status >= 400 ->
           Error(plain(
             502,
             "crushling: GitHub answered "
               <> int.to_string(status)
               <> " for "
-              <> name,
+              <> repo.full(target),
           ))
         _ -> Ok(headers)
       }
     })
-  send(setup.web, req, method, path, headers, body, hooks)
+  attempt(setup.web, req, method, path, headers, body, hooks, deny)
+}
+
+fn secret_of(credential: Credential) -> Option(String) {
+  case credential {
+    AsPerson(token:, ..) | AsApp(token:) -> Some(token)
+    Anonymous -> None
+  }
 }
 
 /// A redirect to elsewhere on GitHub (a renamed repo) stays on the bridge.
@@ -438,13 +412,32 @@ fn redirect(setup: Setup, header: #(String, String)) -> #(String, String) {
   }
 }
 
-/// What the agent is told when a read is refused for good.
-fn refused(missing: Missing, what: String) -> String {
-  case missing {
-    NotConnected ->
+/// What the agent is told when a request is refused for good: for want of
+/// `need`, or with None, because the person's own access falls short.
+@internal
+pub fn refusal(
+  purpose: Purpose,
+  need: Option(Need),
+  on: Option(Repo),
+) -> String {
+  let what = case on {
+    Some(target) -> repo.full(target)
+    None -> "That"
+  }
+  case purpose, need {
+    Push, None | OpenPr, None ->
+      "the GitHub account of the person you're working for can't push to "
+      <> what
+      <> ". They may not have write access to it."
+    Push, Some(Connect(_)) | OpenPr, Some(Connect(_)) ->
+      "pushing to "
+      <> what
+      <> " needs the GitHub account of the person you're working for, and they haven't connected it. crushling asked them in this thread and waited, but they didn't connect in time. Tell them; it works once they connect."
+    Read, Some(Connect(_)) ->
       what
       <> " isn't public, and the person you're working for hasn't connected their GitHub account. crushling asked them in this thread and waited, but they didn't connect in time. Tell them what you were trying to read; it works once they connect."
-    NotInstalled(owner) ->
+    _, Some(Install(target)) -> {
+      let owner = repo.owner(target)
       "crushling's GitHub App isn't installed on "
       <> owner
       <> ", so "
@@ -452,16 +445,13 @@ fn refused(missing: Missing, what: String) -> String {
       <> " can't be read, even as the person you're working for. crushling asked them in this thread to add it and waited; if they don't own "
       <> owner
       <> ", one of its owners has to approve it. Tell them; it works once it's installed."
-    NoAccess ->
+    }
+    _, Some(Unavailable(_)) ->
+      "couldn't get a GitHub token for " <> what <> "; try again."
+    Read, None ->
       what
       <> " can't be read with the GitHub account of the person you're working for: it may not exist, or they don't have access to it."
   }
-}
-
-type Missing {
-  NotConnected
-  NotInstalled(owner: String)
-  NoAccess
 }
 
 // The API ------------------------------------------------------------------
@@ -477,20 +467,45 @@ const api_dropped = [
 fn api(
   setup: Setup,
   req: Request(mist.Connection),
-  thread: Thread,
+  key: String,
 ) -> Response(mist.ResponseData) {
-  case req.method, req.path {
-    http.Get, _ | http.Head, _ -> api_forward(setup, req, thread, None)
-    http.Post, "/graphql" ->
-      case relay.read_body(req, max_graphql_body, 60_000) {
-        Error(_) -> api_error(400, "crushling couldn't read the query")
-        Ok(body) ->
-          case only_reads(body) {
-            True -> api_forward(setup, req, thread, Some(body))
-            False -> read_only()
+  let segments = request.path_segments(req)
+  let lowered = string.lowercase(req.path)
+  // The raw path: path_segments has already resolved any dot steps.
+  let odd =
+    list.any(string.split(req.path, "/"), fn(part) {
+      part == "." || part == ".."
+    })
+    || string.contains(lowered, "%2f")
+    || string.contains(lowered, "%2e")
+  let target = case segments {
+    ["repos", owner, name, ..] ->
+      repo.from_api_segments(owner, name) |> result.map(Some)
+    _ -> Ok(None)
+  }
+  case odd, target {
+    True, _ -> api_error(400, "crushling won't send that path to GitHub")
+    _, Error(Nil) -> api_error(404, "That isn't a GitHub repository")
+    False, Ok(target) ->
+      case req.method, req.path {
+        http.Get, _ | http.Head, _ -> {
+          use access <- with_access(setup, key)
+          api_forward(setup, req, key, access, target, None)
+        }
+        http.Post, "/graphql" ->
+          case relay.read_body(req, max_graphql_body, 60_000) {
+            Error(_) -> api_error(400, "crushling couldn't read the query")
+            Ok(body) ->
+              case only_reads(body) {
+                True -> {
+                  use access <- with_access(setup, key)
+                  api_forward(setup, req, key, access, target, Some(body))
+                }
+                False -> read_only()
+              }
           }
+        _, _ -> read_only()
       }
-    _, _ -> read_only()
   }
 }
 
@@ -504,152 +519,84 @@ fn read_only() -> Response(mist.ResponseData) {
 fn api_forward(
   setup: Setup,
   req: Request(mist.Connection),
-  thread: Thread,
+  key: String,
+  access: Access,
+  target: Option(Repo),
   body: Option(BitArray),
 ) -> Response(mist.ResponseData) {
   let path =
     req.path <> option.map(req.query, fn(q) { "?" <> q }) |> option.unwrap("")
-  let #(repo, first) = case request.path_segments(req) {
-    ["repos", owner, repo, ..] -> #(
-      Some(#(owner, repo)),
-      option.lazy_or(thread.access, fn() { setup.app_token(owner, repo) }),
-    )
-    _ -> #(None, thread.access)
-  }
-  let what = case repo {
-    Some(#(owner, repo)) -> owner <> "/" <> repo
-    None -> "That"
-  }
-  let say = fn(missing) { api_error(404, refused(missing, what)) }
+  let answer = fn(text) { api_error(404, text) }
   let method = http.method_to_string(req.method)
-  use token, refuse <- reading(setup, thread, repo, first, say)
-  let auth = case token {
+  use credential, deny <- reading(setup, key, access, target, Read, answer)
+  let auth = case secret_of(credential) {
     Some(token) -> [#("authorization", "Bearer " <> token)]
     None -> []
   }
   let headers =
     relay.end_to_end(req.headers, api_dropped)
     |> list.append(auth, _)
-  let hooks =
-    hooks(thread, fn(status, headers) {
-      case status {
-        401 | 403 | 404 ->
-          case refuse() {
-            Some(answer) -> Error(answer)
-            None -> Ok(headers)
-          }
-        _ -> Ok(headers)
-      }
-    })
-  send(setup.api, req, method, path, headers, body, hooks)
+  let hooks = hooks(key, fn(_, headers) { Ok(headers) })
+  attempt(setup.api, req, method, path, headers, body, hooks, deny)
 }
 
-/// Read with `first`. If GitHub refuses for want of the person's
-/// connection, or of the app on the repo's account, ask them in the thread
-/// and wait, then read again: the agent's command takes longer rather than
-/// failing and having to be run again. `attempt` makes the request with a
-/// token, calling `refuse` when GitHub said no for want of access.
+/// Make the request with the broker's credential. If GitHub refuses for
+/// want of something someone can give (a connection, the app on the repo's
+/// account), ask them in the thread and wait, then make it again: the
+/// agent's command takes longer rather than failing and having to be run
+/// again. `send` makes the request, turning GitHub's answer down with
+/// `deny` when it is such a refusal.
 fn reading(
   setup: Setup,
-  thread: Thread,
-  repo: Option(#(String, String)),
-  first: Option(String),
-  say: fn(Missing) -> Response(mist.ResponseData),
-  attempt: fn(Option(String), fn() -> Option(Response(mist.ResponseData))) ->
-    Response(mist.ResponseData),
+  key: String,
+  access: Access,
+  target: Option(Repo),
+  purpose: Purpose,
+  answer: fn(String) -> Response(mist.ResponseData),
+  send: fn(Credential, fn(Int) -> Option(Need)) -> relay.Attempt(Need),
 ) -> Response(mist.ResponseData) {
-  // `attempt` calls `refuse` when GitHub said 401, 403 or 404. As someone
-  // connected that's usually just so (no such PR, no access), and GitHub's
-  // own answer goes through; only where the app isn't installed is it
-  // taken over (None), and what follows answers instead.
-  // `theirs`: the token is the person's own.
-  let try = fn(token, theirs) {
-    let refused = process.new_subject()
-    let answer =
-      attempt(token, fn() {
-        let take_over = case theirs, repo {
-          False, _ -> True
-          True, Some(#(owner, name)) ->
-            setup.installed(owner, name) == Some(False)
-          True, None -> False
-        }
-        case take_over {
-          True -> {
-            process.send(refused, Nil)
-            Some(say(NoAccess))
-          }
-          False -> None
-        }
-      })
-    case process.receive(refused, 0) {
-      Ok(Nil) -> Error(Nil)
-      Error(Nil) -> Ok(answer)
-    }
-  }
-  let name = option.map(repo, fn(repo) { repo.0 <> "/" <> repo.1 })
-  // As the person; when that's refused where the app isn't installed, ask
-  // for it, wait, and try once more.
-  let as_them = fn(token) {
-    case try(Some(token), True), repo {
-      Ok(answer), _ -> answer
-      Error(Nil), Some(#(owner, name)) ->
-        case setup.installed(owner, name) {
-          Some(False) -> {
-            setup.ask(thread.key, Install(owner, name))
-            let installed =
-              wait(setup, fn() {
-                case setup.installed(owner, name) {
-                  Some(True) -> Some(Nil)
-                  _ -> None
-                }
-              })
-            case installed {
-              Some(Nil) ->
-                try(Some(token), True) |> result.unwrap(say(NoAccess))
-              None -> say(NotInstalled(owner))
-            }
-          }
-          _ -> say(NoAccess)
-        }
-      Error(Nil), None -> say(NoAccess)
-    }
-  }
-  case thread.access {
-    Some(token) -> as_them(token)
-    None ->
-      case try(first, False) {
-        Ok(answer) -> answer
-        Error(Nil) -> {
-          setup.ask(thread.key, Connection(name))
-          let token =
-            wait(setup, fn() {
-              case setup.access(thread.key) {
-                Ok(Some(token)) -> Some(token)
-                _ -> None
-              }
-            })
-          case token {
-            Some(token) -> as_them(token)
-            None -> say(NotConnected)
-          }
+  let refuse = fn(need) { answer(refusal(purpose, need, target)) }
+  // Each need is asked for once; met and refused again, the person's own
+  // access is what falls short.
+  let wait_for = fn(need, asked, again) {
+    case list.contains(asked, need) {
+      True -> refuse(None)
+      False -> {
+        access.ask(need)
+        case access.await(need, setup.wait_ms) {
+          True -> again([need, ..asked])
+          False -> refuse(Some(need))
         }
       }
+    }
   }
+  resolve(key, access, target, purpose, wait_for, send, [])
 }
 
-/// Look every `poll_ms` until `check` finds something, for `wait_ms`.
-fn wait(setup: Setup, check: fn() -> Option(a)) -> Option(a) {
-  wait_until(setup, check, sys.monotonic_ms() + setup.wait_ms)
-}
-
-fn wait_until(setup: Setup, check: fn() -> Option(a), until: Int) -> Option(a) {
-  case sys.monotonic_ms() > until {
-    True -> None
-    False -> {
-      process.sleep(setup.poll_ms)
-      case check() {
-        Some(found) -> Some(found)
-        None -> wait_until(setup, check, until)
+fn resolve(
+  key: String,
+  access: Access,
+  target: Option(Repo),
+  purpose: Purpose,
+  wait_for: fn(Need, List(Need), fn(List(Need)) -> Response(mist.ResponseData)) ->
+    Response(mist.ResponseData),
+  send: fn(Credential, fn(Int) -> Option(Need)) -> relay.Attempt(Need),
+  asked: List(Need),
+) -> Response(mist.ResponseData) {
+  let again = resolve(key, access, target, purpose, wait_for, send, _)
+  case access.credential(target, purpose) {
+    Error(Unavailable(reason)) -> unavailable(key, reason)
+    Error(need) -> wait_for(need, asked, again)
+    Ok(credential) -> {
+      let deny = fn(status) {
+        case status {
+          401 | 403 | 404 -> access.refused(credential, target)
+          _ -> None
+        }
+      }
+      case send(credential, deny) {
+        relay.Answered(resp) -> resp
+        relay.UpstreamRefused(why: need, ..) -> wait_for(need, asked, again)
       }
     }
   }
@@ -765,7 +712,7 @@ fn read(
   }
 }
 
-fn send(
+fn attempt(
   upstream: relay.Upstream,
   req: Request(mist.Connection),
   method: String,
@@ -773,14 +720,15 @@ fn send(
   headers: List(#(String, String)),
   body: Option(BitArray),
   hooks: relay.Hooks(Nil),
-) -> Response(mist.ResponseData) {
+  deny: fn(Int) -> Option(Need),
+) -> relay.Attempt(Need) {
   let relay =
     relay.start(upstream, relay.Outgoing(method, path, headers), req, hooks)
-  relay.send(relay, req, option.unwrap(body, <<>>), hooks)
+  relay.attempt(relay, req, option.unwrap(body, <<>>), hooks, deny)
 }
 
 fn hooks(
-  thread: Thread,
+  key: String,
   head: fn(Int, List(#(String, String))) ->
     Result(List(#(String, String)), Response(mist.ResponseData)),
 ) -> relay.Hooks(Nil) {
@@ -793,9 +741,7 @@ fn hooks(
     failed: fn(status) {
       plain(status, "crushling: couldn't reach GitHub") |> relay.closing
     },
-    log: fn(what) {
-      sys.warn("crushling: GitHub for " <> thread.key <> ": " <> what)
-    },
+    log: fn(what) { sys.warn("crushling: GitHub for " <> key <> ": " <> what) },
   )
 }
 

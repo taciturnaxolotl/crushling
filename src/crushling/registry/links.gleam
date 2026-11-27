@@ -5,6 +5,7 @@
 import crushling/meta.{type Link, Link}
 import crushling/slack
 import crushling/store.{type Store}
+import crushling/store/threads
 import crushling/sys
 import gleam/dict.{type Dict}
 import gleam/option.{type Option, None, Some}
@@ -24,7 +25,7 @@ pub fn find(links: Links, channel: String) -> #(Links, Option(Link)) {
   case dict.get(links.by_channel, channel) {
     Ok(link) -> #(links, Some(link))
     Error(Nil) ->
-      case store.link(links.store, links.team, channel) {
+      case threads.link(links.store, links.team, channel) {
         Ok(Some(link)) -> #(add_known(links, channel, link), Some(link))
         Ok(None) -> #(links, None)
         Error(reason) -> {
@@ -37,7 +38,7 @@ pub fn find(links: Links, channel: String) -> #(Links, Option(Link)) {
 
 /// Link a new code channel to its thread.
 pub fn add(links: Links, channel: String, link: Link) -> Links {
-  case store.put_link(links.store, links.team, channel, link) {
+  case threads.put_link(links.store, links.team, channel, link) {
     Ok(Nil) -> Nil
     Error(reason) ->
       sys.warn("crushling: saving " <> channel <> " failed: " <> reason)

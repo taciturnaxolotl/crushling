@@ -3,6 +3,7 @@
 
 import crushling/commands
 import crushling/github
+import crushling/github/repo
 import crushling/pr
 import gleam/erlang/process
 import gleam/http
@@ -10,6 +11,7 @@ import gleam/http/request
 import gleam/http/response
 import gleam/list
 import gleam/option.{None}
+import gleam/result
 import gleam/string
 import test_fs
 
@@ -30,9 +32,8 @@ pub fn proposal_test() {
       "",
       "",
     )
+  let assert "charmbracelet/hyper" = repo.full(p.repo)
   let assert pr.Proposal(
-    owner: "charmbracelet",
-    repo: "hyper",
     head: "crushling/fix-restore",
     // Stacked on the branch it was made from, not main.
     base: "fix/cancel",
@@ -74,14 +75,27 @@ pub fn nothing_to_propose_test() {
   let assert Error(why) =
     pr.from_facts(facts("origin/main", "0", "origin/main"), "", "")
   let assert True = string.contains(why, "isn't one crushling pushed")
+  // The prefix alone names no branch.
+  let assert Error(_) =
+    pr.from_facts(facts("origin/crushling/", "0", "origin/main"), "", "")
 }
 
 pub fn github_repo_test() {
-  let assert Ok(#("o", "r")) = pr.github_repo("https://github.com/o/r.git")
-  let assert Ok(#("o", "r")) = pr.github_repo("git@github.com:o/r")
-  let assert Ok(#("o", "r")) = pr.github_repo("ssh://git@github.com/o/r.git")
-  let assert Error(Nil) = pr.github_repo("https://gitlab.com/o/r.git")
-  let assert Error(Nil) = pr.github_repo("https://github.com/o")
+  let full = fn(url) { repo.parse_remote(url) |> result.map(repo.full) }
+  let assert Ok("o/r") = full("https://github.com/o/r.git")
+  let assert Ok("o/r") = full("git@github.com:o/r")
+  let assert Ok("o/r") = full("ssh://git@github.com/o/r.git")
+  let assert Error(Nil) = full("https://gitlab.com/o/r.git")
+  let assert Error(Nil) = full("https://github.com/o")
+  // Only a trailing .git goes, and odd names never get in.
+  let assert Ok("o/r.github.io") = full("https://github.com/o/r.github.io.git")
+  let assert Error(Nil) = full("https://github.com/o/..")
+  let assert Error(Nil) = full("https://github.com/o/.git")
+  let assert Error(Nil) = full("https://github.com/o/r%2F")
+  // One key for every spelling.
+  let assert Ok(a) = repo.parse_path("Octo", "Hyper.git")
+  let assert Ok(b) = repo.from_api_segments("octo", "hyper")
+  let assert True = repo.key(a) == repo.key(b)
 }
 
 pub fn card_test() {
@@ -110,15 +124,10 @@ fn github(
   body: String,
   seen: process.Subject(request.Request(String)),
 ) -> github.Config {
-  github.Config(
-    client_id: "Iv1.test",
-    client_secret: None,
-    accounts: github.no_accounts,
-    send: fn(req) {
-      process.send(seen, req)
-      Ok(response.new(status) |> response.set_body(body))
-    },
-  )
+  github.Config(client_id: "Iv1.test", client_secret: None, send: fn(req) {
+    process.send(seen, req)
+    Ok(response.new(status) |> response.set_body(body))
+  })
 }
 
 pub fn open_test() {
@@ -197,8 +206,6 @@ pub fn facts_from_real_git_test() {
     )
   let assert #(0, out) = facts_in(dir)
   let assert Ok(pr.Proposal(
-    owner: "o",
-    repo: "r",
     head: "crushling/fix-restore",
     base: "fix/cancel",
     title: "keep plans",

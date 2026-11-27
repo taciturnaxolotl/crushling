@@ -1,8 +1,9 @@
 //// The registry's state, shared by its modules, and the events it sends
 //// itself.
 
-import crushling/connections
-import crushling/github/route as github_route
+import crushling/github/broker.{type Broker}
+import crushling/github/connect
+import crushling/home/publisher
 import crushling/key as thread_key
 import crushling/meta.{type Meta, Meta}
 import crushling/pr
@@ -16,7 +17,7 @@ import crushling/registry/incoming.{type Incoming}
 import crushling/registry/links.{type Links}
 import crushling/registry/shutdown
 import crushling/registry/tailnet
-import crushling/store
+import crushling/store/threads
 import crushling/sys
 import crushling/thread
 import gleam/dict.{type Dict}
@@ -55,8 +56,8 @@ pub type Event {
   Sweep
   /// A PR card was opened; forget it.
   PrSettled(card_ts: String)
-  /// Who to ask, for `GitHubNudge`.
-  GitHubNudgeTo(key: String, user: String, want: github_route.Want)
+  /// Ask `user`, in thread `key`, for what a GitHub request needs.
+  GitHubNudgeTo(key: String, user: String, need: broker.Need)
   /// A join finishing, or a grant's timer, for thread `key`.
   TailnetLater(key: String, event: tailnet.Event)
 }
@@ -86,9 +87,13 @@ pub type State(msg) {
     tailnets: tailnet.Tailnets,
     /// Who may drive agents, and what waits on a membership lookup.
     gate: Gate(msg),
-    /// The workspace's GitHub connections and App Homes.
-    connections: Subject(connections.Message),
-    /// When each person was last asked to connect GitHub, by thread, user and want, in monotonic ms.
+    /// Connecting the workspace's GitHub accounts.
+    connect: Subject(connect.Message),
+    /// Drawing the workspace's App Homes.
+    home: Subject(publisher.Message),
+    /// Whose GitHub credentials a request uses.
+    broker: Broker,
+    /// When each person was last asked to connect GitHub, by thread, user and need, in monotonic ms.
     nudged: Dict(#(String, String, String), Int),
     /// PR cards awaiting a press, by ts; lost on restart, when `/pr` posts a new one.
     proposals: Dict(String, #(String, pr.Proposal)),
@@ -133,7 +138,7 @@ pub fn entry_for(
         False -> Ok(Nil)
       })
       // A row that can't be read is refused, not overwritten.
-      use saved <- result.map(store.thread(config.store, key))
+      use saved <- result.map(threads.thread(config.store, key))
       case config.launcher.exists(key) {
         False -> None
         True ->
@@ -150,8 +155,8 @@ pub fn entry_for(
   }
 }
 
-fn saved_thread(config: Config, key: String) -> Option(store.Thread) {
-  case store.thread(config.store, key) {
+fn saved_thread(config: Config, key: String) -> Option(threads.Thread) {
+  case threads.thread(config.store, key) {
     Ok(found) -> found
     Error(reason) -> {
       sys.warn("crushling: reading " <> key <> " failed: " <> reason)
@@ -192,14 +197,14 @@ pub fn set_meta(
   meta: Meta,
 ) -> State(msg) {
   let thread =
-    store.Thread(
+    threads.Thread(
       key:,
       team: state.config.team,
       channel: entry.channel,
       thread_ts: entry.thread_ts,
       meta:,
     )
-  case store.put_thread(state.config.store, thread) {
+  case threads.put_thread(state.config.store, thread) {
     Ok(Nil) -> Nil
     Error(reason) ->
       sys.warn("crushling: saving " <> key <> " failed: " <> reason)

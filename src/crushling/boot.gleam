@@ -6,6 +6,8 @@ import crushling/events
 import crushling/files
 import crushling/github
 import crushling/github/app as github_app
+import crushling/github/broker
+import crushling/github/http as github_http
 import crushling/github/route as github_route
 import crushling/install
 import crushling/instance
@@ -20,6 +22,9 @@ import crushling/sandbox_http
 import crushling/slack_tools
 import crushling/socket
 import crushling/store
+import crushling/store/legacy_import
+import crushling/store/schema
+import crushling/store/teams
 import crushling/store/usage
 import crushling/sys
 import crushling/tailscale
@@ -59,7 +64,7 @@ pub fn run(config: Config) -> Result(Int, String) {
     config.Local(..) -> True
     config.Docker(..) -> False
   }
-  use #(github, app) <- result.try(start_github(config.github))
+  use github <- result.try(start_github(config.github))
   // Sandboxes reach GitHub through the bridge; a local agent uses the
   // host's own git and gh.
   let github_reads = github != option.None && !local
@@ -140,15 +145,9 @@ pub fn run(config: Config) -> Result(Int, String) {
             web: github_route.github(),
             api: github_route.github_api(),
             bridge_url:,
-            app_token: fn(owner, repo) {
-              option.then(app, github_app.token(_, owner, repo))
-            },
-            installed: fn(owner, repo) {
-              option.then(app, github_app.installed(_, owner, repo))
-            },
-            ask: instance.github_ask(teams, store),
             wait_ms: github_route.default_wait_ms,
-            poll_ms: github_route.default_poll_ms,
+            // Until launches record each sandbox's epoch, any token goes.
+            epoch: fn(_) { option.None },
           )),
         ]
         False -> []
@@ -270,12 +269,12 @@ fn open_store(
       )
     False -> Nil
   }
-  store.start(root <> "/crushling.db", key)
+  schema.open(root <> "/crushling.db", key)
 }
 
 /// The workspace of `SLACK_BOT_TOKEN`, from auth.test.
 type Seeded {
-  Seeded(team: store.Team, env: instance.EnvTeam)
+  Seeded(team: teams.Team, env: instance.EnvTeam)
 }
 
 /// Self-host: put the workspace of `SLACK_BOT_TOKEN` in the store, with
@@ -312,10 +311,14 @@ fn seed_env_team(
         <> me.team_id
         <> ")",
       )
-      use imported <- result.map(store.import_files(store, root, me.team_id))
+      use imported <- result.map(legacy_import.import_files(
+        store,
+        root,
+        me.team_id,
+      ))
       case imported {
-        store.AlreadyImported -> Nil
-        store.Imported(threads:, links:, skipped:) -> {
+        legacy_import.AlreadyImported -> Nil
+        legacy_import.Imported(threads:, links:, skipped:) -> {
           list.each(skipped, fn(skip) {
             io.println(
               "crushling: not importing "
@@ -379,40 +382,24 @@ fn save_spend(proxy: proxy.Proxy, store: store.Store) -> Nil {
 
 /// The GitHub App people connect their accounts through. With its private
 /// key, the app's own token reads public repos nobody connected for, and
-/// the bridge knows where the app is installed, which the config's
-/// `accounts` asks.
+/// the bridge knows where the app is installed.
 fn start_github(
   settings: option.Option(config.GitHub),
-) -> Result(
-  #(option.Option(github.Config), option.Option(github_app.App)),
-  String,
-) {
+) -> Result(option.Option(broker.GitHub), String) {
   case settings {
-    option.None -> Ok(#(option.None, option.None))
+    option.None -> Ok(option.None)
     option.Some(config.GitHub(client_id:, client_secret:, private_key:)) -> {
       let config =
-        github.Config(
-          client_id:,
-          client_secret:,
-          send: github.http,
-          accounts: github.no_accounts,
-        )
+        github.Config(client_id:, client_secret:, send: github_http.send)
       case private_key {
-        option.None -> Ok(#(option.Some(config), option.None))
+        option.None -> Ok(option.Some(broker.GitHub(config, option.None)))
         option.Some(key) -> {
           use app <- result.map(
             github_app.start(config, key)
             |> result.replace_error("couldn't start the GitHub App's keeper"),
           )
           log_github_installs(app)
-          #(
-            option.Some(
-              github.Config(..config, accounts: fn() {
-                github_app.accounts(app)
-              }),
-            ),
-            option.Some(app),
-          )
+          option.Some(broker.GitHub(config, option.Some(app)))
         }
       }
     }

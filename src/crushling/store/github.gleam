@@ -4,7 +4,8 @@
 //// copied elsewhere opens nowhere.
 
 import crushling/github.{type Tokens, Tokens}
-import crushling/store.{type Store}
+import crushling/store.{type Migration, type Store, Migration}
+import crushling/store/sealed
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/json
@@ -23,8 +24,49 @@ pub type Account {
   )
 }
 
-fn aad(team: String, user: String) -> BitArray {
-  bit_array.from_string("github:" <> team <> ":" <> user)
+pub fn migrations() -> List(Migration) {
+  [
+    Migration(
+      id: "github.1",
+      legacy_version: 3,
+      sql: "CREATE TABLE github_accounts (
+        team_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        login TEXT NOT NULL,
+        tokens_enc BLOB NOT NULL,
+        connected_at INTEGER NOT NULL,
+        PRIMARY KEY (team_id, user_id)
+      );",
+    ),
+    // A workspace's connections go with it. One no workspace has can't be
+    // used, so it isn't kept.
+    Migration(
+      id: "github.2",
+      legacy_version: 0,
+      sql: "CREATE TABLE github_accounts_new (
+        team_id TEXT NOT NULL REFERENCES teams(team_id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL,
+        login TEXT NOT NULL,
+        tokens_enc BLOB NOT NULL,
+        connected_at INTEGER NOT NULL,
+        PRIMARY KEY (team_id, user_id)
+      );
+      INSERT INTO github_accounts_new
+        SELECT team_id, user_id, login, tokens_enc, connected_at
+        FROM github_accounts WHERE team_id IN (SELECT team_id FROM teams);
+      DROP TABLE github_accounts;
+      ALTER TABLE github_accounts_new RENAME TO github_accounts;",
+    ),
+  ]
+}
+
+fn seal(key: BitArray, team: String, user: String, tokens: Tokens) -> BitArray {
+  sealed.seal(
+    key,
+    sealed.GitHubTokens,
+    [team, user],
+    bit_array.from_string(tokens_json(tokens)),
+  )
 }
 
 fn tokens_json(tokens: Tokens) -> String {
@@ -48,12 +90,7 @@ fn tokens_decoder() -> decode.Decoder(Tokens) {
 /// Save a connection, replacing the person's earlier one.
 pub fn put(store: Store, account: Account) -> Result(Nil, String) {
   use connection, key <- store.run(store)
-  let sealed =
-    store.seal(
-      key,
-      aad(account.team, account.user),
-      bit_array.from_string(tokens_json(account.tokens)),
-    )
+  let sealed = seal(key, account.team, account.user, account.tokens)
   store.exec(
     connection,
     "INSERT OR REPLACE INTO github_accounts
@@ -93,7 +130,7 @@ pub fn get(
     [] -> Ok(None)
     [#(login, sealed, connected_at), ..] -> {
       use tokens <- result.map(
-        store.unseal(key, aad(team, user), sealed)
+        sealed.unseal(key, sealed.GitHubTokens, [team, user], sealed)
         |> result.try(bit_array.to_string)
         |> result.try(fn(text) {
           json.parse(text, tokens_decoder()) |> result.replace_error(Nil)
@@ -117,4 +154,60 @@ pub fn delete(store: Store, team: String, user: String) -> Result(Nil, String) {
     "DELETE FROM github_accounts WHERE team_id = ? AND user_id = ?",
     [sqlight.text(team), sqlight.text(user)],
   )
+}
+
+/// Swap in refreshed tokens, but only on the connection they came from:
+/// False when it was disconnected or replaced meanwhile, which must win.
+pub fn replace_tokens(
+  store: Store,
+  team: String,
+  user: String,
+  connected_at: Int,
+  tokens: Tokens,
+) -> Result(Bool, String) {
+  use connection, key <- store.run(store)
+  let sealed = seal(key, team, user, tokens)
+  store.query(
+    connection,
+    "UPDATE github_accounts SET tokens_enc = ?
+     WHERE team_id = ? AND user_id = ? AND connected_at = ?
+     RETURNING user_id",
+    [
+      sqlight.blob(sealed),
+      sqlight.text(team),
+      sqlight.text(user),
+      sqlight.int(connected_at),
+    ],
+    decode.success(Nil),
+  )
+  |> result.map(fn(rows) { rows != [] })
+}
+
+/// Forget a connection, but only the one made at `connected_at`, so a lapse
+/// noticed late never forgets a newer connection.
+pub fn delete_connection(
+  store: Store,
+  team: String,
+  user: String,
+  connected_at: Int,
+) -> Result(Nil, String) {
+  use connection, _ <- store.run(store)
+  store.exec(
+    connection,
+    "DELETE FROM github_accounts
+     WHERE team_id = ? AND user_id = ? AND connected_at = ?",
+    [sqlight.text(team), sqlight.text(user), sqlight.int(connected_at)],
+  )
+}
+
+/// Forget every connection in workspace `team`, within a caller's
+/// transaction.
+@internal
+pub fn delete_team(
+  connection: sqlight.Connection,
+  team: String,
+) -> Result(Nil, String) {
+  store.exec(connection, "DELETE FROM github_accounts WHERE team_id = ?", [
+    sqlight.text(team),
+  ])
 }

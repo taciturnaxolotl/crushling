@@ -4,6 +4,7 @@
 //// time; pure, so the view is easy to test.
 
 import crushling/github
+import crushling/github/repo.{type Repo}
 import crushling/usage.{type Usage}
 import gleam/float
 import gleam/int
@@ -267,10 +268,10 @@ pub fn dollars(amount: Float) -> String {
 pub fn ask_connect(
   channel: String,
   thread_ts: String,
-  repo: Option(String),
+  on: Option(Repo),
 ) -> #(String, List(block.Block)) {
-  let what = case repo {
-    Some(repo) -> "`" <> repo <> "`"
+  let what = case on {
+    Some(target) -> "`" <> repo.full(target) <> "`"
     None -> "your private repositories"
   }
   let text =
@@ -292,18 +293,16 @@ pub fn ask_connect(
 pub const install_action = "crushling_github_install"
 
 /// Asked when the person is connected but crushling's GitHub App isn't on
-/// the account `owner/repo` belongs to: the button opens GitHub's page to
+/// the account `target` belongs to: the button opens GitHub's page to
 /// add it.
 pub fn ask_install(
-  owner: String,
-  repo: String,
+  target: Repo,
   install_url: String,
 ) -> #(String, List(block.Block)) {
+  let owner = repo.owner(target)
   let text =
     "crushling would like access to `"
-    <> owner
-    <> "/"
-    <> repo
+    <> repo.full(target)
     <> "`, but it isn't set up on *"
     <> owner
     <> "* yet. Would you like to add it? If you don't own "

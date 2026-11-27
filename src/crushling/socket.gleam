@@ -2,7 +2,7 @@
 //// connection drops, with every event turned into a `msg.Incoming`.
 
 import crushling/commands
-import crushling/connections
+import crushling/github/connect
 import crushling/home
 import crushling/key as thread_key
 import crushling/models
@@ -169,7 +169,7 @@ fn home_buttons(app: app.App, find: Find) -> app.App {
     interaction.ButtonAction(value: Some(value), ..) ->
       home.nudged_from(value)
       |> result.map(fn(pair) {
-        connections.Place(pair.0, pair.1, payload.response_url)
+        connect.Place(pair.0, pair.1, payload.response_url)
       })
     _ -> Error(Nil)
   }

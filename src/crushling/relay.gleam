@@ -136,7 +136,31 @@ pub fn send(
   hooks: Hooks(scan),
 ) -> Response(mist.ResponseData) {
   process.send(relay.go, body)
-  respond(relay, req, hooks)
+  case respond(relay, req, hooks, fn(_) { None }) {
+    Answered(resp) -> resp
+    UpstreamRefused(why:, ..) -> why
+  }
+}
+
+/// How an `attempt` went.
+pub type Attempt(why) {
+  Answered(Response(mist.ResponseData))
+  /// `deny` turned down upstream's answer, dropped unread, for `why`.
+  UpstreamRefused(status: Int, why: why)
+}
+
+/// Send `body` upstream, like `send`, but first let `deny` look at the
+/// response status: a caller that would rather try again some other way
+/// gets that instead of the response.
+pub fn attempt(
+  relay: Relay,
+  req: Request(mist.Connection),
+  body: BitArray,
+  hooks: Hooks(scan),
+  deny: fn(Int) -> Option(why),
+) -> Attempt(why) {
+  process.send(relay.go, body)
+  respond(relay, req, hooks, deny)
 }
 
 pub type ReadFailure {
@@ -260,31 +284,50 @@ fn respond(
   relay: Relay,
   req: Request(mist.Connection),
   hooks: Hooks(scan),
-) -> Response(mist.ResponseData) {
+  deny: fn(Int) -> Option(why),
+) -> Attempt(why) {
   case process.receive(relay.reply, relay.head_ms + 15_000) {
     Error(Nil) -> {
       process.kill(relay.pid)
-      hooks.failed(504)
+      Answered(hooks.failed(504))
     }
-    Ok(Failed(status)) -> hooks.failed(status)
-    Ok(Refused(stop)) -> stop.answer
+    Ok(Failed(status)) -> Answered(hooks.failed(status))
+    Ok(Refused(stop)) -> Answered(stop.answer)
     Ok(Head(status:, headers:, body:)) ->
-      case hooks.head(status, end_to_end(headers, ["content-length"])) {
-        Error(answer) -> {
+      case deny(status) {
+        Some(why) -> {
           process.kill(relay.pid)
-          answer |> closing
+          UpstreamRefused(status:, why:)
         }
-        Ok(headers) ->
-          case body {
-            None ->
-              response.Response(
-                status:,
-                headers:,
-                body: mist.Bytes(bytes_tree.new()),
-              )
-              |> closing
-            Some(body) -> stream(relay, req, status, headers, body)
-          }
+        None -> Answered(passed(relay, req, hooks, status, headers, body))
+      }
+  }
+}
+
+/// The response as `hooks.head` has it.
+fn passed(
+  relay: Relay,
+  req: Request(mist.Connection),
+  hooks: Hooks(scan),
+  status: Int,
+  headers: List(#(String, String)),
+  body: Option(Body),
+) -> Response(mist.ResponseData) {
+  case hooks.head(status, end_to_end(headers, ["content-length"])) {
+    Error(answer) -> {
+      process.kill(relay.pid)
+      answer |> closing
+    }
+    Ok(headers) ->
+      case body {
+        None ->
+          response.Response(
+            status:,
+            headers:,
+            body: mist.Bytes(bytes_tree.new()),
+          )
+          |> closing
+        Some(body) -> stream(relay, req, status, headers, body)
       }
   }
 }

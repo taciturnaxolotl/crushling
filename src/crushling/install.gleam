@@ -15,6 +15,7 @@
 //// Marketplace listing is needed either way.
 
 import crushling/store.{type Store}
+import crushling/store/teams.{type Team, Team}
 import crushling/sys
 import gleam/bytes_tree
 import gleam/http
@@ -44,7 +45,7 @@ pub type Config {
     /// An anonymous Slack client for `oauth.v2.access`.
     slack: slackline.Client,
     /// Start the new workspace's instance.
-    on_installed: fn(store.Team) -> Result(Nil, String),
+    on_installed: fn(Team) -> Result(Nil, String),
     /// The self-host workspace, from `SLACK_BOT_TOKEN`, if any: its people
     /// come from the environment, so an install never writes them.
     env_team: Option(String),
@@ -104,7 +105,7 @@ pub fn callback(
   config: Config,
   query: List(#(String, String)),
   now: Int,
-) -> Result(store.Team, String) {
+) -> Result(Team, String) {
   use _ <- result.try(case list.key_find(query, "error") {
     Ok(error) -> Error("Slack said: " <> error)
     Error(Nil) -> Ok(Nil)
@@ -136,19 +137,26 @@ pub fn callback(
     }),
   )
   use team <- result.try(team_from(access, now))
-  use known <- result.try(store.team(config.store, team.id))
-  use _ <- result.try(store.put_team(config.store, team))
   // Only a new workspace, and never the self-host one, gets its installer
-  // as its people; a reinstall keeps what it has.
-  use _ <- result.try(case known, config.env_team {
-    Some(_), _ -> Ok(Nil)
-    None, Some(env) if env == team.id -> Ok(Nil)
-    None, _ -> seed_people(config.store, team)
-  })
+  // as its people (allowed, and approving tailnet access); a reinstall
+  // keeps what it has.
+  use _ <- result.try(
+    teams.install(config.store, team, fn(new) {
+      case new, team.installed_by, config.env_team {
+        False, _, _ | _, "", _ -> None
+        True, _, Some(env) if env == team.id -> None
+        True, user, _ -> Some(user)
+      }
+    }),
+  )
   use _ <- result.map(
     config.on_installed(team)
     |> result.map_error(fn(reason) {
-      let _ = store.set_active(config.store, team.id, False)
+      case teams.set_active(config.store, team.id, False) {
+        Ok(Nil) -> Nil
+        Error(why) ->
+          sys.warn("crushling: turning off " <> team.id <> ": " <> why)
+      }
       "the workspace was saved but couldn't start ("
       <> reason
       <> "), so it is turned off until you install again"
@@ -169,7 +177,7 @@ pub fn callback(
 fn team_from(
   access: oauth_api.OAuthV2AccessResponse,
   now: Int,
-) -> Result(store.Team, String) {
+) -> Result(Team, String) {
   let enterprise_id = option.map(access.enterprise, fn(org) { org.id })
   // The app isn't set up for org deployment (the manifest's
   // org_deploy_enabled is false), and routing assumes one workspace per
@@ -190,7 +198,7 @@ fn team_from(
     access.bot_user_id,
     "Slack sent no bot user",
   ))
-  store.Team(
+  Team(
     id:,
     bot_token:,
     bot_user:,
@@ -200,23 +208,6 @@ fn team_from(
     installed_at: now,
     active: True,
   )
-}
-
-/// Whoever installed the app in a new workspace may use it and approve
-/// tailnet access, until the workspace's settings say otherwise.
-fn seed_people(store: Store, team: store.Team) -> Result(Nil, String) {
-  case team.installed_by {
-    "" -> Ok(Nil)
-    user -> {
-      use _ <- result.try(store.set_setting(
-        store,
-        team.id,
-        store.allowed_users,
-        user,
-      ))
-      store.set_setting(store, team.id, store.admins, user)
-    }
-  }
 }
 
 // HTTP ------------------------------------------------------------------------

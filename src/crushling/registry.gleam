@@ -6,9 +6,10 @@
 //// its workspace and `meta` stay, so the next message picks the work up.
 
 import crushling/commands
-import crushling/connections
 import crushling/conversation.{Conversation}
-import crushling/github/route as github_route
+import crushling/github/broker.{type Broker}
+import crushling/github/connect
+import crushling/home/publisher
 import crushling/meta.{type Link, Meta}
 import crushling/models
 import crushling/registry/accounts.{type HomeAsk, Connect, ShowHome, show_home}
@@ -53,8 +54,6 @@ import gleam/string
 
 pub const default_stop_backoff_ms = config.default_stop_backoff_ms
 
-pub const github_access_ms = accounts.github_access_ms
-
 pub type Message {
   Received(Incoming)
   /// Someone pressed Slack's stop control on the thread's session.
@@ -80,11 +79,11 @@ pub type Message {
   /// A slash command in a code channel, heard as the `!` command `text` from `user`.
   Slash(channel: String, user: String, text: String)
   /// `user` pressed Connect on the note asking them, in a thread.
-  GitHubConnectIn(user: String, place: connections.Place)
-  /// Thread `key`'s agent lacked a GitHub connection: ask whoever it works for, now and then.
-  GitHubNudge(key: String, want: github_route.Want)
-  /// The GitHub token thread `key`'s agent reads with: its requester's, if connected.
-  GitHubAccess(key: String, reply: Subject(Result(Option(String), String)))
+  GitHubConnectIn(user: String, place: connect.Place)
+  /// The workspace's GitHub broker, for requests from its threads.
+  GitHubBroker(reply: Subject(Broker))
+  /// Who thread `key`'s agent works for, "" for nobody.
+  GitHubRequester(key: String, reply: Subject(Result(String, String)))
   /// A pick on a model card; `home` is the thread, since the card may sit elsewhere.
   ModelPicked(
     home: #(String, String),
@@ -121,15 +120,47 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       |> process.select_monitors(fn(down) { Internal(Own(ThreadDown(down))) })
     // The first sweep a minute in, once the bridge has settled.
     process.send_after(self, 60_000, Internal(Own(Sweep)))
-    // Linked: it goes down with the registry, and comes back with it.
-    use connections <- result.try(
-      connections.start(connections.Setup(
+    // Linked: they go down with the registry, and come back with it.
+    use connect <- result.try(
+      connect.start(connect.Setup(
         client: config.client,
         store: config.store,
         team: config.team,
-        github: config.github,
-        default_model: config.default_model,
+        github: option.map(config.github, fn(github) { github.config }),
       ))
+      |> result.replace_error("GitHub connecting could not start"),
+    )
+    use broker <- result.try(
+      broker.start(broker.Setup(
+        store: config.store,
+        team: config.team,
+        github: config.github,
+        connect:,
+        requester: fn(key) {
+          let reply = process.new_subject()
+          process.send(self, GitHubRequester(key, reply))
+          process.receive(reply, accounts.requester_ms + 1000)
+          |> result.unwrap(Error("the workspace didn't answer in time"))
+        },
+        ask: fn(key, user, need) {
+          process.send(self, Internal(Own(GitHubNudgeTo(key, user, need))))
+        },
+        install_poll_ms: broker.default_install_poll_ms,
+      ))
+      |> result.replace_error("the GitHub broker could not start"),
+    )
+    use home <- result.try(
+      publisher.start(
+        publisher.Setup(
+          client: config.client,
+          store: config.store,
+          team: config.team,
+          github: option.is_some(config.github),
+          accounts: fn() { broker.accounts(broker) },
+          default_model: config.default_model,
+        ),
+        connect,
+      )
       |> result.replace_error("the App Home could not start"),
     )
     State(
@@ -162,7 +193,9 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
         process.send_after(self, ms, Internal(Own(Member(answer))))
         Nil
       }),
-      connections:,
+      connect:,
+      home:,
+      broker:,
       nudged: dict.new(),
       proposals: dict.new(),
     )
@@ -247,8 +280,8 @@ fn own(state: State, event: Event) -> actor.Next(State, Message) {
       actor.continue(
         State(..state, proposals: dict.delete(state.proposals, card_ts)),
       )
-    GitHubNudgeTo(key, user, want) ->
-      actor.continue(accounts.nudge(state, key, user, want))
+    GitHubNudgeTo(key, user, need) ->
+      actor.continue(accounts.nudge(state, key, user, need))
     JobsUncounted(key, token) ->
       actor.continue(jobs_uncounted(state, key, token))
     ThreadDown(down) -> actor.continue(thread_down(state, down))
@@ -296,7 +329,7 @@ fn serve(state: State, message: Message) -> State {
     GitHubConnectIn(user, place) ->
       home_ask(state, message, user, Connect(Some(place)))
     GitHubDisconnect(user) -> {
-      process.send(state.connections, connections.Disconnect(user, None))
+      process.send(state.connect, connect.Disconnect(user, None))
       state
     }
     PrPressed(user:, card_ts:, choice:, respond:) -> {
@@ -317,8 +350,8 @@ fn serve(state: State, message: Message) -> State {
         <> string.pad_start(int.to_string(ms % 1000 * 1000), 6, "0")
       received(state, Incoming(channel, "", ts, user, text, True, []), 0)
     }
-    GitHubNudge(key, want) -> {
-      accounts.nudge_who(state, key, want)
+    GitHubBroker(reply) -> {
+      process.send(reply, state.broker)
       state
     }
     // Joins and timers come only from the registry itself.
@@ -332,8 +365,8 @@ fn serve(state: State, message: Message) -> State {
       })
       state
     }
-    GitHubAccess(key, reply) -> {
-      accounts.github_access(state, key, reply)
+    GitHubRequester(key, reply) -> {
+      accounts.requester(state, key, reply)
       state
     }
     ModelPicked(home, pick, card, user) ->
@@ -455,7 +488,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
     commands.GitHubCommand(connect:), _ -> {
       let user = route.incoming.user
       let from =
-        Some(connections.Place(
+        Some(connect.Place(
           route.incoming.channel,
           route.incoming.thread_ts,
           None,
@@ -463,7 +496,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
       case connect {
         True -> show_home(state, user, Connect(from), True)
         False -> {
-          process.send(state.connections, connections.Disconnect(user, from))
+          process.send(state.connect, connect.Disconnect(user, from))
           state
         }
       }

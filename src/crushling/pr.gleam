@@ -4,10 +4,12 @@
 //// a PR without someone pressing the button.
 
 import crushling/github
+import crushling/github/http
+import crushling/github/repo.{type Repo}
+import crushling/github/route
 import crushling/snapshot
 import gleam/dynamic/decode
-import gleam/http
-import gleam/http/request
+import gleam/http as gleam_http
 import gleam/int
 import gleam/json
 import gleam/list
@@ -20,8 +22,7 @@ import slackline/element/button
 /// A PR to open, as the card shows it.
 pub type Proposal {
   Proposal(
-    owner: String,
-    repo: String,
+    repo: Repo,
     /// The branch on GitHub, like `crushling/fix-flaky-test`.
     head: String,
     base: String,
@@ -83,25 +84,30 @@ pub fn from_facts(
     |> list.map(string.trim)
     |> list.filter(fn(line) { line != "" && line != "--files" })
   let changes = snapshot.parse_numstat(files)
-  use #(owner, repo) <- result.try(
-    github_repo(at(0))
+  use repo <- result.try(
+    repo.parse_remote(at(0))
     |> result.replace_error("this repository isn't on GitHub"),
   )
-  use head <- result.try(case at(1) {
-    "origin/crushling/" <> _ as upstream -> Ok(string.drop_start(upstream, 7))
-    "origin/" <> branch ->
-      Error(
-        "the branch `"
-        <> branch
-        <> "` isn't one crushling pushed: push it as `crushling/<what>` first",
-      )
-    "" ->
-      Error(
-        "the branch isn't on GitHub yet: push it first, like `git push -u origin HEAD:crushling/<what>`",
-      )
-    other ->
-      Error("the branch tracks `" <> other <> "`, not a branch on origin")
-  })
+  // The same branches the bridge lets the agent push.
+  let ours = "origin/" <> string.replace(route.branch_prefix, "refs/heads/", "")
+  let upstream = at(1)
+  use head <- result.try(
+    case string.starts_with(upstream, ours) && upstream != ours, upstream {
+      True, _ -> Ok(string.drop_start(upstream, string.length("origin/")))
+      False, "origin/" <> branch ->
+        Error(
+          "the branch `"
+          <> branch
+          <> "` isn't one crushling pushed: push it as `crushling/<what>` first",
+        )
+      False, "" ->
+        Error(
+          "the branch isn't on GitHub yet: push it first, like `git push -u origin HEAD:crushling/<what>`",
+        )
+      False, other ->
+        Error("the branch tracks `" <> other <> "`, not a branch on origin")
+    },
+  )
   use <- guard(
     int.parse(at(2)) |> result.unwrap(0) > 0,
     "some commits aren't pushed yet: push first",
@@ -127,7 +133,6 @@ pub fn from_facts(
     body -> body
   }
   Ok(Proposal(
-    owner:,
     repo:,
     head:,
     base:,
@@ -148,24 +153,6 @@ fn guard(
   case bad {
     True -> Error(why)
     False -> next()
-  }
-}
-
-/// `owner` and `repo` from a GitHub remote URL, https or ssh.
-pub fn github_repo(url: String) -> Result(#(String, String), Nil) {
-  let path = case string.trim(url) {
-    "https://github.com/" <> path | "http://github.com/" <> path -> Ok(path)
-    "git@github.com:" <> path | "ssh://git@github.com/" <> path -> Ok(path)
-    _ -> Error(Nil)
-  }
-  use path <- result.try(path)
-  let path = case string.ends_with(path, ".git") {
-    True -> string.drop_end(path, 4)
-    False -> path
-  }
-  case string.split(path, "/") {
-    [owner, repo] if owner != "" && repo != "" -> Ok(#(owner, repo))
-    _ -> Error(Nil)
   }
 }
 
@@ -207,9 +194,7 @@ fn heading(p: Proposal) -> String {
   <> "` → `"
   <> p.base
   <> "` in "
-  <> p.owner
-  <> "/"
-  <> p.repo
+  <> repo.full(p.repo)
 }
 
 /// The card proposing `p`: its buttons open it as whoever presses.
@@ -259,27 +244,21 @@ pub fn open(
   p: Proposal,
   draft: Bool,
 ) -> Result(#(Int, String), String) {
-  let assert Ok(req) =
-    request.to(
-      "https://api.github.com/repos/" <> p.owner <> "/" <> p.repo <> "/pulls",
-    )
-  let body =
-    json.object([
-      #("title", json.string(p.title)),
-      #("head", json.string(p.head)),
-      #("base", json.string(p.base)),
-      #("body", json.string(p.body)),
-      #("draft", json.bool(draft)),
-    ])
-    |> json.to_string
   let sent =
-    req
-    |> request.set_method(http.Post)
-    |> request.set_header("accept", "application/vnd.github+json")
-    |> request.set_header("authorization", "Bearer " <> token)
-    |> request.set_header("user-agent", "crushling")
-    |> request.set_header("content-type", "application/json")
-    |> request.set_body(body)
+    http.api(
+      gleam_http.Post,
+      "/repos/" <> repo.full(p.repo) <> "/pulls",
+      http.Bearer(token),
+    )
+    |> http.with_json(
+      json.object([
+        #("title", json.string(p.title)),
+        #("head", json.string(p.head)),
+        #("base", json.string(p.base)),
+        #("body", json.string(p.body)),
+        #("draft", json.bool(draft)),
+      ]),
+    )
     |> config.send
   case sent {
     Error(_) -> Error("couldn't reach GitHub; try again")

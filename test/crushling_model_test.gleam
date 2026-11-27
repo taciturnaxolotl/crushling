@@ -17,6 +17,8 @@ import crushling/registry/incoming as msg
 import crushling/sink
 import crushling/socket
 import crushling/store
+import crushling/store/schema
+import crushling/store/threads
 import crushling/thread
 import crushling/venue
 import gleam/dict
@@ -703,12 +705,12 @@ fn start_woken_registry(name: String) {
       run_in_sandbox: None,
     )
   let assert Ok(key) = store.parse_key(test_key)
-  let assert Ok(s) = store.start(":memory:", key)
+  let assert Ok(s) = schema.open(":memory:", key)
   let thread_key = thread_key("T1", "C1", "1.0")
   let assert Ok(Nil) =
-    store.put_thread(
+    threads.put_thread(
       s,
-      store.Thread(thread_key, "T1", "C1", "1.0", meta.new(True)),
+      threads.Thread(thread_key, "T1", "C1", "1.0", meta.new(True)),
     )
   let assert Ok(client) =
     slackline.new("xoxb-test")

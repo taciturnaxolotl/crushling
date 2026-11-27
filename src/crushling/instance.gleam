@@ -12,8 +12,7 @@
 //// `CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`.
 
 import crushling/crush/client
-import crushling/github
-import crushling/github/route as github_route
+import crushling/github/broker
 import crushling/key as thread_key
 import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
@@ -25,6 +24,8 @@ import crushling/registry/tailnet
 import crushling/slack_tools
 import crushling/socket
 import crushling/store.{type Store}
+import crushling/store/teams
+import crushling/store/threads
 import crushling/sys
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
@@ -56,7 +57,7 @@ pub type Shared {
     /// A Slack client for a bot token; `slackline.new` but in tests.
     client: fn(String) -> slackline.Client,
     /// The GitHub App people connect their accounts through, if set up.
-    github: Option(github.Config),
+    github: Option(broker.GitHub),
     default_model: String,
   )
 }
@@ -80,7 +81,7 @@ pub opaque type Teams {
 }
 
 type Message {
-  Start(team: store.Team, reply: Subject(Result(Instance, String)))
+  Start(team: teams.Team, reply: Subject(Result(Instance, String)))
   Find(team: String, reply: Subject(Option(Instance)))
   All(reply: Subject(List(Instance)))
   /// Shutdown is under way: stop restarting registries, and reply with
@@ -206,7 +207,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       case state.draining, dict.has_key(state.running, team) {
         False, False ->
           // From the store, so it starts with the team's latest token.
-          case store.team(state.shared.store, team) {
+          case teams.team(state.shared.store, team) {
             Ok(Some(found)) if found.active -> {
               let #(state, started) = launch(state, found)
               case started {
@@ -230,7 +231,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
 
 fn launch(
   state: State,
-  team: store.Team,
+  team: teams.Team,
 ) -> #(State, Result(Instance, String)) {
   case start_instance(state.shared, state.stranded, team) {
     Error(reason) -> #(state, Error(reason))
@@ -286,17 +287,17 @@ pub fn people(
   shared: Shared,
   team: String,
 ) -> Result(#(People, Set(String)), String) {
-  use settings <- result.map(store.settings(shared.store, team))
+  use settings <- result.map(teams.settings(shared.store, team))
   let env = case shared.env_team {
     Some(env) if env.id == team -> Some(env)
     _ -> None
   }
-  let allowed = case dict.get(settings, store.allowed_users), env {
+  let allowed = case dict.get(settings, teams.allowed_users), env {
     Ok(value), _ -> people.parse(value)
     Error(Nil), Some(env) -> env.allowed
     Error(Nil), None -> people.nobody()
   }
-  let admins = case dict.get(settings, store.admins), env {
+  let admins = case dict.get(settings, teams.admins), env {
     Ok(value), _ -> {
       let admins = people.parse(value)
       case admins.everyone {
@@ -319,7 +320,7 @@ pub fn people(
 fn start_instance(
   shared: Shared,
   stranded: Set(String),
-  team: store.Team,
+  team: teams.Team,
 ) -> Result(Instance, String) {
   use #(allowed, admins) <- result.try(people(shared, team.id))
   let client = shared.client(team.bot_token)
@@ -388,7 +389,7 @@ pub fn seed(
   store: Store,
   client: slackline.Client,
   bot_token: String,
-) -> Result(#(store.Team, auth.TestResponse), String) {
+) -> Result(#(teams.Team, auth.TestResponse), String) {
   use me <- result.try(
     auth.test_()
     |> httpc.send(client)
@@ -396,9 +397,9 @@ pub fn seed(
       "auth.test: " <> slackline.describe_error(error)
     }),
   )
-  use _ <- result.try(store.put_team(
+  use _ <- result.try(teams.put_team(
     store,
-    store.Team(
+    teams.Team(
       id: me.team_id,
       bot_token:,
       bot_user: me.user_id,
@@ -408,7 +409,7 @@ pub fn seed(
       active: True,
     ),
   ))
-  use stored <- result.try(store.team(store, me.team_id))
+  use stored <- result.try(teams.team(store, me.team_id))
   use team <- result.map(option.to_result(
     stored,
     "the store lost workspace " <> me.team_id,
@@ -417,7 +418,7 @@ pub fn seed(
 }
 
 /// Start `team`'s instance, or return the one already running.
-pub fn start_team(teams: Teams, team: store.Team) -> Result(Instance, String) {
+pub fn start_team(teams: Teams, team: teams.Team) -> Result(Instance, String) {
   process.call(teams.subject, timeout_ms, Start(team, _))
 }
 
@@ -427,7 +428,7 @@ pub fn start_stored(
   teams: Teams,
   store: Store,
 ) -> Result(List(#(String, String)), String) {
-  use active <- result.map(store.active_teams(store))
+  use active <- result.map(teams.active_teams(store))
   list.filter_map(active, fn(team) {
     case start_team(teams, team) {
       Ok(_) -> Error(Nil)
@@ -502,36 +503,18 @@ fn int_max(a: Int, b: Int) -> Int {
   }
 }
 
-/// The GitHub token thread `key`'s agent reads with, from its workspace's
-/// registry.
+/// What thread `key` can get from its workspace's GitHub broker.
 pub fn github_access(
   teams: Teams,
   store: Store,
-) -> fn(String) -> Result(Option(String), String) {
+) -> fn(String) -> Result(broker.Access, String) {
   fn(key) {
-    case instance_of(teams, store, key) {
-      Error(reason) -> Error(reason)
-      Ok(found) -> {
-        let reply = process.new_subject()
-        process.send(found.registry, registry.GitHubAccess(key, reply))
-        process.receive(reply, registry.github_access_ms + 10_000)
-        |> result.unwrap(Error("the workspace didn't answer in time"))
-      }
-    }
-  }
-}
-
-/// Ask whoever thread `key`'s agent works for, in its thread, for what a
-/// GitHub read is missing.
-pub fn github_ask(
-  teams: Teams,
-  store: Store,
-) -> fn(String, github_route.Want) -> Nil {
-  fn(key, want) {
-    case instance_of(teams, store, key) {
-      Ok(found) -> process.send(found.registry, registry.GitHubNudge(key, want))
-      Error(_) -> Nil
-    }
+    use found <- result.try(instance_of(teams, store, key))
+    let reply = process.new_subject()
+    process.send(found.registry, registry.GitHubBroker(reply))
+    process.receive(reply, timeout_ms)
+    |> result.replace_error("the workspace didn't answer in time")
+    |> result.try(broker.thread(_, key))
   }
 }
 
@@ -545,7 +528,7 @@ fn instance_of(
   let team = case thread_key.parse(key) {
     Ok(parsed) -> Ok(thread_key.team(parsed))
     Error(Nil) ->
-      case store.thread(store, key) {
+      case threads.thread(store, key) {
         Ok(Some(thread)) -> Ok(thread.team)
         _ -> Error(Nil)
       }

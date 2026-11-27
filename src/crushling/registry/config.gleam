@@ -1,7 +1,7 @@
 //// How a registry is set up.
 
 import crushling/crush/client
-import crushling/github
+import crushling/github/broker
 import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
 import crushling/registry/tailnet
@@ -38,7 +38,7 @@ pub type Config {
     /// Each thread's attachments are kept under `<root>/<key>/files`.
     root: String,
     /// The GitHub App people connect their accounts through, if set up.
-    github: Option(github.Config),
+    github: Option(broker.GitHub),
     /// The model agents start on, for the App Home.
     default_model: String,
   )

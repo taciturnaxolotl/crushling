@@ -4,9 +4,11 @@
 //// Slack.
 
 import crushling/commands
-import crushling/connections
 import crushling/crush/client
 import crushling/github
+import crushling/github/broker
+import crushling/github/connect
+import crushling/github/repo
 import crushling/home
 import crushling/key
 import crushling/launcher
@@ -17,6 +19,9 @@ import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
 import crushling/store
 import crushling/store/github as accounts
+import crushling/store/schema
+import crushling/store/teams
+import crushling/store/threads
 import crushling/store/usage
 import crushling/usage as spend
 import gleam/bit_array
@@ -43,7 +48,15 @@ const test_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 
 fn fresh_store() -> store.Store {
   let assert Ok(key) = store.parse_key(test_key)
-  let assert Ok(s) = store.start(":memory:", key)
+  let assert Ok(s) = schema.open(":memory:", key)
+  // GitHub connections belong to workspaces the store has.
+  list.each(["T1", "T2"], fn(id) {
+    let assert Ok(Nil) =
+      teams.put_team(
+        s,
+        teams.Team(id, "xoxb-" <> id, "UBOT", None, "", 0, True),
+      )
+  })
   s
 }
 
@@ -69,20 +82,14 @@ fn fake_with(
     serve(asks, answers)
   })
   let assert Ok(asks) = process.receive(ready, 1000)
-  github.Config(
-    client_id: "Iv1.test",
-    client_secret: secret,
-    accounts: github.no_accounts,
-    send: fn(req) {
-      process.send(seen, req)
-      let answer = process.call(asks, 1000, fn(reply) { #(req.path, reply) })
-      case answer {
-        Ok(#(status, body)) ->
-          Ok(response.new(status) |> response.set_body(body))
-        Error(reason) -> Error(reason)
-      }
-    },
-  )
+  github.Config(client_id: "Iv1.test", client_secret: secret, send: fn(req) {
+    process.send(seen, req)
+    let answer = process.call(asks, 1000, fn(reply) { #(req.path, reply) })
+    case answer {
+      Ok(#(status, body)) -> Ok(response.new(status) |> response.set_body(body))
+      Error(reason) -> Error(reason)
+    }
+  })
 }
 
 fn serve(
@@ -460,12 +467,13 @@ pub fn home_view_test() {
 }
 
 pub fn nudge_test() {
-  let #(text, blocks) = home.ask_connect("C1", "1.5", Some("octo/hyper"))
+  let assert Ok(hyper) = repo.parse_path("octo", "hyper")
+  let #(text, blocks) = home.ask_connect("C1", "1.5", Some(hyper))
   let assert True =
     text
     == "crushling would like private access to `octo/hyper`. Would you like to connect crushling to your GitHub account?"
   let assert True = string.contains(string.inspect(blocks), "C1|1.5")
-  let #(text, blocks) = home.ask_install("octo", "hyper", "https://x/install")
+  let #(text, blocks) = home.ask_install(hyper, "https://x/install")
   let assert True = string.contains(text, "isn't set up on *octo*")
   let assert True = string.contains(string.inspect(blocks), "https://x/install")
   let assert Ok(#("C1", "1.5")) = home.nudged_from("C1|1.5")
@@ -627,7 +635,7 @@ pub fn connecting_from_a_thread_saves_the_account_test() {
   let assert Ok(accounts.Account(login: "octo", ..)) = eventually(s, "U1", 50)
   let assert Ok(_) = home_with(calls, "octo", 2000)
   // No agent was started for it.
-  let assert Ok(Nil) = store.thread(s, thread_key("T1", "D1", "1.0")) |> none
+  let assert Ok(Nil) = threads.thread(s, thread_key("T1", "D1", "1.0")) |> none
   // Disconnecting forgets it, and says so on the Home.
   process.send(r, registry.GitHubDisconnect("U1"))
   let assert True = gone(s, "U1", 50)
@@ -661,7 +669,7 @@ pub fn only_allowed_people_connect_test() {
     r,
     registry.GitHubConnectIn(
       "U1",
-      connections.Place("C1", "1.0", Some(api <> "/respond")),
+      connect.Place("C1", "1.0", Some(api <> "/respond")),
     ),
   )
   let assert True = asked_github(seen, "/login/device/code", 2000)
@@ -813,7 +821,7 @@ fn start_registry(
       tailnet: None,
       stop_backoff_ms: registry.default_stop_backoff_ms,
       root: "/tmp/crushling-github-test",
-      github:,
+      github: option.map(github, broker.GitHub(_, None)),
       default_model: "prism",
     ))
   r

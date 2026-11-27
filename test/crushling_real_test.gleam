@@ -37,6 +37,7 @@ import crushling/sandbox_http
 import crushling/sink
 import crushling/slack_tools
 import crushling/store
+import crushling/store/schema
 import crushling/sys
 import crushling/thread
 import crushling/tunnel
@@ -624,7 +625,7 @@ fn real_store(root: String) -> store.Store {
   let assert Ok(Nil) = mkdir_p(root)
   let assert Ok(#(key, _)) = store.load_key(Error(Nil), root)
   // In memory: the suite runs close to the open-file limit.
-  let assert Ok(s) = store.start(":memory:", key)
+  let assert Ok(s) = schema.open(":memory:", key)
   s
 }
 

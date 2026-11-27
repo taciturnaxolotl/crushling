@@ -7,7 +7,7 @@
 import crushling/registry/code_channel
 import crushling/registry/core.{type State, known_entry}
 import crushling/registry/entry.{Asleep, Entry}
-import crushling/store
+import crushling/store/threads
 import crushling/sys
 import crushling/venue
 import gleam/dict
@@ -32,7 +32,7 @@ pub const every_ms = 3_600_000
 
 /// Threads quiet since `now - archive_after_s`, with when they last saw work; `busy` ones are left alone.
 pub fn plan(
-  threads: List(#(store.Thread, Int)),
+  threads: List(#(threads.Thread, Int)),
   now: Int,
   busy: fn(String) -> Bool,
   exists: fn(String) -> Bool,
@@ -67,7 +67,7 @@ pub const archive_note =
 pub fn run(state: State(msg)) -> State(msg) {
   let config = state.config
   let now = sys.system_ms() / 1000
-  case store.quiet_threads(config.store, config.team, now - archive_after_s) {
+  case threads.quiet_threads(config.store, config.team, now - archive_after_s) {
     Error(reason) -> {
       sys.warn("crushling: sweeping quiet threads: " <> reason)
       state

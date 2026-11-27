@@ -5,6 +5,8 @@
 import crushling/events
 import crushling/install
 import crushling/store
+import crushling/store/schema
+import crushling/store/teams
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
@@ -36,7 +38,7 @@ fn port() -> Int {
 fn open_store() -> store.Store {
   let assert Ok(key) =
     store.parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
-  let assert Ok(s) = store.start(":memory:", key)
+  let assert Ok(s) = schema.open(":memory:", key)
   s
 }
 
@@ -89,7 +91,7 @@ fn bits(body: BitArray) -> Result(String, Nil) {
 fn config(
   s: store.Store,
   api: String,
-  installed: Subject(store.Team),
+  installed: Subject(teams.Team),
 ) -> install.Config {
   let assert Ok(slack) = slackline.anonymous() |> slackline.with_base_url(api)
   install.Config(
@@ -107,7 +109,7 @@ fn config(
   )
 }
 
-fn callback(c: install.Config) -> Result(store.Team, String) {
+fn callback(c: install.Config) -> Result(teams.Team, String) {
   let now = verify.now_seconds()
   let state = install.sign_state("instance-secret", now)
   install.callback(c, [#("code", "the-code"), #("state", state)], now)
@@ -117,9 +119,9 @@ pub fn a_reinstall_leaves_settings_alone_test() {
   let s = open_store()
   let c = config(s, fake_oauth(process.new_subject()), process.new_subject())
   let assert Ok(Nil) =
-    store.put_team(
+    teams.put_team(
       s,
-      store.Team(
+      teams.Team(
         id: "TNEW",
         bot_token: "xoxb-old",
         bot_user: "UBOTNEW",
@@ -129,17 +131,17 @@ pub fn a_reinstall_leaves_settings_alone_test() {
         active: True,
       ),
     )
-  let assert Ok(Nil) = store.set_setting(s, "TNEW", store.allowed_users, "U7")
+  let assert Ok(Nil) = teams.set_setting(s, "TNEW", teams.allowed_users, "U7")
   let assert Ok(_) = callback(c)
-  let assert Ok(Some("U7")) = store.setting(s, "TNEW", store.allowed_users)
-  let assert Ok(None) = store.setting(s, "TNEW", store.admins)
+  let assert Ok(Some("U7")) = teams.setting(s, "TNEW", teams.allowed_users)
+  let assert Ok(None) = teams.setting(s, "TNEW", teams.admins)
   // The new token, and the first install's installer.
-  let assert Ok(Some(store.Team(
+  let assert Ok(Some(teams.Team(
     bot_token: "xoxb-new",
     installed_by: "UFIRST",
     installed_at: 5,
     ..,
-  ))) = store.team(s, "TNEW")
+  ))) = teams.team(s, "TNEW")
 }
 
 pub fn installing_into_the_self_host_workspace_writes_no_people_test() {
@@ -150,7 +152,7 @@ pub fn installing_into_the_self_host_workspace_writes_no_people_test() {
       env_team: Some("TNEW"),
     )
   let assert Ok(_) = callback(c)
-  let assert Ok(settings) = store.settings(s, "TNEW")
+  let assert Ok(settings) = teams.settings(s, "TNEW")
   let assert True = dict.is_empty(settings)
 }
 
@@ -162,7 +164,7 @@ pub fn org_wide_installs_are_refused_test() {
   let c = config(s, fake_oauth_with(process.new_subject(), body), installed)
   let assert Error(reason) = callback(c)
   let assert "org-wide installs aren't supported yet" = reason
-  let assert Ok(None) = store.team(s, "E1")
+  let assert Ok(None) = teams.team(s, "E1")
   let assert Error(Nil) = process.receive(installed, 50)
 }
 
@@ -175,8 +177,8 @@ pub fn a_workspace_that_won_t_start_is_turned_off_test() {
     )
   let assert Error(reason) = callback(c)
   let assert True = string.contains(reason, "turned off")
-  let assert Ok(Some(store.Team(active: False, ..))) = store.team(s, "TNEW")
-  let assert Ok([]) = store.active_teams(s)
+  let assert Ok(Some(teams.Team(active: False, ..))) = teams.team(s, "TNEW")
+  let assert Ok([]) = teams.active_teams(s)
 }
 
 pub fn state_is_signed_and_expires_test() {
@@ -243,15 +245,15 @@ pub fn the_callback_stores_and_starts_the_workspace_test() {
   let assert True = string.contains(form, "client_secret=shh")
   let assert True = string.contains(form, "redirect_uri=")
   // Stored, token and all, and started.
-  let assert Ok(Some(stored)) = store.team(s, "TNEW")
+  let assert Ok(Some(stored)) = teams.team(s, "TNEW")
   let assert "xoxb-new" = stored.bot_token
   let assert "UBOTNEW" = stored.bot_user
   let assert "UINSTALLER" = stored.installed_by
-  let assert Ok(store.Team(id: "TNEW", ..)) = process.receive(installed, 1000)
+  let assert Ok(teams.Team(id: "TNEW", ..)) = process.receive(installed, 1000)
   // Whoever installed it may use it.
   let assert Ok(Some("UINSTALLER")) =
-    store.setting(s, "TNEW", store.allowed_users)
-  let assert Ok(Some("UINSTALLER")) = store.setting(s, "TNEW", store.admins)
+    teams.setting(s, "TNEW", teams.allowed_users)
+  let assert Ok(Some("UINSTALLER")) = teams.setting(s, "TNEW", teams.admins)
 }
 
 pub fn a_bad_callback_installs_nothing_test() {
@@ -270,7 +272,7 @@ pub fn a_bad_callback_installs_nothing_test() {
     install.callback(c, [#("error", "access_denied"), #("state", old)], now)
   let assert Error(Nil) = process.receive(forms, 100)
   let assert Error(Nil) = process.receive(installed, 50)
-  let assert Ok(None) = store.team(s, "TNEW")
+  let assert Ok(None) = teams.team(s, "TNEW")
 }
 
 pub fn install_is_served_on_the_events_server_test() {
@@ -298,7 +300,7 @@ pub fn install_is_served_on_the_events_server_test() {
   let assert Ok(res) = httpc.send(req)
   let assert 200 = res.status
   let assert True = string.contains(res.body, "installed")
-  let assert Ok(store.Team(id: "TNEW", ..)) = process.receive(installed, 1000)
+  let assert Ok(teams.Team(id: "TNEW", ..)) = process.receive(installed, 1000)
   // A forged one says why, escaped.
   let assert Ok(req) =
     request.to(base <> "/slack/oauth/callback?error=%3Cscript%3E")

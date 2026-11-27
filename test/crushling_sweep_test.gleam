@@ -5,6 +5,8 @@
 import crushling/meta
 import crushling/registry/sweep
 import crushling/store
+import crushling/store/schema
+import crushling/store/threads
 import crushling/sys
 import crushling/venue
 
@@ -12,13 +14,13 @@ const day = 86_400
 
 const now = 100_000_000
 
-fn thread(key: String, venue: venue.Venue) -> store.Thread {
-  store.Thread(key:, team: "T1", channel: "C1", thread_ts: "1.0", meta: {
+fn thread(key: String, venue: venue.Venue) -> threads.Thread {
+  threads.Thread(key:, team: "T1", channel: "C1", thread_ts: "1.0", meta: {
     meta.Meta(..meta.new(False), venue:)
   })
 }
 
-fn plan(threads: List(#(store.Thread, Int))) -> List(sweep.Action) {
+fn plan(threads: List(#(threads.Thread, Int))) -> List(sweep.Action) {
   sweep.plan(threads, now, fn(key) { key == "busy" }, fn(key) { key != "gone" })
 }
 
@@ -52,14 +54,17 @@ pub fn a_month_quiet_thread_is_cleared_out_test() {
 pub fn quiet_threads_test() {
   let assert Ok(key) =
     store.parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
-  let assert Ok(s) = store.start(":memory:", key)
-  let assert Ok(Nil) = store.put_thread(s, thread("a", venue.Thread))
+  let assert Ok(s) = schema.open(":memory:", key)
+  let assert Ok(Nil) = threads.put_thread(s, thread("a", venue.Thread))
   let assert Ok(Nil) =
-    store.put_thread(s, store.Thread(..thread("b", venue.Thread), team: "T2"))
+    threads.put_thread(
+      s,
+      threads.Thread(..thread("b", venue.Thread), team: "T2"),
+    )
   let later = sys.system_ms() / 1000 + 10
-  let assert Ok([#(store.Thread(key: "a", ..), at)]) =
-    store.quiet_threads(s, "T1", later)
+  let assert Ok([#(threads.Thread(key: "a", ..), at)]) =
+    threads.quiet_threads(s, "T1", later)
   let assert True = at <= later
-  let assert Ok([]) = store.quiet_threads(s, "T1", later - 3600)
+  let assert Ok([]) = threads.quiet_threads(s, "T1", later - 3600)
   store.close(s)
 }

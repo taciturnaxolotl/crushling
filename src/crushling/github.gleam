@@ -8,12 +8,10 @@
 //// disconnect just forgets the token, and the person can revoke it in
 //// their GitHub settings.
 
-import gleam/bit_array
+import crushling/github/http
 import gleam/dynamic/decode
-import gleam/http
+import gleam/http as gleam_http
 import gleam/http/request.{type Request}
-import gleam/http/response.{type Response}
-import gleam/httpc
 import gleam/int
 import gleam/json
 import gleam/option.{type Option, None, Some}
@@ -38,10 +36,7 @@ pub type Config {
     client_id: String,
     /// Only to revoke tokens on disconnect.
     client_secret: Option(String),
-    send: fn(Request(String)) -> Result(Response(String), String),
-    /// Where the app is installed, when its private key is known
-    /// (`github/app`); `no_accounts` without it.
-    accounts: fn() -> Option(Accounts),
+    send: http.Send,
   )
 }
 
@@ -50,19 +45,6 @@ pub type Config {
 pub type Accounts {
   Accounts(logins: List(String), install_url: String)
 }
-
-pub fn no_accounts() -> Option(Accounts) {
-  None
-}
-
-/// Send with gleam_httpc.
-pub fn http(req: Request(String)) -> Result(Response(String), String) {
-  httpc.send(req) |> result.map_error(string.inspect)
-}
-
-const web = "https://github.com"
-
-const api = "https://api.github.com"
 
 /// The code a person enters at `verification_uri`, and how to poll for
 /// their answer.
@@ -89,9 +71,9 @@ pub type Poll {
 }
 
 fn form(path: String, fields: List(#(String, String))) -> Request(String) {
-  let assert Ok(req) = request.to(web <> path)
+  let assert Ok(req) = request.to(http.web_base <> path)
   req
-  |> request.set_method(http.Post)
+  |> request.set_method(gleam_http.Post)
   |> request.set_header("accept", "application/json")
   |> request.set_header("content-type", "application/x-www-form-urlencoded")
   |> request.set_body(uri.query_to_string(fields))
@@ -102,13 +84,7 @@ fn body(
   req: Request(String),
   what: String,
 ) -> Result(String, String) {
-  case config.send(req) {
-    Error(reason) -> Error(what <> ": " <> reason)
-    Ok(response) if response.status >= 200 && response.status < 300 ->
-      Ok(response.body)
-    Ok(response) ->
-      Error(what <> ": GitHub answered " <> int.to_string(response.status))
-  }
+  http.body(config.send, req, what)
 }
 
 /// Start connecting an account.
@@ -249,13 +225,9 @@ pub fn stale(tokens: Tokens, now: Int) -> Bool {
 
 /// The login of the person a token belongs to.
 pub fn login(config: Config, tokens: Tokens) -> Result(String, String) {
-  let assert Ok(req) = request.to(api <> "/user")
   use text <- result.try(body(
     config,
-    req
-      |> request.set_header("accept", "application/vnd.github+json")
-      |> request.set_header("authorization", "Bearer " <> tokens.access)
-      |> request.set_header("user-agent", "crushling"),
+    http.api(gleam_http.Get, "/user", http.Bearer(tokens.access)),
     "asking GitHub who this is",
   ))
   json.parse(text, decode.at(["login"], decode.string))
@@ -267,26 +239,17 @@ pub fn login(config: Config, tokens: Tokens) -> Result(String, String) {
 pub fn revoke(config: Config, tokens: Tokens) -> Result(Bool, String) {
   case config.client_secret {
     None -> Ok(False)
-    Some(secret) -> {
-      let assert Ok(req) =
-        request.to(api <> "/applications/" <> config.client_id <> "/grant")
-      let basic =
-        bit_array.from_string(config.client_id <> ":" <> secret)
-        |> bit_array.base64_encode(True)
-      req
-      |> request.set_method(http.Delete)
-      |> request.set_header("accept", "application/vnd.github+json")
-      |> request.set_header("authorization", "Basic " <> basic)
-      |> request.set_header("user-agent", "crushling")
-      |> request.set_header("content-type", "application/json")
-      |> request.set_body(
-        json.to_string(
-          json.object([#("access_token", json.string(tokens.access))]),
-        ),
+    Some(secret) ->
+      http.api(
+        gleam_http.Delete,
+        "/applications/" <> config.client_id <> "/grant",
+        http.Basic(config.client_id, secret),
+      )
+      |> http.with_json(
+        json.object([#("access_token", json.string(tokens.access))]),
       )
       |> body(config, _, "revoking the GitHub token")
       |> result.replace(True)
-    }
   }
 }
 

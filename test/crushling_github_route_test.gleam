@@ -2,6 +2,10 @@
 //// thread tokens, the sandbox's git settings, and the read-only check on
 //// GraphQL.
 
+import crushling/github/broker.{
+  Anonymous, AsApp, AsPerson, Connect, Install, Read, Unavailable,
+}
+import crushling/github/repo
 import crushling/github/route
 import crushling/gun
 import crushling/relay
@@ -49,6 +53,39 @@ pub fn bound_tokens_name_their_thread_test() {
     token.opened(secret, token.GitHub, "T1-C9-1795.000100." <> mac)
   let assert Error(Nil) = token.opened(secret, token.GitHub, mac)
   let assert Error(Nil) = token.opened(secret, token.GitHub, "")
+}
+
+/// A sandbox started again gets a token its earlier copies can't stand in
+/// for.
+pub fn epoch_tokens_test() {
+  let key = "T1-C5-1.0"
+  let at = fn(epoch) { token.bound_at(secret, token.GitHub, key, epoch) }
+  let assert Ok(#("T1-C5-1.0", Some(2))) =
+    token.opened_at(secret, token.GitHub, at(2))
+  let assert Ok(#("T1-C1-1795.000100", None)) =
+    token.opened_at(
+      secret,
+      token.GitHub,
+      token.bound(secret, token.GitHub, "T1-C1-1795.000100"),
+    )
+  // The epoch is signed.
+  let assert Error(Nil) =
+    token.opened_at(secret, token.GitHub, string.replace(at(2), "@2.", "@3."))
+  let s = setup()
+  let path = "/git/octo/public/info/refs?service=git-upload-pack"
+  let get = fn(bound) {
+    ask(s, http.Get, path, [#("authorization", "Bearer " <> bound)], <<>>)
+  }
+  let assert 200 = get(at(2)).status
+  let _ = arrived(s)
+  let assert 401 = get(at(1)).status
+  let assert 401 = get(token.bound(secret, token.GitHub, key)).status
+  let assert True = nothing_arrived(s)
+  let assert True =
+    list.contains(
+      route.env_at("http://b", secret, key, 2),
+      "GH_TOKEN=" <> at(2),
+    )
 }
 
 pub fn sandbox_env_test() {
@@ -207,7 +244,7 @@ fn serve(
 }
 
 type Setup {
-  Setup(bridge: Int, arrivals: Subject(Arrival), nudged: Subject(route.Want))
+  Setup(bridge: Int, arrivals: Subject(Arrival), nudged: Subject(String))
 }
 
 /// The person of thread `late` connects when asked, and `octo/elsewhere`
@@ -218,53 +255,128 @@ fn setup() -> Setup {
   let #(flags, set) = flags()
   let github = relay.Upstream("127.0.0.1", fake_github(arrivals, flags), False)
   let handler =
-    route.route(route.Setup(
-      secret:,
-      access: fn(key) {
-        case key {
-          "T1-C1-1.0" -> Ok(Some("ghu_a"))
-          "T1-C3-1.0" -> Error("store down")
-          "T1-C4-1.0" ->
-            case has(flags, "connected") {
-              True -> Ok(Some("ghu_late"))
-              False -> Ok(None)
-            }
-          _ -> Ok(None)
-        }
-      },
-      web: github,
-      api: github,
-      bridge_url: "http://172.30.0.1:7469",
-      // The app's token is only for the public repo.
-      app_token: fn(owner, repo) {
-        case owner, repo {
-          "octo", "public" -> Some("ghs_app")
-          _, _ -> None
-        }
-      },
-      installed: fn(owner, repo) {
-        case owner, repo {
-          "octo", "elsewhere" -> Some(has(flags, "installed"))
-          "octo", "never" -> Some(False)
-          _, _ -> Some(True)
-        }
-      },
-      ask: fn(key, want) {
-        process.send(nudged, want)
-        case key, want {
-          "T1-C4-1.0", route.Connection(..) -> set("connected")
-          _, route.Install("octo", "elsewhere") -> set("installed")
-          _, _ -> Nil
-        }
-      },
-      wait_ms: 1000,
-      poll_ms: 20,
-    ))
+    route.route(
+      route.Setup(
+        secret:,
+        access: fn(key) { access(key, flags, set, nudged) },
+        web: github,
+        api: github,
+        bridge_url: "http://172.30.0.1:7469",
+        wait_ms: 1000,
+        epoch: fn(key) {
+          case key {
+            "T1-C5-1.0" -> Some(2)
+            _ -> None
+          }
+        },
+      ),
+    )
   let bridge =
     serve(fn(req) {
       handler(req) |> option.unwrap(sandbox_http.reply(404, "not mine"))
     })
   Setup(bridge:, arrivals:, nudged:)
+}
+
+/// What each test thread can get: a stand-in for its workspace's broker.
+fn access(
+  key: String,
+  flags: Flags,
+  set: fn(String) -> Nil,
+  nudged: Subject(String),
+) -> Result(broker.Access, String) {
+  let person = fn() {
+    case key {
+      "T1-C1-1.0" -> Some("ghu_a")
+      "T1-C4-1.0" ->
+        case has(flags, "connected") {
+          True -> Some("ghu_late")
+          False -> None
+        }
+      _ -> None
+    }
+  }
+  let installed = fn(target) {
+    case repo.key(target) {
+      "octo/elsewhere" -> has(flags, "installed")
+      "octo/never" -> False
+      _ -> True
+    }
+  }
+  case key {
+    "T1-C3-1.0" -> Error("store down")
+    _ ->
+      Ok(broker.Access(
+        credential: fn(target, purpose) {
+          case person(), purpose, target {
+            Some(token), _, _ -> Ok(AsPerson("someone", token))
+            // The app's token is only for the public repo.
+            None, Read, Some(target) ->
+              case repo.key(target) {
+                "octo/public" -> Ok(AsApp("ghs_app"))
+                _ -> Ok(Anonymous)
+              }
+            None, Read, None -> Ok(Anonymous)
+            None, _, _ -> Error(Connect(target))
+          }
+        },
+        refused: fn(credential, target) {
+          case credential, target {
+            AsPerson(..), Some(target) ->
+              case installed(target) {
+                False -> Some(Install(target))
+                True -> None
+              }
+            AsPerson(..), None -> None
+            _, _ -> Some(Connect(target))
+          }
+        },
+        ask: fn(need) {
+          process.send(nudged, describe(need))
+          case key, need {
+            "T1-C4-1.0", Connect(..) -> set("connected")
+            _, Install(target) ->
+              case repo.name(target) == elsewhere_name {
+                True -> set("installed")
+                False -> Nil
+              }
+            _, _ -> Nil
+          }
+        },
+        await: fn(need, ms) {
+          let met = fn() {
+            case need {
+              Connect(..) -> person() != None
+              Install(target) -> installed(target)
+              Unavailable(..) -> False
+            }
+          }
+          eventually(met, sys.monotonic_ms() + ms)
+        },
+      ))
+  }
+}
+
+fn eventually(met: fn() -> Bool, until: Int) -> Bool {
+  case met(), sys.monotonic_ms() > until {
+    True, _ -> True
+    False, True -> False
+    False, False -> {
+      process.sleep(20)
+      eventually(met, until)
+    }
+  }
+}
+
+const elsewhere_name = "elsewhere"
+
+fn describe(need: broker.Need) -> String {
+  case need {
+    Connect(Some(target)) -> "connect:" <> repo.full(target)
+    Connect(None) -> "connect"
+    Install(target) -> "install:" <> repo.full(target)
+    Unavailable(..) -> "unavailable"
+  }
 }
 
 /// Each request from a process of its own, so gun's messages about the
@@ -359,8 +471,7 @@ pub fn git_without_a_connection_reads_public_repos_test() {
   let assert True = string.contains(text(resp), "octo/private isn't public")
   let assert True = string.contains(text(resp), "asked them in this thread")
   // They were asked, for that repo, before the answer.
-  let assert Ok(route.Connection(Some("octo/private"))) =
-    process.receive(s.nudged, 0)
+  let assert Ok("connect:octo/private") = process.receive(s.nudged, 0)
   let assert Error(Nil) = header(arrived(s), "authorization")
   // Connected, the app installed, and no such repo: GitHub's own answer,
   // not a guess about installing.
@@ -400,8 +511,7 @@ pub fn a_read_waits_for_the_connection_test() {
   let basic = bit_array.base64_encode(<<"x-access-token:ghu_late":utf8>>, True)
   let assert Ok(auth) = header(arrived(s), "authorization")
   let assert True = auth == "Basic " <> basic
-  let assert Ok(route.Connection(Some("octo/private"))) =
-    process.receive(s.nudged, 0)
+  let assert Ok("connect:octo/private") = process.receive(s.nudged, 0)
   // Connected now, the next read goes straight through as them.
   let resp =
     ask(
@@ -442,7 +552,7 @@ pub fn a_resent_read_keeps_its_body_test() {
   let again = arrived(s)
   let assert Ok("Bearer ghu_late") = header(again, "authorization")
   let assert True = again.body == body
-  let assert Ok(route.Connection(None)) = process.receive(s.nudged, 0)
+  let assert Ok("connect") = process.receive(s.nudged, 0)
 }
 
 /// Connected, but the app isn't on the repo's account: they're asked to
@@ -456,15 +566,14 @@ pub fn a_read_waits_for_the_app_test() {
       "/git/octo/elsewhere/info/refs?service=git-upload-pack",
     )
   let assert 200 = resp.status
-  let assert Ok(route.Install("octo", "elsewhere")) =
-    process.receive(s.nudged, 0)
+  let assert Ok("install:octo/elsewhere") = process.receive(s.nudged, 0)
   // Where it never comes, the agent is told why.
   let resp =
     git_get(s, connected, "/git/octo/never/info/refs?service=git-upload-pack")
   let assert 403 = resp.status
   let assert True =
     string.contains(text(resp), "GitHub App isn't installed on octo")
-  let assert Ok(route.Install("octo", "never")) = process.receive(s.nudged, 0)
+  let assert Ok("install:octo/never") = process.receive(s.nudged, 0)
 }
 
 pub fn git_streams_a_fetch_test() {
@@ -594,6 +703,16 @@ pub fn pushes_elsewhere_never_reach_github_test() {
   let assert 403 = resp.status
   let assert True = string.contains(text(resp), "crushling/")
   let assert True = nothing_arrived(s)
+  // The fence comes before anyone's token is looked up.
+  let resp =
+    ask(
+      s,
+      http.Post,
+      "/git/octo/private/git-receive-pack",
+      [as_thread(broken)],
+      push_body([old <> " " <> new <> " refs/heads/main"]),
+    )
+  let assert 403 = resp.status
 }
 
 /// Without a connection, a push waits for one rather than going to GitHub
@@ -610,13 +729,13 @@ pub fn pushes_wait_for_the_connection_test() {
       body,
     )
   let assert 200 = resp.status
-  let assert Error(Nil) = header(arrived(s), "authorization")
+  // Nothing goes to GitHub until they connect.
   let again = arrived(s)
   let basic = bit_array.base64_encode(<<"x-access-token:ghu_late":utf8>>, True)
   let assert Ok(auth) = header(again, "authorization")
   let assert True = auth == "Basic " <> basic
-  let assert Ok(route.Connection(Some("octo/private"))) =
-    process.receive(s.nudged, 0)
+  let assert True = nothing_arrived(s)
+  let assert Ok("connect:octo/private") = process.receive(s.nudged, 0)
 }
 
 pub fn lfs_and_odd_paths_are_refused_test() {
@@ -684,13 +803,12 @@ pub fn the_api_reads_as_the_person_test() {
   let assert Ok("Bearer ghs_app") = header(arrived(s), "authorization")
   let _ = api_get(s, anonymous, "/search/code?q=secret")
   let assert Error(Nil) = header(arrived(s), "authorization")
-  let assert Ok(route.Connection(None)) = process.receive(s.nudged, 0)
+  let assert Ok("connect") = process.receive(s.nudged, 0)
   let resp = api_get(s, anonymous, "/repos/octo/private")
   let assert Error(Nil) = header(arrived(s), "authorization")
   let assert 404 = resp.status
   let assert True = string.contains(text(resp), "hasn't connected")
-  let assert Ok(route.Connection(Some("octo/private"))) =
-    process.receive(s.nudged, 1000)
+  let assert Ok("connect:octo/private") = process.receive(s.nudged, 1000)
 }
 
 pub fn the_api_only_reads_test() {
@@ -721,6 +839,16 @@ pub fn the_api_only_reads_test() {
   let assert 403 = gh(http.Post, "/repos/octo/public/issues", <<"{}">>).status
   let assert 403 = gh(http.Delete, "/repos/octo/public", <<>>).status
   let assert 403 = gh(http.Patch, "/repos/octo/public", <<"{}">>).status
+  let assert True = nothing_arrived(s)
+}
+
+pub fn the_api_refuses_odd_paths_test() {
+  let s = setup()
+  let assert 400 =
+    api_get(s, connected, "/repos/octo/public/contents/%2e%2e/x").status
+  let assert 400 = api_get(s, connected, "/repos/octo%2Fpublic/pulls").status
+  let assert 400 = api_get(s, connected, "/repos/octo/public/./x").status
+  let assert 404 = api_get(s, connected, "/repos/oc~to/public").status
   let assert True = nothing_arrived(s)
 }
 
@@ -758,18 +886,26 @@ pub fn real_github_test_() -> Dynamic {
 /// sandbox gets, and the API answers as api.github.com.
 fn real_clone() -> Nil {
   let handler =
-    route.route(route.Setup(
-      secret:,
-      access: fn(_) { Ok(None) },
-      web: route.github(),
-      api: route.github_api(),
-      bridge_url: "http://127.0.0.1:1",
-      app_token: fn(_, _) { None },
-      installed: fn(_, _) { None },
-      ask: fn(_, _) { Nil },
-      wait_ms: 0,
-      poll_ms: 10,
-    ))
+    route.route(
+      route.Setup(
+        secret:,
+        access: fn(_) {
+          Ok(
+            broker.Access(
+              credential: fn(_, _) { Ok(Anonymous) },
+              refused: fn(_, _) { None },
+              ask: fn(_) { Nil },
+              await: fn(_, _) { False },
+            ),
+          )
+        },
+        web: route.github(),
+        api: route.github_api(),
+        bridge_url: "http://127.0.0.1:1",
+        wait_ms: 0,
+        epoch: fn(_) { None },
+      ),
+    )
   let port =
     serve(fn(req) {
       handler(req) |> option.unwrap(sandbox_http.reply(404, "not mine"))

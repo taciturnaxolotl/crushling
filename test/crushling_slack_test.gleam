@@ -15,6 +15,8 @@ import crushling/registry/tailnet/card as tailnet_card
 import crushling/slack
 import crushling/socket
 import crushling/store
+import crushling/store/schema
+import crushling/store/threads
 import crushling/sys
 import crushling/tailscale
 import crushling/thread
@@ -136,7 +138,7 @@ fn fresh_store() -> store.Store {
   // In memory: a file store holds three files open, and the suite runs
   // close to the open-file limit.
   let assert Ok(key) = store.parse_key(test_key)
-  let assert Ok(s) = store.start(":memory:", key)
+  let assert Ok(s) = schema.open(":memory:", key)
   s
 }
 
@@ -144,17 +146,20 @@ const test_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 
 fn put_meta(s: store.Store, channel: String, ts: String, meta: meta.Meta) {
   let assert Ok(Nil) =
-    store.put_thread(s, store.Thread(k(channel, ts), "T1", channel, ts, meta))
+    threads.put_thread(
+      s,
+      threads.Thread(k(channel, ts), "T1", channel, ts, meta),
+    )
   Nil
 }
 
 fn get_meta(s: store.Store, key: String) -> meta.Meta {
-  let assert Ok(Some(thread)) = store.thread(s, key)
+  let assert Ok(Some(thread)) = threads.thread(s, key)
   thread.meta
 }
 
 fn put_link(s: store.Store, channel: String, link: meta.Link) {
-  let assert Ok(Nil) = store.put_link(s, "T1", channel, link)
+  let assert Ok(Nil) = threads.put_link(s, "T1", channel, link)
   Nil
 }
 
@@ -725,9 +730,9 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
   let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
   let s = fresh_store()
   let assert Ok(Nil) =
-    store.put_thread(
+    threads.put_thread(
       s,
-      store.Thread(
+      threads.Thread(
         "C9-1.0",
         "T1",
         "C9",
@@ -738,9 +743,9 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
   // Another workspace's old thread isn't this one's to take.
   let assert Ok(Nil) = mkdir_p(root <> "/C5-1.0/work")
   let assert Ok(Nil) =
-    store.put_thread(
+    threads.put_thread(
       s,
-      store.Thread("C5-1.0", "T2", "C5", "1.0", meta.new(True)),
+      threads.Thread("C5-1.0", "T2", "C5", "1.0", meta.new(True)),
     )
   let #(fake, launches, rekeys) = migrating_launcher(root, False)
   let assert True = set.is_empty(legacy.migrate(s, fake, root, "T1"))
@@ -748,11 +753,11 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
   let assert Error(Nil) = process.receive(rekeys, 50)
   let new = k("C9", "1.0")
   let assert "T1-C9-1.0" = new
-  let assert Ok(None) = store.thread(s, "C9-1.0")
-  let assert Ok(Some(store.Thread(team: "T1", ..))) = store.thread(s, new)
+  let assert Ok(None) = threads.thread(s, "C9-1.0")
+  let assert Ok(Some(threads.Thread(team: "T1", ..))) = threads.thread(s, new)
   let assert True = file_exists(root <> "/T1-C9-1.0/work")
   let assert False = file_exists(root <> "/C9-1.0")
-  let assert Ok(Some(_)) = store.thread(s, "C5-1.0")
+  let assert Ok(Some(_)) = threads.thread(s, "C5-1.0")
   let assert True = file_exists(root <> "/C5-1.0/work")
   // Only once.
   let assert True = set.is_empty(legacy.migrate(s, fake, root, "T1"))
@@ -836,9 +841,9 @@ pub fn a_move_cut_short_after_the_directory_finishes_test() {
   let assert Ok(Nil) = mkdir_p(root <> "/T1-C9-1.0/work")
   let s = fresh_store()
   let assert Ok(Nil) =
-    store.put_thread(
+    threads.put_thread(
       s,
-      store.Thread(
+      threads.Thread(
         "C9-1.0",
         "T1",
         "C9",
@@ -849,9 +854,9 @@ pub fn a_move_cut_short_after_the_directory_finishes_test() {
   let #(r, launches, rekeys) = migrating_registry(root, s, False)
   // Nothing left to rename on disk.
   let assert Error(Nil) = process.receive(rekeys, 50)
-  let assert Ok(None) = store.thread(s, "C9-1.0")
-  let assert Ok(Some(store.Thread(meta: meta.Meta(cursor: "2.0", ..), ..))) =
-    store.thread(s, "T1-C9-1.0")
+  let assert Ok(None) = threads.thread(s, "C9-1.0")
+  let assert Ok(Some(threads.Thread(meta: meta.Meta(cursor: "2.0", ..), ..))) =
+    threads.thread(s, "T1-C9-1.0")
   process.send(r, reply_in("C9", "3.0"))
   let assert Ok(Launched("T1-C9-1.0")) = process.receive(launches, 1000)
   Nil
@@ -877,17 +882,17 @@ pub fn a_failed_move_starts_nothing_test() {
   let assert Ok(Nil) = mkdir_p(root <> "/C9-1.0/work")
   let s = fresh_store()
   let assert Ok(Nil) =
-    store.put_thread(
+    threads.put_thread(
       s,
-      store.Thread("C9-1.0", "T1", "C9", "1.0", meta.new(True)),
+      threads.Thread("C9-1.0", "T1", "C9", "1.0", meta.new(True)),
     )
   let #(r, launches, rekeys) = migrating_registry(root, s, True)
   let assert Ok(_) = process.receive(rekeys, 1000)
   // No fresh thread under the new key; the old one stays as it was.
   process.send(r, reply_in("C9", "3.0"))
   let assert Error(Nil) = process.receive(launches, 150)
-  let assert Ok(Some(_)) = store.thread(s, "C9-1.0")
-  let assert Ok(None) = store.thread(s, "T1-C9-1.0")
+  let assert Ok(Some(_)) = threads.thread(s, "C9-1.0")
+  let assert Ok(None) = threads.thread(s, "T1-C9-1.0")
   let assert True = file_exists(root <> "/C9-1.0/work")
   // A later message still starts nothing.
   process.send(r, reply_in("C9", "4.0"))
