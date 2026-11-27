@@ -1,5 +1,5 @@
 //// The functions a thread actor uses to post in one Slack conversation.
-//// `slack.surface` builds the real ones, and the tests build their own.
+//// `slack/sink.surface` builds the real ones, and the tests build their own.
 
 import crushling/conversation.{type Conversation}
 import crushling/render

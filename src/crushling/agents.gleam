@@ -2,9 +2,11 @@
 //// always in one state, `Absent | Starting | Live | Stopping | Forgetting`,
 //// and its launches, stops, forgets and rekeys run one at a time, in the
 //// order they were asked for; what arrives while one runs waits its turn.
-//// Each operation runs on a worker process linked to this actor, so the
-//// actor never blocks and a crash anywhere takes the whole lifecycle down
-//// together, to be reconciled when it starts again.
+//// Each operation runs on an unlinked worker the actor monitors, so the
+//// actor never blocks and a worker that crashes (a timed-out call, say)
+//// only fails its own operation: the key's queue goes on, and the rest of
+//// the bridge never notices. A launch that crashed is stopped again, as it
+//// may have got partway up.
 ////
 //// At start, sandboxes a previous bridge left running are stopped rather
 //// than adopted: no registry knows their threads, and the next message
@@ -17,7 +19,7 @@ import crushling/key as thread_key
 import crushling/launcher.{type Launched, type Launcher}
 import crushling/sys
 import gleam/dict.{type Dict}
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
@@ -58,7 +60,8 @@ pub opaque type Message {
   GetStatus(key: String, reply: Subject(Status))
   GetEpoch(key: String, reply: Subject(Option(Int)))
   Reconcile
-  Finished(key: String, outcome: Outcome)
+  Finished(key: String, worker: Pid, outcome: Outcome)
+  WorkerDown(worker: Pid, reason: process.ExitReason)
 }
 
 type Outcome {
@@ -95,6 +98,8 @@ type State {
     stray: fn() -> Result(List(String), String),
     slots: Dict(String, Slot),
     generation: Int,
+    /// Each running worker's key and the status it runs under.
+    workers: Dict(Pid, #(String, Status)),
   )
 }
 
@@ -128,9 +133,26 @@ fn start_with(
   let builder =
     actor.new_with_initialiser(1000, fn(self) {
       process.send(self, Reconcile)
-      State(self:, launcher:, stray:, slots: dict.new(), generation: 0)
+      let selector =
+        process.new_selector()
+        |> process.select(self)
+        |> process.select_monitors(fn(down) {
+          case down {
+            process.ProcessDown(pid:, reason:, ..) -> WorkerDown(pid, reason)
+            // Only processes are monitored.
+            process.PortDown(reason:, ..) -> WorkerDown(process.self(), reason)
+          }
+        })
+      State(
+        self:,
+        launcher:,
+        stray:,
+        slots: dict.new(),
+        generation: 0,
+        workers: dict.new(),
+      )
       |> actor.initialised
-      |> actor.selecting(process.new_selector() |> process.select(self))
+      |> actor.selecting(selector)
       |> actor.returning(self)
       |> Ok
     })
@@ -240,7 +262,19 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
           })
           |> actor.continue
       }
-    Finished(key, outcome) -> actor.continue(finished(state, key, outcome))
+    Finished(key, worker, outcome) ->
+      State(..state, workers: dict.delete(state.workers, worker))
+      |> finished(key, outcome)
+      |> actor.continue
+    WorkerDown(worker, reason) ->
+      case dict.get(state.workers, worker) {
+        // It finished first, and said so.
+        Error(Nil) -> actor.continue(state)
+        Ok(#(key, status)) ->
+          State(..state, workers: dict.delete(state.workers, worker))
+          |> crashed(key, status, reason)
+          |> actor.continue
+      }
   }
 }
 
@@ -290,15 +324,24 @@ fn run(
 ) -> #(State, Option(Nil)) {
   let launcher = state.launcher
   let self = state.self
-  let busy = fn(state, status, work: fn() -> Outcome) {
+  let busy = fn(state: State, status: Status, work: fn() -> Outcome) {
     // `current` has the op taken off its queue; the epoch may be new.
     let epoch = case status {
       Starting if current.up == None -> Some(sys.system_ms())
       _ -> current.epoch
     }
-    process.spawn(fn() { process.send(self, Finished(key, work())) })
+    let worker =
+      process.spawn_unlinked(fn() {
+        process.send(self, Finished(key, process.self(), work()))
+      })
+    process.monitor(worker)
+    let workers = dict.insert(state.workers, worker, #(key, status))
     #(
-      put(state, key, Slot(..current, status:, running: Some(op), epoch:)),
+      put(
+        State(..state, workers:),
+        key,
+        Slot(..current, status:, running: Some(op), epoch:),
+      ),
       Some(Nil),
     )
   }
@@ -319,12 +362,14 @@ fn run(
         Launched(attached(launcher, key, launched, attach))
       })
     // Up but never attached (left over): stop it, then launch afresh.
-    Launch(..), Some(Up(launched: None, ..)) -> {
-      let #(state, running) =
-        busy(state, Stopping, fn() { Stopped(launcher.stop(key)) })
-      let current = slot(state, key)
-      #(put(state, key, Slot(..current, queue: [op, ..current.queue])), running)
-    }
+    // The stop runs as its own op, so the launch's `done` hears only once.
+    Launch(..), Some(Up(launched: None, ..)) ->
+      run(
+        state,
+        key,
+        Slot(..current, queue: [op, ..current.queue]),
+        Stop(fn(_) { Nil }),
+      )
     Stop(..), None -> answer(Ok(Nil))
     Stop(..), Some(_) ->
       busy(state, Stopping, fn() { Stopped(launcher.stop(key)) })
@@ -413,6 +458,36 @@ fn finished(state: State, key: String, outcome: Outcome) -> State {
     }
   }
   next(state, key)
+}
+
+/// A worker died before it answered: its operation failed.
+fn crashed(
+  state: State,
+  key: String,
+  status: Status,
+  reason: process.ExitReason,
+) -> State {
+  let why = "crashed: " <> string.inspect(reason)
+  sys.warn("crushling: " <> key <> " " <> why)
+  case status {
+    Starting -> {
+      let current = slot(state, key)
+      option.map(current.running, fn(op) { op.done(Error(why)) })
+      // It may be partway up: stop it before anything else runs for it.
+      let up = Up(generation: 0, since_ms: sys.system_ms(), launched: None)
+      put(
+        state,
+        key,
+        Slot(..current, status: live(up), up: Some(up), running: None, queue: [
+          Stop(fn(_) { Nil }),
+          ..current.queue
+        ]),
+      )
+      |> next(key)
+    }
+    Stopping -> finished(state, key, Stopped(Error(why)))
+    _ -> finished(state, key, Forgot(Error(why)))
+  }
 }
 
 fn reset_team(state: State, team: String) -> State {

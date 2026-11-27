@@ -11,7 +11,10 @@
 //// name of its own: a crash in one workspace leaves the others running, and
 //// the supervisor starts it again (from the store, so with its latest
 //// token) under the same name. The teams actor beside it only remembers the
-//// names. Who may use a workspace is `people.settled` over its settings.
+//// names, so the two restart together (one-for-all): a teams actor that
+//// forgot its names never meets registries it can't see, and starts every
+//// stored workspace afresh, the self-host one first. Who may use a workspace
+//// is `people.settled` over its settings.
 
 import crushling/agents.{type Agents}
 import crushling/crush/client
@@ -23,12 +26,12 @@ import crushling/registry/config as registry_config
 import crushling/registry/legacy
 import crushling/registry/shutdown
 import crushling/registry/tailnet
-import crushling/slack_tools
-import crushling/socket
+import crushling/slack/workspace.{type Outbox, type Workspace}
 import crushling/store.{type Store}
 import crushling/store/teams
 import crushling/store/threads
 import crushling/sys
+import crushling/tools
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/list
@@ -71,14 +74,9 @@ pub type EnvTeam {
   EnvTeam(id: String, allowed: People, admins: Set(String))
 }
 
-/// A running workspace.
+/// A running workspace: its Slack handle and its registry.
 pub type Instance {
-  Instance(
-    team: String,
-    bot_user: String,
-    client: slackline.Client,
-    registry: Subject(registry.Message),
-  )
+  Instance(workspace: Workspace, registry: Subject(registry.Message))
 }
 
 pub opaque type Teams {
@@ -89,15 +87,17 @@ pub opaque type Message {
   Start(team: teams.Team, reply: Subject(Result(Instance, String)))
   Find(team: String, reply: Subject(Option(Instance)))
   All(reply: Subject(List(Instance)))
-  /// Shutdown is under way: reply with every instance.
-  Drain(reply: Subject(List(Instance)))
+  /// Shutdown is under way: reply with every instance, by team, up or not.
+  Drain(reply: Subject(List(#(String, Instance))))
   /// Start every active workspace in the store, as the teams actor starts.
   StartStored
+  /// Reply with how `StartStored` went, once it has run.
+  Started(reply: Subject(Result(List(#(String, String)), String)))
 }
 
 /// What the factory needs to start, and restart, a workspace's registry.
 type Spawn {
-  Spawn(team: String, name: process.Name(registry.Message))
+  Spawn(team: String, name: process.Name(registry.Message), outbox: Outbox)
 }
 
 type Running {
@@ -109,6 +109,8 @@ type State {
     shared: Shared,
     registries: factory.Supervisor(Spawn, Subject(registry.Message)),
     running: Dict(String, Running),
+    /// How starting the stored workspaces went: those that failed, with why.
+    started: Result(List(#(String, String)), String),
   )
 }
 
@@ -156,7 +158,7 @@ fn start_tree(
     |> factory.restart_strategy(supervision.Transient)
     |> factory.restart_tolerance(intensity: 5, period: 10)
     |> factory.named(factory_name)
-  supervisor.new(supervisor.RestForOne)
+  supervisor.new(supervisor.OneForAll)
   |> supervisor.add(factory.supervised(registries))
   |> supervisor.add(
     supervision.worker(fn() {
@@ -174,7 +176,7 @@ fn start_teams(
   actor.new_with_initialiser(timeout_ms, fn(self) {
     // After init, so a slow store doesn't hold up the supervisor.
     process.send(self, StartStored)
-    State(shared:, registries:, running: dict.new())
+    State(shared:, registries:, running: dict.new(), started: Ok([]))
     |> actor.initialised
     |> actor.returning(self)
     |> Ok
@@ -217,7 +219,15 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(state)
     }
     Drain(reply) -> {
-      process.send(reply, instances(state))
+      process.send(
+        reply,
+        dict.to_list(state.running)
+          |> list.map(fn(pair) { #(pair.0, { pair.1 }.instance) }),
+      )
+      actor.continue(state)
+    }
+    Started(reply) -> {
+      process.send(reply, state.started)
       actor.continue(state)
     }
     Start(team, reply) -> {
@@ -229,24 +239,34 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       case teams.active_teams(state.shared.store) {
         Error(reason) -> {
           sys.warn("crushling: listing workspaces: " <> reason)
-          actor.continue(state)
+          actor.continue(State(..state, started: Error(reason)))
         }
-        Ok(teams) ->
-          list.fold(teams, state, fn(state, team) {
-            let #(state, started) = start_one(state, team)
-            case started {
-              Ok(_) -> Nil
-              Error(reason) ->
-                sys.warn(
-                  "crushling: couldn't start workspace "
-                  <> team.id
-                  <> ": "
-                  <> reason,
-                )
-            }
-            state
-          })
-          |> actor.continue
+        Ok(teams) -> {
+          let own = case state.shared.env_team {
+            Some(env) -> env.id
+            None -> ""
+          }
+          let #(own, others) =
+            list.partition(teams, fn(team) { team.id == own })
+          let #(state, failed) =
+            list.fold(list.append(own, others), #(state, []), fn(acc, team) {
+              let #(state, failed) = acc
+              let #(state, started) = start_one(state, team)
+              case started {
+                Ok(_) -> #(state, failed)
+                Error(reason) -> {
+                  sys.warn(
+                    "crushling: couldn't start workspace "
+                    <> team.id
+                    <> ": "
+                    <> reason,
+                  )
+                  #(state, [#(team.id, reason), ..failed])
+                }
+              }
+            })
+          actor.continue(State(..state, started: Ok(list.reverse(failed))))
+        }
       }
   }
 }
@@ -261,16 +281,16 @@ fn start_one(
     Ok(running) -> #(state, Ok(running.instance))
     Error(Nil) -> {
       let name = process.new_name("crushling_registry")
+      // One outbox per workspace, kept across restarts of its registry.
+      let outbox = workspace.start_outbox()
       let started =
-        factory.start_child(state.registries, Spawn(team.id, name))
+        factory.start_child(state.registries, Spawn(team.id, name, outbox))
         |> result.map_error(fn(error) {
           "registry for " <> team.id <> ": " <> string.inspect(error)
         })
         |> result.map(fn(_) {
           Instance(
-            team: team.id,
-            bot_user: team.bot_user,
-            client: state.shared.client(team.bot_token),
+            workspace: workspace_of(state.shared, team, outbox),
             registry: process.named_subject(name),
           )
         })
@@ -290,6 +310,18 @@ fn start_one(
       }
     }
   }
+}
+
+/// The Slack handle for `team`, as the store has it now, sending through
+/// its workspace's `outbox`.
+fn workspace_of(shared: Shared, team: teams.Team, outbox: Outbox) -> Workspace {
+  workspace.using(
+    outbox,
+    team: team.id,
+    bot_user: team.bot_user,
+    client: shared.client(team.bot_token),
+    token: team.bot_token,
+  )
 }
 
 /// A workspace's allowlist and admins: its settings in the store, else the
@@ -331,7 +363,7 @@ fn start_registry(
     Ok(Some(team)) ->
       case people(shared, team.id) {
         Ok(#(allowed, admins)) ->
-          start_instance(shared, stranded, team, allowed, admins, spawn.name)
+          start_instance(shared, stranded, team, allowed, admins, spawn)
         Error(reason) -> failed(reason)
       }
     Ok(None) -> failed("not in the store")
@@ -345,9 +377,8 @@ fn start_instance(
   team: teams.Team,
   allowed: People,
   admins: Set(String),
-  name: process.Name(registry.Message),
+  spawn: Spawn,
 ) -> actor.StartResult(Subject(registry.Message)) {
-  let client = shared.client(team.bot_token)
   let is_env = case shared.env_team {
     Some(env) -> env.id == team.id
     None -> False
@@ -355,10 +386,7 @@ fn start_instance(
   use started <- result.map(registry.start_with(
     registry_config.Config(
       launcher: agents.launcher(shared.agents),
-      client:,
-      token: team.bot_token,
-      bot_user: team.bot_user,
-      team: team.id,
+      workspace: workspace_of(shared, team, spawn.outbox),
       allowed:,
       admins:,
       store: shared.store,
@@ -379,7 +407,7 @@ fn start_instance(
       default_model: shared.default_model,
     ),
     Some(shared.agents),
-    Some(name),
+    Some(spawn.name),
   ))
   sys.info(
     "crushling: serving workspace "
@@ -440,6 +468,40 @@ pub fn seed(
   #(team, me)
 }
 
+/// Wait up to `timeout_ms` for the stored workspaces to have started, as
+/// the teams actor does on its own when it starts: the ones that failed,
+/// with why, or why they couldn't be listed.
+pub fn started(
+  teams: Teams,
+  timeout_ms: Int,
+) -> Result(List(#(String, String)), String) {
+  guarded(timeout_ms, fn() { process.call(teams.subject, timeout_ms, Started) })
+  |> result.flatten
+}
+
+/// Run `work` on a process of its own, so a call to something that is
+/// down or restarting is an error here rather than a crash.
+fn guarded(timeout_ms: Int, work: fn() -> a) -> Result(a, String) {
+  let reply = process.new_subject()
+  let pid = process.spawn_unlinked(fn() { process.send(reply, work()) })
+  let monitor = process.monitor(pid)
+  let answer =
+    process.new_selector()
+    |> process.select_map(reply, Ok)
+    |> process.select_specific_monitor(monitor, fn(down) {
+      Error(string.inspect(down.reason))
+    })
+    |> process.selector_receive(timeout_ms + 1000)
+  process.demonitor_process(monitor)
+  case answer {
+    Ok(answer) -> answer
+    Error(Nil) -> {
+      process.kill(pid)
+      Error("no answer in time")
+    }
+  }
+}
+
 /// Start `team`'s instance, or return the one already running.
 pub fn start_team(teams: Teams, team: teams.Team) -> Result(Instance, String) {
   process.call(teams.subject, timeout_ms, Start(team, _))
@@ -470,42 +532,66 @@ pub fn all(teams: Teams) -> List(Instance) {
 
 /// How the event router finds a workspace: by `team_id`, else (for an
 /// org-wide install) by `enterprise_id`.
-pub fn finder(teams: Teams) -> socket.Find {
+pub fn finder(
+  teams: Teams,
+) -> fn(Option(String), Option(String)) -> Result(Instance, Nil) {
   fn(team, enterprise) {
-    let found = case team, enterprise {
+    case team, enterprise {
       Some(team), _ -> find(teams, team)
       None, Some(enterprise) -> find(teams, enterprise)
       None, None -> None
     }
-    case found {
-      Some(instance) ->
-        Ok(socket.Target(
-          team: instance.team,
-          bot_user: instance.bot_user,
-          registry: instance.registry,
-        ))
-      None -> Error(Nil)
-    }
+    |> option.to_result(Nil)
   }
 }
 
 /// Shut every instance down with `grace_ms` for running turns, all at
 /// once, and wait for all of them: Clean only if every one was.
+///
+/// Nothing here may crash the caller, which still has to save spend and
+/// exit: a workspace that can't be reached is Incomplete with its team.
 pub fn shutdown(teams: Teams, grace_ms: Int) -> shutdown.ShutdownOutcome {
-  let instances = process.call(teams.subject, timeout_ms, Drain)
-  let replies =
-    list.map(instances, fn(instance) {
-      let done = process.new_subject()
-      process.send(instance.registry, registry.Shutdown(grace_ms, done))
-      done
-    })
+  case
+    guarded(timeout_ms, fn() { process.call(teams.subject, timeout_ms, Drain) })
+  {
+    Error(reason) -> {
+      sys.warn("crushling: shutting down the workspaces: " <> reason)
+      shutdown.Incomplete(["workspaces: " <> reason])
+    }
+    Ok(instances) -> shutdown_all(instances, grace_ms)
+  }
+}
+
+fn shutdown_all(
+  instances: List(#(String, Instance)),
+  grace_ms: Int,
+) -> shutdown.ShutdownOutcome {
   let budget = shutdown.budget_ms(grace_ms)
   let deadline = sys.monotonic_ms() + budget
-  list.fold(replies, shutdown.Clean, fn(outcome, done) {
+  let replies =
+    list.map(instances, fn(pair) {
+      let #(team, instance) = pair
+      let done = process.new_subject()
+      #(
+        team,
+        send_shutdown(instance.registry, registry.Shutdown(grace_ms, done), 20),
+        done,
+      )
+    })
+  list.fold(replies, shutdown.Clean, fn(outcome, sent) {
     let left = int_max(deadline - sys.monotonic_ms(), 0)
-    let this = case process.receive(done, left) {
-      Ok(this) -> this
-      Error(Nil) -> shutdown.TimedOut
+    let this = case sent {
+      #(team, Error(reason), _) -> {
+        sys.warn(
+          "crushling: shutting down workspace " <> team <> ": " <> reason,
+        )
+        shutdown.Incomplete([team])
+      }
+      #(_, Ok(Nil), done) ->
+        case process.receive(done, left) {
+          Ok(this) -> this
+          Error(Nil) -> shutdown.TimedOut
+        }
     }
     case outcome, this {
       shutdown.TimedOut, _ | _, shutdown.TimedOut -> shutdown.TimedOut
@@ -517,6 +603,24 @@ pub fn shutdown(teams: Teams, grace_ms: Int) -> shutdown.ShutdownOutcome {
       shutdown.Clean, shutdown.Clean -> shutdown.Clean
     }
   })
+}
+
+/// Send to a registry that may be mid-restart, waiting up to `tries` tenths
+/// of a second for it to come back under its name.
+fn send_shutdown(
+  registry: Subject(registry.Message),
+  message: registry.Message,
+  tries: Int,
+) -> Result(Nil, String) {
+  // Sending to a name nobody holds raises, so it is tried off this process.
+  case guarded(1000, fn() { process.send(registry, message) }) {
+    Ok(Nil) -> Ok(Nil)
+    Error(_) if tries > 0 -> {
+      process.sleep(100)
+      send_shutdown(registry, message, tries - 1)
+    }
+    Error(_) -> Error("it is down")
+  }
 }
 
 fn int_max(a: Int, b: Int) -> Int {
@@ -563,12 +667,17 @@ fn instance_of(
 
 /// The Slack tools reach each thread's own workspace: its team is in its
 /// key, else in its row in the store.
-pub fn tools_context(teams: Teams, store: Store) -> slack_tools.Context {
+pub fn tools_context(
+  teams: Teams,
+  store: Store,
+  features: tools.Features,
+) -> tools.Context {
   let instance_of = instance_of(teams, store, _)
-  slack_tools.Context(
+  tools.Context(
+    features:,
     workspace: fn(key) {
       use found <- result.map(instance_of(key))
-      slack_tools.Workspace(client: found.client, bot_user: found.bot_user)
+      found.workspace
     },
     lookup: fn(key) {
       case instance_of(key) {

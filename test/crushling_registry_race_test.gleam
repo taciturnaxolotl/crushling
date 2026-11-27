@@ -2,6 +2,7 @@
 //// sandbox running: checked with a launcher whose launch and stop block
 //// until the test lets them finish.
 
+import crushling/agent/post_mortem
 import crushling/crush/client
 import crushling/key
 import crushling/launcher
@@ -10,6 +11,7 @@ import crushling/registry
 import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
 import crushling/registry/shutdown
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/schema
 import crushling/thread
@@ -38,7 +40,13 @@ fn blocking_launcher(calls: Subject(Call)) -> launcher.Launcher {
       process.send(calls, Launch(key, go))
       let assert Ok(Nil) = process.receive(go, 10_000)
       // Nothing listens here: the thread actor starts and keeps retrying.
-      Ok(launcher.Launched(socket: dir <> "/none.sock", root: dir))
+      Ok(
+        launcher.Launched(
+          socket: dir <> "/none.sock",
+          root: dir,
+          post_mortem: fn() { post_mortem.Unknown("test") },
+        ),
+      )
     },
     stop: fn(key) {
       let go = process.new_subject()
@@ -68,10 +76,12 @@ fn start_with(
   let assert Ok(r) =
     registry.start(registry_config.Config(
       launcher: blocking_launcher(calls),
-      client:,
-      token: "xoxb-test",
-      bot_user: "UBOT",
-      team: "T1",
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: race_store(),

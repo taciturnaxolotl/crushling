@@ -1,7 +1,7 @@
 //// Socket Mode stays connected: a connection Slack drops without a close
 //// frame is replaced, rather than taking the reconnect loop down with it.
 
-import crushling/socket
+import crushling/slack/socket_mode
 import gleam/bytes_tree
 import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
@@ -62,7 +62,9 @@ pub fn a_dropped_connection_is_replaced_test() {
       "http://127.0.0.1:" <> int.to_string(port) <> "/api",
     )
   let loop =
-    process.spawn_unlinked(fn() { socket.run_with(client, app.unverified()) })
+    process.spawn_unlinked(fn() {
+      socket_mode.run_with(client, app.unverified())
+    })
   let assert Ok(first) = process.receive(connected, 5000)
   // Slack goes away without a close frame.
   process.kill(first)

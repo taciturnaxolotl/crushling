@@ -8,11 +8,12 @@
 import crushling/agents.{type Agents}
 import crushling/commands
 import crushling/conversation.{Conversation}
+import crushling/crush/catalog
 import crushling/github/broker.{type Broker}
 import crushling/github/connect
 import crushling/home/publisher
 import crushling/meta.{type Link, Meta}
-import crushling/models
+import crushling/pr
 import crushling/registry/accounts.{type HomeAsk, Connect, ShowHome, show_home}
 import crushling/registry/backlog.{prepared, pump}
 import crushling/registry/code_channel
@@ -21,7 +22,7 @@ import crushling/registry/core.{
   type Event, Deferred, FromThread, GitHubNudgeTo, IdleCheck, JobsUncounted,
   Member, PrSettled, Prepared, RetryStop, ShutdownDeadline, ShutdownFinal,
   ShutdownGiveUp, Started, State, Stopped, Sweep, TailnetLater, ThreadDown,
-  apply_tailnet, busy, entry_for, key, put, set_meta,
+  announce, apply_tailnet, busy, entry_for, key, put, set_meta, whisper,
 }
 import crushling/registry/entry.{
   type Entry, Asleep, Entry, Live, Starting, Stopping, Turn, already_read,
@@ -34,12 +35,13 @@ import crushling/registry/lifecycle.{
   stop_agent, stopped, thread_down,
 }
 import crushling/registry/links
-import crushling/registry/say.{announce, whisper}
 import crushling/registry/shutdown.{type ShutdownOutcome}
 import crushling/registry/sweep
 import crushling/registry/tailnet
 import crushling/registry/text
-import crushling/slack
+import crushling/slack/model_card
+import crushling/slack/text as slack_text
+import crushling/slack/workspace
 import crushling/sys
 import crushling/thread
 import gleam/bool
@@ -70,13 +72,10 @@ pub type Message {
   /// Connect or disconnect `user`'s GitHub account, from the App Home.
   GitHubConnect(user: String)
   GitHubDisconnect(user: String)
-  /// A PR card button: open the PR (maybe as a draft) or dismiss it; `respond` answers privately.
-  PrPressed(
-    user: String,
-    card_ts: String,
-    choice: String,
-    respond: Option(String),
-  )
+  /// A PR card button: open the PR (maybe as a draft) or dismiss it.
+  PrPressed(pr.Pressed)
+  /// Answer whoever pressed a button through its `response_url`: in place of what they pressed when `replace`.
+  Respond(url: String, text: String, replace: Bool)
   /// A slash command in a code channel, heard as the `!` command `text` from `user`.
   Slash(channel: String, user: String, text: String)
   /// `user` pressed Connect on the note asking them, in a thread.
@@ -88,7 +87,7 @@ pub type Message {
   /// A pick on a model card; `home` is the thread, since the card may sit elsewhere.
   ModelPicked(
     home: #(String, String),
-    pick: models.Pick,
+    pick: model_card.Pick,
     card: meta.Card,
     user: String,
   )
@@ -142,6 +141,7 @@ fn init(
   named: Subject(Message),
 ) -> Result(actor.Initialised(State, Message, Subject(Message)), String) {
   {
+    let team = workspace.team(config.workspace)
     // Its own callbacks and timers come here, so ones from a crashed
     // registry die with it rather than reach the one started after it.
     let self = process.new_subject()
@@ -155,9 +155,8 @@ fn init(
     // Linked: they go down with the registry, and come back with it.
     use connect <- result.try(
       connect.start(connect.Setup(
-        client: config.client,
+        workspace: config.workspace,
         store: config.store,
-        team: config.team,
         github: option.map(config.github, fn(github) { github.config }),
       ))
       |> result.replace_error("GitHub connecting could not start"),
@@ -165,7 +164,7 @@ fn init(
     use broker <- result.try(
       broker.start(broker.Setup(
         store: config.store,
-        team: config.team,
+        team:,
         github: config.github,
         connect:,
         requester: fn(key) {
@@ -184,9 +183,8 @@ fn init(
     use home <- result.try(
       publisher.start(
         publisher.Setup(
-          client: config.client,
+          workspace: config.workspace,
           store: config.store,
-          team: config.team,
           github: option.is_some(config.github),
           accounts: fn() { broker.accounts(broker) },
           default_model: config.default_model,
@@ -200,14 +198,14 @@ fn init(
       None -> agents.start(config.launcher)
     })
     // A registry starting afresh knows none of the agents its workspace had.
-    agents.reset(owner, config.team)
+    agents.reset(owner, team)
     State(
       config:,
       agents: owner,
       self:,
       wrap: fn(event) { Internal(Own(event)) },
       threads: dict.new(),
-      code_channels: links.new(config.store, config.team),
+      code_channels: links.new(config.store, team),
       opening: set.new(),
       seen: [],
       launches: 0,
@@ -217,7 +215,7 @@ fn init(
       broken: set.new(),
       tailnets: tailnet.new(
         config.tailnet,
-        config.client,
+        config.workspace,
         gate.approvers(config.allowed, config.admins),
         fn(key, event, after_ms) {
           process.send_after(
@@ -228,7 +226,7 @@ fn init(
           Nil
         },
       ),
-      gate: gate.new(config.allowed, config.client, config.team, fn(answer, ms) {
+      gate: gate.new(config.allowed, config.workspace, fn(answer, ms) {
         process.send_after(self, ms, Internal(Own(Member(answer))))
         Nil
       }),
@@ -368,8 +366,8 @@ fn serve(state: State, message: Message) -> State {
       process.send(state.connect, connect.Disconnect(user, None))
       state
     }
-    PrPressed(user:, card_ts:, choice:, respond:) -> {
-      let say = accounts.responder(respond)
+    PrPressed(pr.Pressed(user:, card_ts:, choice:, respond:)) -> {
+      let say = accounts.responder(state, respond)
       use card <- accounts.with_proposal(state, card_ts, say)
       use <- admit(state, user, message, fn() {
         say(text.cant_use)
@@ -388,6 +386,10 @@ fn serve(state: State, message: Message) -> State {
     }
     GitHubBroker(reply) -> {
       process.send(reply, state.broker)
+      state
+    }
+    Respond(url:, text:, replace:) -> {
+      workspace.respond_later(state.config.workspace, url, text, replace)
       state
     }
     // Joins and timers come only from the registry itself.
@@ -433,7 +435,7 @@ fn received(state: State, incoming: Incoming, attempts: Int) -> State {
   let origin = option.map(code, links.origin)
   let #(channel, thread_ts) =
     option.unwrap(origin, #(incoming.channel, incoming.thread_ts))
-  let key = key(state.config.team, channel, thread_ts)
+  let key = key(core.team(state), channel, thread_ts)
   case entry_for(state, key, channel, thread_ts) {
     Ok(known) -> {
       use <- code_channel.hold(state, incoming, known, attempts)
@@ -448,11 +450,7 @@ fn broken(state: State, key: String, incoming: Incoming) -> State {
   case set.contains(state.broken, key) {
     True -> state
     False -> {
-      say.post(
-        state.config.client,
-        conversation.from_slack(incoming.channel, incoming.thread_ts),
-        text.broken_thread,
-      )
+      core.say(state, incoming.conversation(incoming), text.broken_thread)
       State(..state, broken: set.insert(state.broken, key))
     }
   }
@@ -481,7 +479,8 @@ fn route(
 ) -> State {
   let config = state.config
   let id = incoming.channel <> ":" <> incoming.ts
-  let prompt = slack.prompt_text(incoming.text, config.bot_user)
+  let prompt =
+    slack_text.prompt_text(incoming.text, workspace.bot_user(config.workspace))
   let command = commands.parse(prompt)
   // In a code channel everyone talks to the agent; a paused agent hears only mentions and `!resume`.
   let addressed = case known, origin {
@@ -517,7 +516,6 @@ fn route(
 
 /// Do what a message asks for.
 fn act(state: State, route: Route, command: commands.Command) -> State {
-  let config = state.config
   case command, route.known {
     commands.SideComment, _ -> state
     // Works anywhere the bot hears it, with or without an agent.
@@ -538,12 +536,12 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
       }
     }
     commands.HelpCommand, _ -> {
-      whisper(config, route.incoming, commands.help())
+      whisper(state, route.incoming, commands.help())
       state
     }
     commands.PauseCommand, Some(entry) -> {
       announce(
-        config,
+        state,
         route.incoming,
         route.origin,
         "_paused: I'll only answer when mentioned. `!resume` to have me follow along again._",
@@ -552,7 +550,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
     }
     commands.ResumeCommand, Some(entry) -> {
       announce(
-        config,
+        state,
         route.incoming,
         route.origin,
         "_following along again: every message here reaches me._",
@@ -571,7 +569,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
           case result {
             Ok(_) -> Nil
             Error(why) ->
-              whisper(config, incoming, "_No PR card: " <> why <> "._")
+              whisper(state, incoming, "_No PR card: " <> why <> "._")
           }
         }),
       )
@@ -584,13 +582,13 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
         let text =
           process.receive(asked, 15_000)
           |> result.unwrap("_The agent didn't answer in time._")
-        whisper(config, incoming, text)
+        whisper(state, incoming, text)
       })
       state
     }
     commands.InfoCommand, Some(_) -> {
       whisper(
-        config,
+        state,
         route.incoming,
         "_The agent is asleep; send a message to wake it, then ask again._",
       )
@@ -603,7 +601,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
       state
     }
     commands.StopCommand, _ -> {
-      whisper(config, route.incoming, "_nothing is running in this thread._")
+      whisper(state, route.incoming, "_nothing is running in this thread._")
       state
     }
     commands.TailnetCommand(on: True), Some(entry) -> {
@@ -618,7 +616,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
       let state = State(..state, tailnets:)
       case asked {
         Ok(_) -> Nil
-        Error(reason) -> whisper(config, route.incoming, "_" <> reason <> "._")
+        Error(reason) -> whisper(state, route.incoming, "_" <> reason <> "._")
       }
       state
     }
@@ -631,7 +629,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
       )
       |> apply_tailnet(state, route.key, Some(entry), _)
     commands.ModelCommand(argument), Some(entry) ->
-      case models.parse_argument(argument) {
+      case catalog.parse_argument(argument) {
         Ok(request) ->
           deliver(
             state,
@@ -641,7 +639,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
           )
         Error(Nil) -> {
           whisper(
-            config,
+            state,
             route.incoming,
             "_`!model` shows the model; `!model <id> [level]` switches, and `!model default` goes back to the default._",
           )
@@ -656,7 +654,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
     | commands.TailnetCommand(..), None
     | commands.ModelCommand(..), None
     -> {
-      whisper(config, route.incoming, "_I'm not working in this thread._")
+      whisper(state, route.incoming, "_I'm not working in this thread._")
       state
     }
     // A bare mention with nothing attached has nothing to say.
@@ -671,12 +669,13 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
 fn queue(state: State, route: Route, known: Option(Entry)) -> State {
   let incoming = route.incoming
   // "Working…" now, not once the agent is up and the prompt is ready.
-  let client = state.config.client
   let place = case known {
     Some(entry) -> entry.conversation(entry)
     None -> Conversation(incoming.channel, Some(incoming.thread_ts))
   }
-  process.spawn_unlinked(fn() { slack.mark_working(client, place) })
+  // Straight to Slack, not the outbox: queued behind a slow post it could land after the thread's own "done".
+  let ws = state.config.workspace
+  process.spawn_unlinked(fn() { workspace.mark_working(ws, place) })
   case known {
     Some(entry) -> {
       let entry =
@@ -731,15 +730,15 @@ fn deliver(
 fn model_picked(
   state: State,
   home: #(String, String),
-  pick: models.Pick,
+  pick: model_card.Pick,
   card: meta.Card,
   user: String,
 ) -> State {
   let #(channel, thread_ts) = home
-  let key = key(state.config.team, channel, thread_ts)
+  let key = key(core.team(state), channel, thread_ts)
   let refuse = fn(text) {
     conversation.from_slack(card.channel, card.thread_ts)
-    |> say.privately(state.config.client, _, user, text)
+    |> core.tell_privately(state, _, user, text)
     state
   }
   let message = ModelPicked(home, pick, card, user)
@@ -780,11 +779,11 @@ fn stop_requested(
   }
   let key = case origin {
     Some(#(origin_channel, origin_ts)) ->
-      key(config.team, origin_channel, origin_ts)
-    None -> key(config.team, channel, thread_ts)
+      key(core.team(state), origin_channel, origin_ts)
+    None -> key(core.team(state), channel, thread_ts)
   }
   use <- admit(state, user, StopRequested(channel, thread_ts, user), fn() {
-    whisper(config, incoming, text.cant_stop)
+    whisper(state, incoming, text.cant_stop)
     state
   })
   case dict.get(state.threads, key) {
@@ -796,8 +795,8 @@ fn stop_requested(
     }
     // Nothing running here, so the session shouldn't say it is.
     _ -> {
-      say.session_done(
-        config.client,
+      workspace.session_done_later(
+        config.workspace,
         conversation.from_slack(channel, thread_ts),
       )
       state

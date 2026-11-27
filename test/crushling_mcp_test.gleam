@@ -1,7 +1,7 @@
 import crushling/crush/event
 import crushling/mcp
 import crushling/run
-import crushling/slack_tools
+import crushling/tools
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
@@ -9,7 +9,7 @@ import gleam/option.{None, Some}
 import gleam/string
 
 fn tools() {
-  slack_tools.tools(tailnet: False)
+  tools.tools(tools.Features(tailnet: False))
 }
 
 fn fake(key, name, arguments) {
@@ -116,7 +116,7 @@ pub fn settled_messages_test() {
 
 pub fn the_tailnet_tool_is_offered_only_when_set_up_test() {
   let names = fn(tailnet) {
-    slack_tools.tools(tailnet:) |> list.map(fn(tool) { tool.name })
+    tools.tools(tools.Features(tailnet:)) |> list.map(fn(tool) { tool.name })
   }
   let assert False = list.contains(names(False), "request_tailnet")
   let assert True = list.contains(names(True), "request_tailnet")

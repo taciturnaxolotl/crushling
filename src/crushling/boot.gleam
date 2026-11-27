@@ -6,7 +6,7 @@ import crushling/agent/spec
 import crushling/agents
 import crushling/config.{type Config}
 import crushling/events
-import crushling/files
+import crushling/files/route as files_route
 import crushling/github
 import crushling/github/app as github_app
 import crushling/github/broker
@@ -22,8 +22,8 @@ import crushling/registry/shutdown
 import crushling/registry/tailnet
 import crushling/sandbox
 import crushling/sandbox_http
-import crushling/slack_tools
-import crushling/socket
+import crushling/slack/router
+import crushling/slack/socket_mode
 import crushling/store
 import crushling/store/legacy_import
 import crushling/store/schema
@@ -31,7 +31,9 @@ import crushling/store/teams
 import crushling/store/usage
 import crushling/sys
 import crushling/tailscale
+import crushling/tools
 import crushling/tunnel
+import crushling/usage as usage_cap
 import gleam/erlang/process
 import gleam/int
 import gleam/io
@@ -64,6 +66,10 @@ fn install_sigterm(subject: process.Subject(Nil)) -> Result(Nil, String)
 /// by name, so a restart is invisible to its users, and a restart of one
 /// restarts everything after it: a new lifecycle owner stops the sandboxes
 /// it doesn't know, and new registries start from nothing running.
+///
+/// Slack events are only taken once the stored workspaces have started, so
+/// none arrives for a workspace that isn't there yet; the self-host one
+/// failing to start fails the boot.
 pub fn run(config: Config) -> Result(Int, String) {
   let root = config.root
   use secret <- result.try(mcp_secret(root))
@@ -85,6 +91,7 @@ pub fn run(config: Config) -> Result(Int, String) {
   }
 
   let proxy_config = proxy_config(config.proxy, secret, store)
+  log_caps(config.proxy)
   use proxy <- result.try(
     proxy.new(proxy_config)
     |> result.map_error(fn(reason) {
@@ -144,7 +151,12 @@ pub fn run(config: Config) -> Result(Int, String) {
       default_model: config.models.large,
     )
 
-  let context = instance.tools_context(teams, store)
+  let context =
+    instance.tools_context(
+      teams,
+      store,
+      tools.Features(tailnet: tailnet != option.None),
+    )
   // Every agent reaches the bridge here: its tunnel, its inference, its
   // Slack tools and its files.
   let config.Address(bind:, port:) = config.bridge.address
@@ -153,17 +165,15 @@ pub fn run(config: Config) -> Result(Int, String) {
     proxy.route(proxy),
     mcp.route_with(
       secret,
-      slack_tools.tools(tailnet: tailnet != option.None),
-      fn(key, name, arguments) {
-        slack_tools.call(context, key, name, arguments)
-      },
+      tools.tools(context.features),
+      fn(key, name, arguments) { tools.call(context, key, name, arguments) },
       case github_reads {
         True -> github_route.instructions
         False -> ""
       },
     ),
-    files.route(secret, root, fn(key, name, contents, comment) {
-      slack_tools.share(context, key, name, contents, comment)
+    files_route.route(secret, root, fn(key, name, contents, comment) {
+      tools.share(context, key, name, contents, comment)
     }),
     ..case github_reads {
       True -> [
@@ -209,6 +219,7 @@ pub fn run(config: Config) -> Result(Int, String) {
     <> ", reached by agents at "
     <> bridge_url,
   )
+  use _ <- result.try(workspaces_started(teams, own_team))
 
   let find = instance.finder(teams)
   let install =
@@ -235,7 +246,7 @@ pub fn run(config: Config) -> Result(Int, String) {
       let config.Address(bind:, port:) = config.slack.events
       let router =
         option.map(signing_secret, fn(signing_secret) {
-          socket.router(app.new(signing_secret), find)
+          router.router(app.new(signing_secret), find)
         })
       use _ <- result.map(events.start(bind, port, router, install))
       case router {
@@ -262,9 +273,9 @@ pub fn run(config: Config) -> Result(Int, String) {
   })
   let socket =
     option.map(config.slack.socket_mode, fn(app_token) {
-      let router = socket.router(app.unverified(), find)
+      let router = router.router(app.unverified(), find)
       io.println("crushling: taking events over Socket Mode")
-      process.spawn_unlinked(fn() { socket.run(app_token, router) })
+      process.spawn_unlinked(fn() { socket_mode.run(app_token, router) })
     })
 
   let terminate = process.new_subject()
@@ -298,6 +309,49 @@ pub fn run(config: Config) -> Result(Int, String) {
       )
       Ok(1)
     }
+  }
+}
+
+/// Wait for the teams actor to start every stored workspace. The self-host
+/// one must be up; others that failed were logged and can be installed
+/// again.
+fn workspaces_started(
+  teams: instance.Teams,
+  own_team: String,
+) -> Result(Nil, String) {
+  use failed <- result.try(
+    instance.started(teams, workspaces_timeout_ms)
+    |> result.map_error(fn(reason) { "starting workspaces: " <> reason }),
+  )
+  case own_team, list.key_find(failed, own_team) {
+    "", _ -> Ok(Nil)
+    _, Ok(reason) -> Error("starting workspace " <> own_team <> ": " <> reason)
+    _, Error(Nil) ->
+      case instance.find(teams, own_team) {
+        option.Some(_) -> Ok(Nil)
+        option.None ->
+          Error("workspace " <> own_team <> " didn't start with the bridge")
+      }
+  }
+}
+
+const workspaces_timeout_ms = 300_000
+
+/// Say once what the spend caps count, since that changed with the store.
+fn log_caps(settings: config.Proxy) -> Nil {
+  case settings.thread_cap == usage_cap.unlimited {
+    True -> Nil
+    False ->
+      io.println(
+        "crushling: the thread cap counts all a thread has spent, across restarts",
+      )
+  }
+  case settings.instance_cap == usage_cap.unlimited {
+    True -> Nil
+    False ->
+      io.println(
+        "crushling: CRUSHLING_PROXY_INSTANCE_CAP_* caps each workspace on its own, over its last 30 days",
+      )
   }
 }
 
@@ -525,7 +579,16 @@ fn getenv(name: String) -> Result(String, Nil)
 fn docker_socket() -> String {
   case getenv("DOCKER_HOST") {
     Ok("unix://" <> path) -> path
-    _ -> sandbox.default_socket
+    Ok("") | Error(Nil) -> sandbox.default_socket
+    Ok(other) -> {
+      sys.warn(
+        "crushling: DOCKER_HOST is "
+        <> other
+        <> ", but only unix:// sockets are supported; using "
+        <> sandbox.default_socket,
+      )
+      sandbox.default_socket
+    }
   }
 }
 

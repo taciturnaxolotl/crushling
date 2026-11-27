@@ -8,6 +8,7 @@ import crushling/registry
 import crushling/registry/config as registry_config
 import crushling/registry/gate
 import crushling/registry/incoming as msg
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/schema
 import gleam/bit_array
@@ -197,10 +198,12 @@ fn start_registry(
   let assert Ok(r) =
     registry.start(registry_config.Config(
       launcher: launcher_reporting(launches),
-      client: slack_client(api),
-      token: "xoxb-test",
-      bot_user: "UBOT",
-      team: "T1",
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client: slack_client(api),
+        token: "xoxb-test",
+      ),
       allowed: people.parse(allowed),
       admins: set.new(),
       store: s,

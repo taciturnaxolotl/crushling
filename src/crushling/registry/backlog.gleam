@@ -1,6 +1,7 @@
 //// A thread's waiting messages, prepared into prompts one at a time so each
 //// catches up from where the last left off.
 
+import crushling/attachments
 import crushling/meta.{Meta}
 import crushling/registry/core.{type State, Prepared, put, set_meta}
 import crushling/registry/entry.{
@@ -9,7 +10,7 @@ import crushling/registry/entry.{
 }
 import crushling/registry/incoming.{type Incoming}
 import crushling/registry/prompt
-import crushling/slack
+import crushling/slack/text
 import crushling/sys
 import crushling/thread
 import gleam/dict
@@ -66,14 +67,9 @@ fn prepare_next(
         False -> ""
       }
       process.spawn_unlinked(fn() {
-        let source =
-          prompt.Source(
-            config.client,
-            config.token,
-            config.bot_user,
-            slack.Keep(config.root, key),
-          )
-        let prompt = prompt.build(source, next, cursor, catch_up)
+        let keep = attachments.Keep(config.root, key)
+        let prompt =
+          prompt.build(config.workspace, keep, next, cursor, catch_up)
         tell(Prepared(key, next.ts, prompt))
       })
       let entry =
@@ -95,7 +91,7 @@ pub fn prepared(
   case dict.get(state.threads, key) {
     Ok(Entry(agent: Live(thread:, ..), ..) as entry) -> {
       // How long the person waited for their message to reach the agent.
-      let waited = sys.system_ms() - float.round(slack.ts_value(ts) *. 1000.0)
+      let waited = sys.system_ms() - float.round(text.ts_value(ts) *. 1000.0)
       sys.info(
         "crushling: "
         <> key

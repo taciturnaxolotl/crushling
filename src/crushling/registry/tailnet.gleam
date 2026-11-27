@@ -4,9 +4,12 @@
 //// lasts; `sync` makes that so after every change.
 
 import crushling/conversation.{type Conversation}
+import crushling/key as thread_key
 import crushling/meta.{type Card, type Grant}
 import crushling/people.{type People}
 import crushling/registry/tailnet/card as tailnet_card
+import crushling/slack/action_ref.{ThreadRef}
+import crushling/slack/workspace.{type Workspace, Message}
 import crushling/sys
 import crushling/tailscale
 import gleam/dict.{type Dict}
@@ -15,12 +18,8 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import gleam/string
-import slackline
-import slackline/api/chat
-import slackline/api/chat/post_ephemeral
 import slackline/block
-import slackline/httpc
+import slackline/interaction
 
 /// What the registry needs to put sandboxes on the tailnet.
 pub type Setup {
@@ -70,7 +69,7 @@ pub type Step {
 pub opaque type Tailnets {
   Tailnets(
     setup: Option(Setup),
-    client: slackline.Client,
+    workspace: Workspace,
     /// Who may press the buttons. Never everyone (see
     /// `gate.approvers`), so no membership lookup is needed.
     approvers: People,
@@ -107,13 +106,13 @@ pub type Outcome {
 
 pub fn new(
   setup: Option(Setup),
-  client: slackline.Client,
+  workspace: Workspace,
   approvers: People,
   later: fn(String, Event, Int) -> Nil,
 ) -> Tailnets {
   Tailnets(
     setup:,
-    client:,
+    workspace:,
     approvers:,
     later:,
     links: dict.new(),
@@ -175,11 +174,13 @@ pub fn ask(
     _, True, _ -> #(t, Error("the sandbox is already on the tailnet"))
     _, _, True -> #(t, Error("a request is already waiting for an answer"))
     Some(setup), False, False -> {
-      let client = t.client
       let blocks =
         tailnet_card.ask_blocks(by, reason, key, setup.api.tag, thread.home)
-      let place = thread.conversation
-      process.spawn_unlinked(fn() { tailnet_card.post(client, place, blocks) })
+      workspace.post_later(
+        t.workspace,
+        thread.conversation,
+        Message(tailnet_card.title, blocks),
+      )
       #(
         Tailnets(..t, asking: dict.insert(t.asking, key, sys.system_ms())),
         Ok(
@@ -191,9 +192,12 @@ pub fn ask(
 }
 
 fn show(t: Tailnets, card: Card, blocks: List(block.Block)) -> Nil {
-  let client = t.client
-  process.spawn_unlinked(fn() { tailnet_card.update(client, card, blocks) })
-  Nil
+  workspace.update_later(
+    t.workspace,
+    card.channel,
+    card.ts,
+    Message(tailnet_card.title, blocks),
+  )
 }
 
 fn pressed(
@@ -208,18 +212,12 @@ fn pressed(
   let approves = people.allows(t.approvers, user, fn(_) { False })
   case approves, thread, choice {
     False, _, _ -> {
-      let client = t.client
-      process.spawn_unlinked(fn() {
-        let _ =
-          chat.post_ephemeral(
-            channel: card.channel,
-            user:,
-            text: "You can't change this sandbox's tailnet access.",
-          )
-          |> post_ephemeral.thread_ts(card.thread_ts)
-          |> httpc.send(client)
-        Nil
-      })
+      workspace.whisper_later(
+        t.workspace,
+        conversation.from_slack(card.channel, card.thread_ts),
+        user,
+        Message("You can't change this sandbox's tailnet access.", []),
+      )
       keep(t)
     }
     True, None, _ -> {
@@ -406,7 +404,10 @@ pub fn read_button(
   action_id: String,
   value: String,
 ) -> Result(#(Choice, String, String), Nil) {
-  use #(channel, thread_ts) <- result.try(string.split_once(value, "|"))
+  use #(channel, thread_ts) <- result.try(case action_ref.decode(value) {
+    Ok(ThreadRef(channel:, thread_ts:)) -> Ok(#(channel, thread_ts))
+    _ -> Error(Nil)
+  })
   use choice <- result.map(case action_id {
     "tailnet_allow_" <> hours ->
       case int.parse(hours) {
@@ -422,6 +423,33 @@ pub fn read_button(
     _ -> Error(Nil)
   })
   #(choice, channel, thread_ts)
+}
+
+/// A press on a card's buttons in workspace `team`: the thread's key, and
+/// the event for it.
+pub fn decode(
+  action: interaction.BlockAction,
+  payload: interaction.BlockActionsPayload,
+  team: String,
+) -> Result(#(String, Event), Nil) {
+  use #(action_id, value) <- result.try(case action {
+    interaction.ButtonAction(action_id:, value: Some(value), ..) ->
+      Ok(#(action_id, value))
+    _ -> Error(Nil)
+  })
+  use #(choice, channel, thread_ts) <- result.try(read_button(action_id, value))
+  use card <- result.map(card_of(payload))
+  let key = thread_key.new(team, channel, thread_ts) |> thread_key.to_string
+  #(key, Pressed(choice:, channel:, thread_ts:, user: payload.user.id, card:))
+}
+
+/// The message a press in `payload` came from, as a card.
+pub fn card_of(payload: interaction.BlockActionsPayload) -> Result(Card, Nil) {
+  case payload.container {
+    Some(interaction.MessageContainer(message_ts:, channel_id:, thread_ts:, ..)) ->
+      card(channel_id, message_ts, thread_ts)
+    _ -> Error(Nil)
+  }
 }
 
 /// The card a press came from, when it came from a message.

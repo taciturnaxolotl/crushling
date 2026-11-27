@@ -62,6 +62,28 @@ pub const mounted_crush = "/opt/crushling/crush"
 
 pub const label = "crushling-sandbox"
 
+/// Names the bridge a container belongs to, by `root_id`. Not part of the
+/// fingerprint, so adding it recreated nothing.
+pub const root_label = "crushling-sandbox-root"
+
+/// This bridge's id among others on the same engine: a hash of its root.
+pub fn root_id(policy: Policy) -> String {
+  sys.sha256_hex(policy.root) |> string.slice(0, 16)
+}
+
+/// Whether a listed sandbox container is this bridge's: by its root label,
+/// else (made before the label) by a mount under this bridge's root.
+pub fn owned(
+  policy: Policy,
+  labels: dict.Dict(String, String),
+  mounts: List(String),
+) -> Bool {
+  case dict.get(labels, root_label) {
+    Ok(id) -> id == root_id(policy)
+    Error(Nil) -> list.any(mounts, string.starts_with(_, policy.root <> "/"))
+  }
+}
+
 pub const workspace = spec.workspace
 
 /// The engine's socket when nothing says otherwise.
@@ -186,6 +208,7 @@ pub fn create_body(policy: Policy, spec: Spec) -> Result(Json, Error) {
       json.object([
         #(label, json.string("1")),
         #(label <> "-policy", json.string(fingerprint(policy))),
+        #(root_label, json.string(root_id(policy))),
       ]),
     ),
     #(
@@ -295,6 +318,16 @@ fn call(
   path: String,
   body: Option(Json),
 ) -> Result(#(Int, BitArray), Error) {
+  call_within(policy, method, path, body, timeout_ms)
+}
+
+fn call_within(
+  policy: Policy,
+  method: http.Method,
+  path: String,
+  body: Option(Json),
+  timeout_ms: Int,
+) -> Result(#(Int, BitArray), Error) {
   use conn <- result.try(
     gun.connect_unix(policy.socket, 5000) |> result.map_error(Unreachable),
   )
@@ -349,16 +382,124 @@ pub fn observe(policy: Policy, key: String) -> Result(Observed, Error) {
   }
 }
 
+/// What is left of a thread's container after its crush went quiet.
+pub type Remains {
+  Gone
+  Running
+  /// Stopped with exit `code`; `oom` when the engine killed it for memory.
+  Stopped(oom: Bool, code: Int)
+}
+
+/// Parse the `State` of `GET /containers/<name>/json`.
+pub fn parse_remains(body: String) -> Result(Remains, Nil) {
+  let decoder = {
+    use running <- decode.subfield(["State", "Running"], decode.bool)
+    use oom <- decode.then(decode.optionally_at(
+      ["State", "OOMKilled"],
+      False,
+      decode.bool,
+    ))
+    use code <- decode.then(decode.optionally_at(
+      ["State", "ExitCode"],
+      0,
+      decode.int,
+    ))
+    decode.success(case running {
+      True -> Running
+      False -> Stopped(oom:, code:)
+    })
+  }
+  json.parse(body, decoder) |> result.replace_error(Nil)
+}
+
+/// What is left of thread `key`'s container.
+pub fn remains(policy: Policy, key: String) -> Result(Remains, Error) {
+  use reply <- result.try(
+    call(policy, http.Get, container(key) <> "/json", None)
+    |> expect([200, 404]),
+  )
+  case reply.status {
+    404 -> Ok(Gone)
+    _ ->
+      parse_remains(reply.body)
+      |> result.replace_error(Engine(200, "no State in the inspect answer"))
+  }
+}
+
 fn create(policy: Policy, spec: Spec) -> Result(Nil, Error) {
   use body <- result.try(create_body(policy, spec))
-  call(
-    policy,
-    http.Post,
-    "/containers/create?name=" <> container_name(spec.key),
-    Some(body),
+  let attempt = fn() {
+    call(
+      policy,
+      http.Post,
+      "/containers/create?name=" <> container_name(spec.key),
+      Some(body),
+    )
+    |> expect([201])
+    |> result.replace(Nil)
+  }
+  case attempt() {
+    // The CLI pulled a missing image itself; the Engine API leaves it to us.
+    Error(Engine(404, message)) ->
+      case string.contains(message, "No such image") {
+        True -> {
+          use _ <- result.try(pull(policy))
+          attempt()
+        }
+        False -> Error(Engine(404, message))
+      }
+    other -> other
+  }
+}
+
+const pull_timeout_ms = 600_000
+
+/// Pull the policy's image. The engine streams progress and reports a
+/// failure partway through as an `error` in that stream, still with 200.
+fn pull(policy: Policy) -> Result(Nil, Error) {
+  let #(repository, tag) = image_ref(policy.image)
+  sys.info("crushling: pulling " <> policy.image)
+  use reply <- result.try(
+    call_within(
+      policy,
+      http.Post,
+      "/images/create?fromImage="
+        <> uri.percent_encode(repository)
+        <> "&tag="
+        <> uri.percent_encode(tag),
+      None,
+      pull_timeout_ms,
+    )
+    |> expect([200]),
   )
-  |> expect([201])
-  |> result.replace(Nil)
+  let failed =
+    string.split(reply.body, "\n")
+    |> list.find_map(fn(line) {
+      json.parse(line, decode.at(["error"], decode.string))
+    })
+  case failed {
+    Ok(message) ->
+      Error(Engine(200, "pulling " <> policy.image <> ": " <> message))
+    Error(Nil) -> Ok(Nil)
+  }
+}
+
+/// An image reference as its repository and tag, `latest` when it has
+/// none. A registry's port is not a tag.
+pub fn image_ref(image: String) -> #(String, String) {
+  case string.split_once(image, "@") {
+    // Pinned by digest, which the engine takes as the tag.
+    Ok(#(name, digest)) -> #(name, digest)
+    Error(Nil) ->
+      case string.split(image, ":") |> list.reverse {
+        [tag, _, ..] as parts ->
+          case string.contains(tag, "/") {
+            True -> #(image, "latest")
+            False -> #(string.join(list.reverse(list.drop(parts, 1)), ":"), tag)
+          }
+        _ -> #(image, "latest")
+      }
+  }
 }
 
 fn start(policy: Policy, key: String) -> Result(Nil, Error) {
@@ -478,9 +619,16 @@ pub fn demux(stream: BitArray, acc: BitArray) -> BitArray {
   }
 }
 
-/// A container in a list, by name, with its image and whether it runs.
+/// A container in a list, by name, with its image, whether it runs, and
+/// what says whose it is.
 type Listed {
-  Listed(name: String, image: String, running: Bool)
+  Listed(
+    name: String,
+    image: String,
+    running: Bool,
+    labels: dict.Dict(String, String),
+    mounts: List(String),
+  )
 }
 
 fn filters(pairs: List(#(String, List(String)))) -> String {
@@ -508,26 +656,52 @@ fn list_containers(
     use names <- decode.field("Names", decode.list(decode.string))
     use image <- decode.field("Image", decode.string)
     use state <- decode.optional_field("State", "", decode.string)
+    use labels <- decode.optional_field(
+      "Labels",
+      dict.new(),
+      decode.optional(decode.dict(decode.string, decode.string))
+        |> decode.map(option.unwrap(_, dict.new())),
+    )
+    use mounts <- decode.optional_field(
+      "Mounts",
+      [],
+      decode.optional(
+        decode.list({
+          use source <- decode.optional_field("Source", "", decode.string)
+          decode.success(source)
+        }),
+      )
+        |> decode.map(option.unwrap(_, [])),
+    )
     let name = case names {
       ["/" <> name, ..] | [name, ..] -> name
       [] -> ""
     }
-    decode.success(Listed(name, image, state == "running"))
+    decode.success(Listed(name, image, state == "running", labels, mounts))
   }
   json.parse(reply.body, decode.list(item))
   |> result.replace_error(Engine(200, "unreadable container list"))
 }
 
-/// The keys of every sandbox container still running.
+/// The keys of every sandbox container of this bridge still running.
 pub fn running(policy: Policy) -> Result(List(String), Error) {
-  use listed <- result.map(
-    list_containers(policy, [#("label", [label <> "=1"])]),
-  )
+  use listed <- result.map(ours(policy, [#("label", [label <> "=1"])]))
   list.filter_map(listed, fn(container) {
     case container.running, container.name {
       True, "crushling-" <> key -> Ok(key)
       _, _ -> Error(Nil)
     }
+  })
+}
+
+/// The sandbox containers listed by `by` that are this bridge's.
+fn ours(
+  policy: Policy,
+  by: List(#(String, List(String))),
+) -> Result(List(Listed), Error) {
+  use listed <- result.map(list_containers(policy, by))
+  list.filter(listed, fn(container) {
+    owned(policy, container.labels, container.mounts)
   })
 }
 
@@ -540,7 +714,7 @@ pub fn running(policy: Policy) -> Result(List(String), Error) {
 /// removed.
 pub fn prune_images(policy: Policy) -> Result(List(String), Error) {
   use stopped <- result.try(
-    list_containers(policy, [
+    ours(policy, [
       #("label", [label <> "=1"]),
       #("status", ["exited"]),
     ]),

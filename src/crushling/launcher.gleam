@@ -12,6 +12,7 @@
 //// that, and is the only caller in the bridge.
 
 import crushling/agent/backend.{type Backend}
+import crushling/agent/post_mortem.{type PostMortem}
 import crushling/agent/spec
 import crushling/key as thread_key
 import crushling/proxy
@@ -30,6 +31,8 @@ pub type Launched {
     socket: String,
     /// The workspace path as that server sees it.
     root: String,
+    /// Why the agent went quiet, should it.
+    post_mortem: fn() -> PostMortem,
   )
 }
 
@@ -123,7 +126,12 @@ fn launch(
     await_hello(wiring, backend, key, wiring.hello_timeout_ms)
   }
   case started {
-    Ok(Nil) -> Ok(Launched(socket: shim, root: spec.workdir))
+    Ok(Nil) ->
+      Ok(
+        Launched(socket: shim, root: spec.workdir, post_mortem: fn() {
+          backend.post_mortem(key)
+        }),
+      )
     Error(reason) -> Error(undone(key, reason, cleanup(wiring, backend, key)))
   }
 }

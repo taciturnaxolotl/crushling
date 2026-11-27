@@ -4,6 +4,7 @@
 //// backend runs a stand-in crush.
 
 import crushling/agent/backend
+import crushling/agent/post_mortem
 import crushling/agent/spec
 import crushling/gun
 import crushling/launcher
@@ -194,6 +195,7 @@ fn recording(
     exec: None,
     exists: fn(key) { file_exists(b.root <> "/" <> key <> "/work") },
     running: fn() { Ok([]) },
+    post_mortem: fn(_) { post_mortem.Unknown("test") },
   )
 }
 

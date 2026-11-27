@@ -38,3 +38,14 @@ crushling reads its settings from the environment, else from `./.env`, once at s
 | `CRUSHLING_PROXY_UPSTREAM` | where the proxy sends requests; else `HYPER_URL`, else `https://hyper.charm.land` |
 | `CRUSHLING_PROXY_THREAD_CAP_USD`, `CRUSHLING_PROXY_THREAD_CAP_TOKENS` | what one thread may spend through the proxy, in US dollars and/or tokens; unset is unlimited |
 | `CRUSHLING_PROXY_INSTANCE_CAP_USD`, `CRUSHLING_PROXY_INSTANCE_CAP_TOKENS` | the same for each workspace's threads together, over the last 30 days; one workspace at its cap leaves the others alone. The thread cap counts everything the thread ever spent. Both count what the store kept, so they survive restarts |
+
+## Upgrading from before the store-backed caps
+
+The cap settings kept their names but count differently now:
+
+- `CRUSHLING_PROXY_THREAD_CAP_*` used to count spend since the bridge last started. It now counts everything the thread ever spent, so a long-lived thread already past the cap is refused on its first request after the upgrade.
+- `CRUSHLING_PROXY_INSTANCE_CAP_*` used to be one total for the whole bridge since it started. It is now per workspace, over the last 30 days.
+
+Raise the caps before upgrading if old threads should keep working.
+
+Empty settings (`NAME=`) count as unset for the GitHub settings, as they did before.

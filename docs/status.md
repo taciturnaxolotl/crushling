@@ -82,7 +82,7 @@ only its final answer.
 ### Slack tools
 
 Each agent gets a `slack` MCP server from the bridge (`crushling/mcp`,
-`crushling/slack_tools`): `read_conversation`, `read_channel`,
+`crushling/tools`): `read_conversation`, `read_channel`,
 `list_channels`, `user_info`, `post_message`, and
 `open_code_channel`, which lets the agent move its work to a code channel
 itself, with a task name for the title. Reading reaches any channel the bot
@@ -266,7 +266,7 @@ serves four things, each with its own per-thread token:
   the thread's token for the org's Hyper key, meters usage and enforces the
   caps.
 - `/mcp/<thread>`: the Slack tools.
-- `/files/<thread>`: Slack attachments and shared files (`crushling/files`,
+- `/files/<thread>`: Slack attachments and shared files (`crushling/files/route`,
   see Files below), with the Slack tools' token.
 
 For `local` the URL defaults to `http://127.0.0.1:<port>`. For `docker` it
@@ -303,7 +303,7 @@ at every poll.
 ### Files
 
 The bridge and a sandbox share no filesystem, so files cross over HTTP on
-the same port (`crushling/files`). Every Slack attachment is kept on the
+the same port (`crushling/files`, `crushling/files/route`, `crushling/attachments`). Every Slack attachment is kept on the
 bridge at `$CRUSHLING_ROOT/<thread>/files/<file_id>-<name>`. Downloads from
 Slack are capped at 64 MiB as they are read, whatever size Slack claims; a
 bigger file is named in the prompt as "too large to fetch" and not kept.
@@ -470,7 +470,7 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 | `crushling/thread/subagents` | Gives each subagent its own Slack thread with a plan card and notes, and posts its report back to the parent. |
 | `crushling/thread/repo` | Finds a repository in the workspace, lists its changes, and updates a code channel's context bar and Code tab. |
 | `crushling/venue` | Where a thread's work is. That is the thread, a code channel, an archived channel, or the thread after Slack refused a code channel. |
-| `crushling/sink` | The functions a thread uses to post in Slack. `crushling/slack` builds the real one. |
+| `crushling/sink` | The functions a thread uses to post in Slack. `crushling/slack/sink` builds the real one. |
 | `crushling/conversation` | Where in Slack something is said: a channel, and maybe a thread in it. |
 | `crushling/key` | A thread's key (workspace, channel and thread ts) and its string form, checked to be safe as a file, container and socket name. |
 | `crushling/usage` | What inference cost and the caps on it, shared by the proxy, the store and the App Home. |
@@ -485,13 +485,20 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 | `crushling/proxy` | The inference proxy: thread tokens in, the org's Hyper key out, usage metered and capped. |
 | `crushling/sandbox_http` | The one port agents reach the bridge on, with the tunnel, proxy and Slack tools routes. |
 | `crushling` | Entry point: reads the settings, opens the store, starts the proxy, the tunnels, an instance per workspace, the sandbox server, the events server and Socket Mode. |
-| `crushling/socket` | Socket Mode on stratus, reconnecting on request or drop; routes events by workspace and turns them into `Incoming`. |
+| `crushling/slack/router` | Routes events and interactions (HTTP or Socket Mode) to the workspace they belong to; turns messages into `Incoming` and button presses into registry messages through each feature's `decode`. |
+| `crushling/slack/socket_mode` | Socket Mode on stratus, reconnecting on request or drop. |
 | `crushling/registry` | One workspace's threads: maps thread keys to actors. Handles the allowlist, duplicate events, commands, lazy launch and idle shutdown, writes all thread meta to the store. |
 | `crushling/tailscale` | The Tailscale API (auth keys) and the scripts that join and leave the tailnet inside a sandbox. |
 | `crushling/registry/tailnet` | Tailnet access for each thread: one rule (on the tailnet while the agent runs and access lasts), the Slack card and its buttons. |
 | `crushling/registry/entry`, `incoming`, `prompt` | A thread's entry in the registry, an incoming Slack message, and the prompt built from it. |
 | `crushling/registry/links` | Links code channels to their threads, in memory and in the store. |
-| `crushling/slack` | The `Sink` over chat.postMessage/update and slackline's `stream` for run replies, with markdown and plan blocks and file uploads; prompt text cleanup. |
+| `crushling/slack/workspace` | One workspace's Slack handle (team, bot user, client, token) and every Slack call the bridge makes, with an outbox that sends fire-and-forget posts in order, retried and logged. |
+| `crushling/slack/sink` | The `Sink` over the workspace and slackline's `stream` for run replies, with markdown and plan blocks and file uploads. |
+| `crushling/slack/text`, `slack/blocks`, `slack/action_ref` | Slack text into prompts and catch-ups; shared Block Kit pieces; versioned refs carried in button values and block ids. |
+| `crushling/slack/model_card`, `crush/catalog` | The `!model` card and its presses; the model catalog and choices as crush reports them. |
+| `crushling/attachments`, `files`, `files/route`, `mime` | Fetching and keeping Slack attachments and placing them in prompts; the thread's files on disk; the sandbox `/files` route; the one MIME table. |
+| `crushling/tools` | The Slack tools agents get over MCP, as one list of tools. |
+| `crushling/github/nudge` | The asks in threads to connect GitHub or add the App, and their buttons. |
 | `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). Either way crush dials the tunnel and uses the proxy. |
 | `crushling/sandbox` | The Docker Engine API: the create body, a policy fingerprint label, adopt/start/recreate, stop (warm), remove (cold), exec and image pruning. |
 | `crushling/agents` | The one owner of every agent's lifecycle: per key `Absent`, `Starting`, `Live`, `Stopping` or `Forgetting`, one operation at a time. |

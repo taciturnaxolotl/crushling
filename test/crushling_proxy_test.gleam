@@ -1148,3 +1148,10 @@ fn real_crush_run(key: String) -> Nil {
   let assert True = totals.input_tokens > 0
   Nil
 }
+
+/// At shutdown a meter that is down or restarting is an error to log, not
+/// a crash that skips the exit.
+pub fn flushing_a_meter_that_is_down_is_an_error_test() {
+  let assert Ok(p) = proxy.new(config("http://127.0.0.1:1"))
+  let assert Error(_) = proxy.flush(p)
+}

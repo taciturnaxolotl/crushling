@@ -67,7 +67,9 @@ pub const archive_note =
 pub fn run(state: State(msg)) -> State(msg) {
   let config = state.config
   let now = sys.system_ms() / 1000
-  case threads.quiet_threads(config.store, config.team, now - archive_after_s) {
+  case
+    threads.quiet_threads(config.store, core.team(state), now - archive_after_s)
+  {
     Error(reason) -> {
       sys.warn("crushling: sweeping quiet threads: " <> reason)
       state

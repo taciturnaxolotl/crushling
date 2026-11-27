@@ -1,4 +1,5 @@
 import crushling/agents
+import crushling/attachments
 import crushling/commands
 import crushling/crush/client
 import crushling/events
@@ -13,8 +14,9 @@ import crushling/registry/legacy
 import crushling/registry/shutdown
 import crushling/registry/tailnet
 import crushling/registry/tailnet/card as tailnet_card
-import crushling/slack
-import crushling/socket
+import crushling/slack/router
+import crushling/slack/text as slack_text
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/schema
 import crushling/store/threads
@@ -32,6 +34,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/set
 import gleam/string
+import slack_fixture
 import slackline
 import slackline/app
 import slackline/event
@@ -39,17 +42,17 @@ import slackline/verify
 
 pub fn prompt_text_test() {
   let assert "fix the build" =
-    slack.prompt_text("<@UBOT> fix the build", "UBOT")
+    slack_text.prompt_text("<@UBOT> fix the build", "UBOT")
   let assert "see https://x.dev/a?b=1&c=2 and <@U2>" =
-    slack.prompt_text(
+    slack_text.prompt_text(
       "<@UBOT> see <https://x.dev/a?b=1&amp;c=2|x.dev> and <@U2>",
       "UBOT",
     )
   let assert "if a < b && c > d" =
-    slack.prompt_text("if a &lt; b &amp;&amp; c &gt; d", "UBOT")
+    slack_text.prompt_text("if a &lt; b &amp;&amp; c &gt; d", "UBOT")
   let assert "mail mailto:a@b.c in <#C1|general>" =
-    slack.prompt_text("mail <mailto:a@b.c|a@b.c> in <#C1|general>", "UBOT")
-  let assert "" = slack.prompt_text("  <@UBOT>  ", "UBOT")
+    slack_text.prompt_text("mail <mailto:a@b.c|a@b.c> in <#C1|general>", "UBOT")
+  let assert "" = slack_text.prompt_text("  <@UBOT>  ", "UBOT")
 }
 
 pub fn command_test() {
@@ -74,14 +77,14 @@ pub fn mention_starts_a_thread_test() {
       "{\"type\":\"app_mention\",\"user\":\"U1\",\"text\":\"<@UBOT> hi\",\"ts\":\"10.1\",\"channel\":\"C1\",\"event_ts\":\"10.1\"}",
     )
   let assert Ok(msg.Incoming("C1", "10.1", "10.1", "U1", "<@UBOT> hi", True, [])) =
-    socket.incoming(mention, "UBOT")
+    router.incoming(mention, "UBOT")
 
   let in_thread =
     decode_event(
       "{\"type\":\"app_mention\",\"user\":\"U1\",\"text\":\"<@UBOT> hi\",\"ts\":\"11.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\"}",
     )
   let assert Ok(msg.Incoming(thread_ts: "10.1", ts: "11.1", ..)) =
-    socket.incoming(in_thread, "UBOT")
+    router.incoming(in_thread, "UBOT")
 }
 
 pub fn thread_replies_route_test() {
@@ -90,14 +93,14 @@ pub fn thread_replies_route_test() {
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"more\",\"ts\":\"12.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
     )
   let assert Ok(msg.Incoming("C1", "10.1", "12.1", "U1", "more", False, [])) =
-    socket.incoming(reply, "UBOT")
+    router.incoming(reply, "UBOT")
 
   // The app_mention for the same message is the one that counts.
   let mentioning =
     decode_event(
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"<@UBOT> more\",\"ts\":\"12.2\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
     )
-  let assert Error(Nil) = socket.incoming(mentioning, "UBOT")
+  let assert Error(Nil) = router.incoming(mentioning, "UBOT")
 
   let top_level =
     decode_event(
@@ -106,13 +109,13 @@ pub fn thread_replies_route_test() {
   // Routed in case it is in a code channel; the registry drops it
   // anywhere else.
   let assert Ok(msg.Incoming(thread_ts: "13.1", ts: "13.1", mention: False, ..)) =
-    socket.incoming(top_level, "UBOT")
+    router.incoming(top_level, "UBOT")
 
   let from_bot =
     decode_event(
       "{\"type\":\"message\",\"user\":\"U9\",\"bot_id\":\"B1\",\"text\":\"echo\",\"ts\":\"14.1\",\"thread_ts\":\"10.1\",\"channel\":\"C1\",\"channel_type\":\"channel\"}",
     )
-  let assert Error(Nil) = socket.incoming(from_bot, "UBOT")
+  let assert Error(Nil) = router.incoming(from_bot, "UBOT")
 }
 
 pub fn direct_messages_start_threads_test() {
@@ -121,7 +124,7 @@ pub fn direct_messages_start_threads_test() {
       "{\"type\":\"message\",\"user\":\"U1\",\"text\":\"hi\",\"ts\":\"20.1\",\"channel\":\"D1\",\"channel_type\":\"im\"}",
     )
   let assert Ok(msg.Incoming("D1", "20.1", "20.1", "U1", "hi", True, [])) =
-    socket.incoming(dm, "UBOT")
+    router.incoming(dm, "UBOT")
 }
 
 type Launch {
@@ -214,10 +217,12 @@ fn start_registry_as(
   let assert Ok(r) =
     registry.start(registry_config.Config(
       launcher: fake,
-      client:,
-      token: "xoxb-test",
-      bot_user: "UBOT",
-      team: "T1",
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       allowed: people.only(["U1"]),
       admins: set.new(),
       store:,
@@ -298,10 +303,7 @@ pub fn shutdown_with_nothing_running_stops_at_once_test() {
 pub fn native_stop_reaches_the_registry_test() {
   let registry = process.new_subject()
   let router =
-    socket.router(
-      app.unverified(),
-      socket.only(socket.Target("T1", "UBOT", registry)),
-    )
+    router.router(app.unverified(), slack_fixture.only("T1", "UBOT", registry))
   let frame =
     "{\"envelope_id\":\"e2\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev1\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"C1\",\"user\":\"U1\",\"thread_ts\":\"10.1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
   let assert app.Send(after:, ..) = app.handle_socket(router, frame)
@@ -386,10 +388,7 @@ pub fn code_channel_messages_reach_their_thread_test() {
 pub fn native_stop_in_a_code_channel_test() {
   let registry = process.new_subject()
   let router =
-    socket.router(
-      app.unverified(),
-      socket.only(socket.Target("T1", "UBOT", registry)),
-    )
+    router.router(app.unverified(), slack_fixture.only("T1", "UBOT", registry))
   let frame =
     "{\"envelope_id\":\"e3\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"T1\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev2\",\"event_time\":1,\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"CCODE\",\"user\":\"U1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
   let assert app.Send(after:, ..) = app.handle_socket(router, frame)
@@ -494,16 +493,16 @@ pub fn shared_files_route_like_messages_test() {
     thread_ts: "10.1",
     ts: "15.1",
     mention: False,
-    files: [slack.Attachment(name: "image.png", ..)],
+    files: [attachments.Attachment(name: "image.png", ..)],
     ..,
-  )) = socket.incoming(in_thread, "UBOT")
+  )) = router.incoming(in_thread, "UBOT")
   // At the top of a channel, as in a code channel.
   let top =
     decode_event(
       "{\"type\":\"message\",\"subtype\":\"file_share\",\"user\":\"U1\",\"text\":\"\",\"ts\":\"16.1\",\"channel\":\"CCODE\",\"channel_type\":\"channel\",\"files\":[]}",
     )
   let assert Ok(msg.Incoming(thread_ts: "16.1", mention: False, ..)) =
-    socket.incoming(top, "UBOT")
+    router.incoming(top, "UBOT")
 }
 
 pub fn done_archives_the_code_channel_test() {
@@ -691,7 +690,7 @@ pub fn events_arrive_over_http_test() {
   let secret = "test-signing-secret"
   let port = 18_000 + int.absolute_value(unique()) % 2000
   let router =
-    socket.router(app.new(secret), socket.only(socket.Target("T1", "UBOT", r)))
+    router.router(app.new(secret), slack_fixture.only("T1", "UBOT", r))
   let assert Ok(Nil) = events.start("127.0.0.1", port, Some(router), None)
   let post = fn(body, signature) {
     let now = verify.now_seconds()
@@ -912,10 +911,7 @@ pub fn events_route_to_the_installation_they_were_delivered_to_test() {
     "{\"envelope_id\":\"e9\",\"type\":\"events_api\",\"accepts_response_payload\":false,\"retry_attempt\":0,\"retry_reason\":\"\",\"payload\":{\"token\":\"t\",\"team_id\":\"TOTHER\",\"api_app_id\":\"A1\",\"type\":\"event_callback\",\"event_id\":\"Ev9\",\"event_time\":1,\"authorizations\":[{\"team_id\":\"T1\",\"user_id\":\"UBOT\",\"is_bot\":true,\"is_enterprise_install\":false}],\"event\":{\"type\":\"agent_session_stopped\",\"channel\":\"C1\",\"user\":\"U1\",\"thread_ts\":\"10.1\",\"streaming_message_ts\":[],\"event_ts\":\"12.0\"}}}"
   let registry = process.new_subject()
   let router =
-    socket.router(
-      app.unverified(),
-      socket.only(socket.Target("T1", "UBOT", registry)),
-    )
+    router.router(app.unverified(), slack_fixture.only("T1", "UBOT", registry))
   let assert app.Send(after:, ..) = app.handle_socket(router, frame)
   after()
   let assert Ok(registry.StopRequested("C1", "10.1", "U1")) =

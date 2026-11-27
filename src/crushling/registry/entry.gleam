@@ -5,7 +5,7 @@ import crushling/meta.{type Meta, Meta}
 import crushling/registry/idle.{type Idle}
 import crushling/registry/incoming.{type Incoming}
 import crushling/registry/tailnet
-import crushling/slack
+import crushling/slack/text
 import crushling/thread
 import crushling/venue
 import gleam/erlang/process.{type Subject}
@@ -76,7 +76,7 @@ pub fn new(channel: String, thread_ts: String, meta: Meta) -> Entry {
 pub fn already_read(known: Option(Entry), ts: String) -> Bool {
   case known {
     Some(Entry(meta: Meta(cursor:, ..), ..)) if cursor != "" ->
-      slack.ts_value(ts) <=. slack.ts_value(cursor)
+      text.ts_value(ts) <=. text.ts_value(cursor)
     _ -> False
   }
 }

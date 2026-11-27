@@ -2,6 +2,7 @@
 //// state each key is in meanwhile. A launcher whose calls block until the
 //// test lets them go shows what overlaps and what waits.
 
+import crushling/agent/post_mortem
 import crushling/agents
 import crushling/launcher
 import gleam/erlang/process.{type Subject}
@@ -23,7 +24,14 @@ fn blocking(calls: Subject(Call)) -> launcher.Launcher {
   launcher.Launcher(
     launch: fn(key) {
       case ask("launch", key) {
-        Ok(Nil) -> Ok(launcher.Launched(socket: "/tmp/none.sock", root: "/w"))
+        Ok(Nil) ->
+          Ok(
+            launcher.Launched(
+              socket: "/tmp/none.sock",
+              root: "/w",
+              post_mortem: fn() { post_mortem.Unknown("test") },
+            ),
+          )
         Error(reason) -> Error(reason)
       }
     },
@@ -211,4 +219,52 @@ pub fn strays_are_stopped_at_start_test() {
   let owner = agents.named(blocking(calls), name)
   let _ = agents.status(owner, "T1-C9-1.0")
   let assert agents.Absent = agents.status(owner, "T1-C9-1.0")
+}
+
+/// A launch that panics (a timed-out call, say) fails only itself: the
+/// owner lives on, stops what may be partway up, and runs the next op.
+pub fn a_crashed_launch_fails_only_itself_test() {
+  let calls = process.new_subject()
+  let results = process.new_subject()
+  let inner = blocking(calls)
+  let fake =
+    launcher.Launcher(..inner, launch: fn(key) {
+      case key {
+        "T1-C1-1.0" -> panic as "proxy.allow timed out"
+        _ -> inner.launch(key)
+      }
+    })
+  let assert Ok(owner) = agents.start(fake)
+  agents.launch(owner, "T1-C1-1.0", attach_ok, noted(results, "launch"))
+  agents.forget(owner, "T1-C1-1.0", noted(results, "forget"))
+  let assert Ok(#("launch", Error("crashed: " <> _))) =
+    process.receive(results, 1000)
+  let assert Call("stop", "T1-C1-1.0", go) = next(calls)
+  process.send(go, Ok(Nil))
+  let assert Call("forget", "T1-C1-1.0", go) = next(calls)
+  process.send(go, Ok(Nil))
+  let assert Ok(#("forget", Ok(Nil))) = process.receive(results, 1000)
+  let assert agents.Absent = agents.status(owner, "T1-C1-1.0")
+  // Other keys still launch.
+  agents.launch(owner, "T1-C2-1.0", attach_ok, noted(results, "other"))
+  let assert Call("launch", "T1-C2-1.0", go) = next(calls)
+  process.send(go, Ok(Nil))
+  let assert Ok(#("other", Ok(Nil))) = process.receive(results, 1000)
+}
+
+/// A stop that panics leaves the agent live, for a retry.
+pub fn a_crashed_stop_leaves_it_live_test() {
+  let calls = process.new_subject()
+  let results = process.new_subject()
+  let inner = blocking(calls)
+  let fake = launcher.Launcher(..inner, stop: fn(_) { panic as "docker hung" })
+  let assert Ok(owner) = agents.start(fake)
+  agents.launch(owner, "T1-C1-1.0", attach_ok, noted(results, "launch"))
+  let assert Call("launch", _, go) = next(calls)
+  process.send(go, Ok(Nil))
+  let assert Ok(#("launch", Ok(Nil))) = process.receive(results, 1000)
+  agents.stop(owner, "T1-C1-1.0", noted(results, "stop"))
+  let assert Ok(#("stop", Error("crashed: " <> _))) =
+    process.receive(results, 1000)
+  let assert agents.Live(..) = agents.status(owner, "T1-C1-1.0")
 }

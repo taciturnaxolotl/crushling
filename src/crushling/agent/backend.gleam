@@ -6,12 +6,14 @@
 //// `crush server` straight on this machine, for development only: the
 //// agent is in YOLO mode with your user's access.
 
+import crushling/agent/post_mortem.{type PostMortem}
 import crushling/agent/spec.{type Spec}
 import crushling/sandbox
 import crushling/sys
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 
 pub type Backend {
   Backend(
@@ -38,6 +40,8 @@ pub type Backend {
     /// The keys of agents still running, such as ones a previous bridge
     /// left behind.
     running: fn() -> Result(List(String), String),
+    /// Why the thread's crush went quiet, asked before it is stopped.
+    post_mortem: fn(String) -> PostMortem,
   )
 }
 
@@ -58,7 +62,29 @@ pub fn docker(policy: sandbox.Policy) -> Backend {
     }),
     exists: fn(key) { file_exists(sandbox.host_workspace(policy, key)) },
     running: fn() { sandbox.running(policy) |> described },
+    post_mortem: fn(key) { docker_post_mortem(policy, key) },
   )
+}
+
+fn docker_post_mortem(policy: sandbox.Policy, key: String) -> PostMortem {
+  // crush logs to its cache inside the workspace, in a directory named
+  // after the tunnel it dials; docker's own log of it is empty.
+  let cache = sandbox.host_workspace(policy, key) <> "/.home/.cache/crush"
+  let words = fn() {
+    sys.list_dir(cache)
+    |> result.unwrap([])
+    |> list.find(string.starts_with(_, "server-"))
+    |> result.try(fn(dir) { sys.read_file(cache <> "/" <> dir <> "/crush.log") })
+    |> result.map(post_mortem.last_words)
+    |> result.unwrap("")
+  }
+  case sandbox.remains(policy, key) {
+    Ok(sandbox.Running) -> post_mortem.StillRunning(words())
+    Ok(sandbox.Gone) -> post_mortem.Vanished
+    Ok(sandbox.Stopped(oom: True, ..)) -> post_mortem.OutOfMemory(policy.memory)
+    Ok(sandbox.Stopped(code:, ..)) -> post_mortem.Exited(Some(code), words())
+    Error(error) -> post_mortem.Unknown(sandbox.describe(error))
+  }
 }
 
 fn described(result: Result(a, sandbox.Error)) -> Result(a, String) {
@@ -137,5 +163,19 @@ pub fn local(root: String, crush: String) -> Backend {
     // Each launch stops the server its key left behind, so there is
     // nothing to sweep at boot.
     running: fn() { Ok([]) },
+    post_mortem: fn(key) {
+      let words =
+        sys.read_file(dir(key) <> "/server.log")
+        |> result.map(post_mortem.last_words)
+        |> result.unwrap("")
+      case recorded_pid(pid_file(key)) {
+        Ok(os_pid) ->
+          case os_alive(os_pid) {
+            True -> post_mortem.StillRunning(words)
+            False -> post_mortem.Exited(None, words)
+          }
+        Error(Nil) -> post_mortem.Exited(None, words)
+      }
+    },
   )
 }

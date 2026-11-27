@@ -3,6 +3,7 @@
 //// a user sent meanwhile waits here and is handed back with the answer.
 
 import crushling/people.{type People}
+import crushling/slack/workspace.{type Workspace}
 import crushling/sys
 import gleam/dict.{type Dict}
 import gleam/erlang/process
@@ -10,13 +11,11 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/set.{type Set}
-import slackline
 
 pub opaque type Gate(msg) {
   Gate(
     allowed: People,
-    client: slackline.Client,
-    team: String,
+    workspace: Workspace,
     /// Sends an answer back to the registry after a delay in milliseconds.
     reply: fn(Answer, Int) -> Nil,
     members: people.Cache,
@@ -43,14 +42,12 @@ const timeout_ms = 15_000
 
 pub fn new(
   allowed: People,
-  client: slackline.Client,
-  team: String,
+  workspace: Workspace,
   reply: fn(Answer, Int) -> Nil,
 ) -> Gate(msg) {
   Gate(
     allowed:,
-    client:,
-    team:,
+    workspace:,
     reply:,
     members: people.new_cache(people.cache_ms),
     looking_up: dict.new(),
@@ -93,7 +90,9 @@ fn wait(gate: Gate(msg), user: String, message: msg) -> Gate(msg) {
       )
     Error(Nil) -> {
       let id = gate.lookups + 1
-      let Gate(client:, team:, reply:, ..) = gate
+      let Gate(workspace:, reply:, ..) = gate
+      let client = workspace.client(workspace)
+      let team = workspace.team(workspace)
       process.spawn_unlinked(fn() {
         reply(Answer(user, id, people.lookup(client, team, user)), 0)
       })
@@ -120,7 +119,7 @@ pub fn answered(gate: Gate(msg), answer: Answer) -> #(Gate(msg), List(msg)) {
             "crushling: couldn't tell whether "
             <> user
             <> " is a member of "
-            <> gate.team
+            <> workspace.team(gate.workspace)
             <> ", so ignoring them for now: "
             <> reason,
           )

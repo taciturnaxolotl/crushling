@@ -5,7 +5,7 @@
 ////   line naming the files it changed;
 //// - when it fails, a note saying whether what is above is partial.
 ////
-//// Everything here is pure; `crushling/slack` turns it into blocks.
+//// Everything here is pure; `crushling/slack/sink` turns it into blocks.
 
 import crushling/run.{type Run}
 import crushling/text

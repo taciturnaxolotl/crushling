@@ -3,19 +3,22 @@
 //// server` (test/fake_crush_ffi.erl), and the registry waking and putting
 //// to sleep a thread that only got `!model`.
 
+import crushling/agent/post_mortem
 import crushling/commands
 import crushling/conversation
+import crushling/crush/catalog
 import crushling/crush/client
 import crushling/key
 import crushling/launcher
 import crushling/meta.{DefaultReasoning, Effort, ModelChoice, Thinking}
-import crushling/models
 import crushling/people
 import crushling/registry
 import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
 import crushling/sink
-import crushling/socket
+import crushling/slack/action_ref
+import crushling/slack/model_card
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/schema
 import crushling/store/threads
@@ -44,13 +47,13 @@ const catalog_json =
    \"reasoning\":{\"thinking\":\"toggleable\"}},
   {\"id\":\"gamma\",\"name\":\"Gamma\",\"reasoning\":{\"thinking\":\"never\"}}]}]"
 
-fn catalog() -> List(models.Model) {
-  let assert Ok(catalog) = models.parse_catalog(catalog_json)
+fn catalog() -> List(catalog.Model) {
+  let assert Ok(catalog) = catalog.parse_catalog(catalog_json)
   catalog
 }
 
-fn model(id: String) -> models.Model {
-  let assert Ok(model) = models.find(catalog(), id)
+fn model(id: String) -> catalog.Model {
+  let assert Ok(model) = catalog.find(catalog(), id)
   model
 }
 
@@ -59,22 +62,22 @@ fn model(id: String) -> models.Model {
 pub fn catalog_reads_the_hyper_models_test() {
   let assert ["alpha", "beta", "gamma"] =
     list.map(catalog(), fn(model) { model.id })
-  let assert models.Model(
+  let assert catalog.Model(
     name: "Alpha",
-    kind: models.Levels([#("low", "Low"), #("high", "High")], "high"),
+    kind: catalog.Levels([#("low", "Low"), #("high", "High")], "high"),
     ..,
   ) = model("alpha")
-  let assert models.Toggle = model("beta").kind
-  let assert models.NoReasoning = model("gamma").kind
+  let assert catalog.Toggle = model("beta").kind
+  let assert catalog.NoReasoning = model("gamma").kind
   // Nothing to pick from is an error.
-  let assert Error(Nil) = models.parse_catalog("[{\"id\":\"openai\"}]")
+  let assert Error(Nil) = catalog.parse_catalog("[{\"id\":\"openai\"}]")
   let assert Error(Nil) =
-    models.parse_catalog("[{\"id\":\"hyper\",\"models\":[]}]")
+    catalog.parse_catalog("[{\"id\":\"hyper\",\"models\":[]}]")
 }
 
 pub fn a_default_level_outside_the_levels_falls_back_test() {
-  let assert Ok([models.Model(kind: models.Levels(default: "low", ..), ..)]) =
-    models.parse_catalog(
+  let assert Ok([catalog.Model(kind: catalog.Levels(default: "low", ..), ..)]) =
+    catalog.parse_catalog(
       "[{\"id\":\"hyper\",\"models\":[{\"id\":\"x\",\"reasoning\":{\"default_effort_level\":\"max\",\"effort_levels\":[{\"value\":\"low\"}]}}]}]",
     )
 }
@@ -87,20 +90,20 @@ pub fn current_settles_the_reasoning_test() {
     "{\"id\":\"alpha\",\"reasoning\":{\"thinking\":\"toggleable\",\"default_effort_level\":\"high\",\"effort_levels\":[{\"value\":\"low\"},{\"value\":\"high\"}]}}"
   let beta = "{\"id\":\"beta\",\"reasoning\":{\"thinking\":\"toggleable\"}}"
   // No effort picked: the model's default.
-  let assert Ok(models.Current(reasoning: Effort("high"), ..)) =
-    models.parse_current(session(alpha, "{}"))
-  let assert Ok(models.Current(reasoning: Effort("low"), ..)) =
-    models.parse_current(session(alpha, "{\"reasoning_effort\":\"low\"}"))
+  let assert Ok(catalog.Current(reasoning: Effort("high"), ..)) =
+    catalog.parse_current(session(alpha, "{}"))
+  let assert Ok(catalog.Current(reasoning: Effort("low"), ..)) =
+    catalog.parse_current(session(alpha, "{\"reasoning_effort\":\"low\"}"))
   // A level the model doesn't take falls back, as crush does.
-  let assert Ok(models.Current(reasoning: Effort("high"), ..)) =
-    models.parse_current(session(alpha, "{\"reasoning_effort\":\"max\"}"))
-  let assert Ok(models.Current(reasoning: Thinking(True), ..)) =
-    models.parse_current(session(beta, "{\"think\":true}"))
-  let assert Ok(models.Current(reasoning: Thinking(False), ..)) =
-    models.parse_current(session(beta, "{}"))
-  let assert Error(Nil) = models.parse_current("{\"is_busy\":false}")
+  let assert Ok(catalog.Current(reasoning: Effort("high"), ..)) =
+    catalog.parse_current(session(alpha, "{\"reasoning_effort\":\"max\"}"))
+  let assert Ok(catalog.Current(reasoning: Thinking(True), ..)) =
+    catalog.parse_current(session(beta, "{\"think\":true}"))
+  let assert Ok(catalog.Current(reasoning: Thinking(False), ..)) =
+    catalog.parse_current(session(beta, "{}"))
+  let assert Error(Nil) = catalog.parse_current("{\"is_busy\":false}")
   // crush reports an empty model when the pin can't be built.
-  let assert Error(Nil) = models.parse_current(session("{\"id\":\"\"}", "{}"))
+  let assert Error(Nil) = catalog.parse_current(session("{\"id\":\"\"}", "{}"))
 }
 
 // Choosing.
@@ -108,7 +111,7 @@ pub fn current_settles_the_reasoning_test() {
 pub fn check_test() {
   let catalog = catalog()
   let ok = fn(choice) {
-    let assert Ok(_) = models.check(catalog, choice)
+    let assert Ok(_) = catalog.check(catalog, choice)
     Nil
   }
   ok(ModelChoice("alpha", DefaultReasoning))
@@ -117,39 +120,39 @@ pub fn check_test() {
   ok(ModelChoice("beta", DefaultReasoning))
   ok(ModelChoice("gamma", DefaultReasoning))
   let assert Error("`alpha` takes low, high") =
-    models.check(catalog, ModelChoice("alpha", Effort("max")))
+    catalog.check(catalog, ModelChoice("alpha", Effort("max")))
   let assert Error("`alpha` takes low, high") =
-    models.check(catalog, ModelChoice("alpha", Thinking(True)))
+    catalog.check(catalog, ModelChoice("alpha", Thinking(True)))
   let assert Error("`beta` takes on or off") =
-    models.check(catalog, ModelChoice("beta", Effort("high")))
+    catalog.check(catalog, ModelChoice("beta", Effort("high")))
   let assert Error("`gamma` doesn't take a reasoning level") =
-    models.check(catalog, ModelChoice("gamma", Effort("high")))
+    catalog.check(catalog, ModelChoice("gamma", Effort("high")))
   let assert Error("there's no model called `nope`") =
-    models.check(catalog, ModelChoice("nope", DefaultReasoning))
+    catalog.check(catalog, ModelChoice("nope", DefaultReasoning))
 }
 
 pub fn after_mirrors_crush_test() {
   // As crush: nothing picked means the default level, and thinking off.
-  let assert models.Current(reasoning: Effort("high"), ..) =
-    models.after(model("alpha"), ModelChoice("alpha", DefaultReasoning))
-  let assert models.Current(reasoning: Thinking(False), ..) =
-    models.after(model("beta"), ModelChoice("beta", DefaultReasoning))
-  let assert models.Current(reasoning: DefaultReasoning, ..) =
-    models.after(model("gamma"), ModelChoice("gamma", DefaultReasoning))
-  let assert models.Current(reasoning: Effort("low"), ..) =
-    models.after(model("alpha"), ModelChoice("alpha", Effort("low")))
+  let assert catalog.Current(reasoning: Effort("high"), ..) =
+    catalog.after(model("alpha"), ModelChoice("alpha", DefaultReasoning))
+  let assert catalog.Current(reasoning: Thinking(False), ..) =
+    catalog.after(model("beta"), ModelChoice("beta", DefaultReasoning))
+  let assert catalog.Current(reasoning: DefaultReasoning, ..) =
+    catalog.after(model("gamma"), ModelChoice("gamma", DefaultReasoning))
+  let assert catalog.Current(reasoning: Effort("low"), ..) =
+    catalog.after(model("alpha"), ModelChoice("alpha", Effort("low")))
 }
 
 pub fn argument_test() {
-  let assert Ok(models.ShowCard) = models.parse_argument("")
-  let assert Ok(models.UseDefault) = models.parse_argument(" Default ")
-  let assert Ok(models.Choose(ModelChoice("kimi-k3", DefaultReasoning))) =
-    models.parse_argument("kimi-k3")
-  let assert Ok(models.Choose(ModelChoice("alpha", Effort("low")))) =
-    models.parse_argument("  alpha   low ")
-  let assert Ok(models.Choose(ModelChoice("beta", Thinking(False)))) =
-    models.parse_argument("beta OFF")
-  let assert Error(Nil) = models.parse_argument("a b c")
+  let assert Ok(catalog.ShowCard) = catalog.parse_argument("")
+  let assert Ok(catalog.UseDefault) = catalog.parse_argument(" Default ")
+  let assert Ok(catalog.Choose(ModelChoice("kimi-k3", DefaultReasoning))) =
+    catalog.parse_argument("kimi-k3")
+  let assert Ok(catalog.Choose(ModelChoice("alpha", Effort("low")))) =
+    catalog.parse_argument("  alpha   low ")
+  let assert Ok(catalog.Choose(ModelChoice("beta", Thinking(False)))) =
+    catalog.parse_argument("beta OFF")
+  let assert Error(Nil) = catalog.parse_argument("a b c")
 }
 
 pub fn command_test() {
@@ -196,8 +199,8 @@ fn initial(menu: block.StaticSelectElement) -> String {
   option.value
 }
 
-fn card(current: models.Current, catalog, note) {
-  models.card(current, current, catalog, #("C1", "1.5"), note)
+fn card(current: catalog.Current, catalog, note) {
+  model_card.card(current, current, catalog, #("C1", "1.5"), note)
 }
 
 fn header(blocks: List(block.Block)) -> String {
@@ -208,7 +211,7 @@ fn header(blocks: List(block.Block)) -> String {
 
 pub fn card_test() {
   let blocks =
-    card(models.Current(model("alpha"), Effort("low")), catalog(), "")
+    card(catalog.Current(model("alpha"), Effort("low")), catalog(), "")
   // The model and reasoning in words; no prices.
   let assert True = string.contains(header(blocks), "*Alpha* · reasoning Low")
   let assert False = string.contains(header(blocks), "$")
@@ -218,7 +221,7 @@ pub fn card_test() {
   // Confirm names the thread.
   let assert Some(True) = m.dispatch_action
   let assert Some(id) = confirm.block_id
-  let assert Ok(#("C1", "1.5")) = models.read_block_id(id)
+  let assert Ok(action_ref.CardRef(_, "C1", "1.5", _)) = action_ref.decode(id)
   let assert [block.Button(button)] = confirm.elements
   let assert Some(block.Primary) = button.style
   let assert [menu, reasoning] = menus(blocks)
@@ -226,16 +229,18 @@ pub fn card_test() {
   let assert ["alpha", "beta", "gamma"] =
     list.map(options, fn(option) { option.value })
   let assert "alpha" = initial(menu)
-  let assert "alpha|effort:low" = initial(reasoning)
+  let assert Ok(action_ref.ReasoningOption("alpha", Effort("low"))) =
+    action_ref.decode(initial(reasoning))
   // A toggle model offers on and off.
   let blocks =
-    card(models.Current(model("beta"), Thinking(False)), catalog(), "")
+    card(catalog.Current(model("beta"), Thinking(False)), catalog(), "")
   let assert [_, reasoning] = menus(blocks)
-  let assert "beta|think:off" = initial(reasoning)
+  let assert Ok(action_ref.ReasoningOption("beta", Thinking(False))) =
+    action_ref.decode(initial(reasoning))
   // A model that doesn't reason has no second menu; a note goes under.
   let blocks =
     card(
-      models.Current(model("gamma"), DefaultReasoning),
+      catalog.Current(model("gamma"), DefaultReasoning),
       catalog(),
       "couldn't",
     )
@@ -244,13 +249,14 @@ pub fn card_test() {
 }
 
 pub fn a_preview_shows_another_model_under_the_current_one_test() {
-  let current = models.Current(model("alpha"), Effort("high"))
-  let shown = models.Current(model("beta"), Thinking(False))
-  let blocks = models.card(current, shown, catalog(), #("C1", "1.5"), "")
+  let current = catalog.Current(model("alpha"), Effort("high"))
+  let shown = catalog.Current(model("beta"), Thinking(False))
+  let blocks = model_card.card(current, shown, catalog(), #("C1", "1.5"), "")
   let assert True = string.contains(header(blocks), "*Alpha*")
   let assert [menu, reasoning] = menus(blocks)
   let assert "beta" = initial(menu)
-  let assert "beta|think:off" = initial(reasoning)
+  let assert Ok(action_ref.ReasoningOption("beta", Thinking(False))) =
+    action_ref.decode(initial(reasoning))
 }
 
 pub fn card_menus_stay_inside_slacks_limits_test() {
@@ -259,14 +265,14 @@ pub fn card_menus_stay_inside_slacks_limits_test() {
   let many =
     int.range(from: 150, to: 0, with: [], run: list.prepend)
     |> list.map(fn(i) {
-      models.Model(
+      catalog.Model(
         id: "m" <> int.to_string(i),
         name: string.repeat("Long name ", 20),
-        kind: models.NoReasoning,
+        kind: catalog.NoReasoning,
       )
     })
   let assert Ok(current) = list.last(many)
-  let blocks = card(models.Current(current, DefaultReasoning), many, "")
+  let blocks = card(catalog.Current(current, DefaultReasoning), many, "")
   let assert [menu] = menus(blocks)
   let assert Some(options) = menu.options
   let assert 100 = list.length(options)
@@ -282,27 +288,33 @@ pub fn card_menus_stay_inside_slacks_limits_test() {
 
 pub fn card_survives_json_test() {
   let blocks =
-    card(models.Current(model("beta"), Thinking(True)), catalog(), "")
+    card(catalog.Current(model("beta"), Thinking(True)), catalog(), "")
   let encoded = json.to_string(json.array(blocks, block.block_to_json))
-  let assert True = string.contains(encoded, "crushling_confirm|C1|1.5|beta")
-  let assert Some("beta") =
-    models.confirm_model("crushling_confirm|C1|1.5|beta")
+  let confirm =
+    action_ref.encode(action_ref.CardRef(
+      action_ref.ConfirmButton,
+      "C1",
+      "1.5",
+      "beta",
+    ))
+  let assert True = string.contains(encoded, confirm)
   let assert True = string.contains(encoded, "\"crushling_reasoning\"")
 }
 
 pub fn read_confirm_test() {
-  let assert Ok(models.Confirm(ModelChoice("beta", Thinking(True)))) =
-    models.read_confirm(Some("beta"), Some("beta|think:on"))
+  let assert Ok(model_card.Confirm(ModelChoice("beta", Thinking(True)))) =
+    model_card.read_confirm(Some("beta"), Some("beta|think:on"))
   // A reasoning value left over from another model means the default.
-  let assert Ok(models.Confirm(ModelChoice("beta", DefaultReasoning))) =
-    models.read_confirm(Some("beta"), Some("alpha|effort:low"))
-  let assert Ok(models.Confirm(ModelChoice("gamma", DefaultReasoning))) =
-    models.read_confirm(Some("gamma"), None)
-  let assert Error(Nil) = models.read_confirm(None, Some("beta|think:on"))
-  let assert Error(Nil) = models.read_block_id("crushling_model|C1")
-  let assert Error(Nil) = models.read_block_id("other|C1|1.5")
-  let assert Ok(#("C1", "1.5")) =
-    models.read_block_id("crushling_model|C1|1.5|alpha")
+  let assert Ok(model_card.Confirm(ModelChoice("beta", DefaultReasoning))) =
+    model_card.read_confirm(Some("beta"), Some("alpha|effort:low"))
+  let assert Ok(model_card.Confirm(ModelChoice("gamma", DefaultReasoning))) =
+    model_card.read_confirm(Some("gamma"), None)
+  let assert Error(Nil) = model_card.read_confirm(None, Some("beta|think:on"))
+  let assert Error(Nil) = action_ref.decode("other|C1|1.5")
+  let assert Error(Nil) = action_ref.decode("crushling_model|C1")
+  // Cards posted before refs had a version still name their thread.
+  let assert Ok(action_ref.CardRef(action_ref.ModelMenu, "C1", "1.5", "alpha")) =
+    action_ref.decode("crushling_model|C1|1.5|alpha")
 }
 
 fn payload(action: String, state: String) -> String {
@@ -342,21 +354,21 @@ fn picked(action: String) {
       interaction.block_actions_payload_decoder(),
     )
   let assert Some([action]) = payload.actions
-  socket.picked(action, payload)
+  model_card.decode(action, payload)
 }
 
 pub fn socket_reads_card_actions_test() {
   let card = meta.Card(channel: "CCODE", ts: "9.9", thread_ts: "")
-  let assert Ok(registry.ModelPicked(
+  let assert Ok(model_card.Picked(
     home: #("C1", "1.5"),
-    pick: models.Confirm(ModelChoice("alpha", Effort("low"))),
+    pick: model_card.Confirm(ModelChoice("alpha", Effort("low"))),
     card: c,
     user: "U1",
   )) = picked(confirm_action)
   let assert True = c == card
-  let assert Ok(registry.ModelPicked(
+  let assert Ok(model_card.Picked(
     home: #("C1", "1.5"),
-    pick: models.Preview("beta"),
+    pick: model_card.Preview("beta"),
     ..,
   )) = picked(change_action)
   // With no menu state at all, Confirm falls back to the model it was drawn
@@ -367,10 +379,10 @@ pub fn socket_reads_card_actions_test() {
       interaction.block_actions_payload_decoder(),
     )
   let assert Some([action]) = payload.actions
-  let assert Ok(registry.ModelPicked(
-    pick: models.Confirm(ModelChoice("alpha", DefaultReasoning)),
+  let assert Ok(model_card.Picked(
+    pick: model_card.Confirm(ModelChoice("alpha", DefaultReasoning)),
     ..,
-  )) = socket.picked(action, payload)
+  )) = model_card.decode(action, payload)
 }
 
 // A thread against the fake server.
@@ -462,6 +474,7 @@ fn start(
         on_connect: fn(_) { Nil },
         model: saved,
         home: #("C", "1.0"),
+        post_mortem: fn() { post_mortem.Unknown("test") },
       ),
     )
   #(server, t, seen)
@@ -562,24 +575,26 @@ pub fn a_saved_model_crush_refuses_goes_back_to_the_default_test() {
 pub fn card_shows_and_switches_test() {
   let #(server, t, seen) = start("card", None)
   let _ = expect("events")
-  process.send(t, thread.ModelCommand(models.ShowCard, "U1"))
+  process.send(t, thread.ModelCommand(catalog.ShowCard, "U1"))
   let assert Card(blocks) = receive(seen)
   let assert [menu, reasoning] = menus(blocks)
   let assert "alpha" = initial(menu)
-  let assert "alpha|effort:high" = initial(reasoning)
+  let assert Ok(action_ref.ReasoningOption("alpha", Effort("high"))) =
+    action_ref.decode(initial(reasoning))
   // Changing the model menu only redraws the card for it...
-  process.send(t, thread.CardPicked(models.Preview("beta"), "card", "U1"))
+  process.send(t, thread.CardPicked(model_card.Preview("beta"), "card", "U1"))
   let assert CardUpdated("card", blocks) = receive(seen)
   let assert True = string.contains(header(blocks), "*Alpha*")
   let assert [menu, reasoning] = menus(blocks)
   let assert "beta" = initial(menu)
-  let assert "beta|think:off" = initial(reasoning)
+  let assert Ok(action_ref.ReasoningOption("beta", Thinking(False))) =
+    action_ref.decode(initial(reasoning))
   no("model")
   // ...and Confirm switches: thinking stays off, as in crush.
   process.send(
     t,
     thread.CardPicked(
-      models.Confirm(ModelChoice("beta", DefaultReasoning)),
+      model_card.Confirm(ModelChoice("beta", DefaultReasoning)),
       "card",
       "U1",
     ),
@@ -594,7 +609,7 @@ pub fn card_shows_and_switches_test() {
   process.send(
     t,
     thread.CardPicked(
-      models.Confirm(ModelChoice("beta", Thinking(True))),
+      model_card.Confirm(ModelChoice("beta", Thinking(True))),
       "card",
       "U1",
     ),
@@ -613,7 +628,7 @@ pub fn a_refused_confirm_puts_the_card_back_test() {
   process.send(
     t,
     thread.CardPicked(
-      models.Confirm(ModelChoice("alpha", Thinking(True))),
+      model_card.Confirm(ModelChoice("alpha", Thinking(True))),
       "card",
       "U1",
     ),
@@ -624,7 +639,8 @@ pub fn a_refused_confirm_puts_the_card_back_test() {
     string.contains(string.inspect(note), "`alpha` takes low, high")
   let assert [menu, reasoning] = menus(blocks)
   let assert "alpha" = initial(menu)
-  let assert "alpha|effort:high" = initial(reasoning)
+  let assert Ok(action_ref.ReasoningOption("alpha", Effort("high"))) =
+    action_ref.decode(initial(reasoning))
   no("model")
   process.send(t, thread.Stop)
   stop_server(server)
@@ -636,7 +652,7 @@ pub fn command_switches_refuses_and_resets_test() {
   process.send(
     t,
     thread.ModelCommand(
-      models.Choose(ModelChoice("alpha", Effort("low"))),
+      catalog.Choose(ModelChoice("alpha", Effort("low"))),
       "U1",
     ),
   )
@@ -649,7 +665,7 @@ pub fn command_switches_refuses_and_resets_test() {
   process.send(
     t,
     thread.ModelCommand(
-      models.Choose(ModelChoice("nope", DefaultReasoning)),
+      catalog.Choose(ModelChoice("nope", DefaultReasoning)),
       "U1",
     ),
   )
@@ -657,7 +673,7 @@ pub fn command_switches_refuses_and_resets_test() {
   let assert True = string.contains(text, "no model called `nope`")
   no("model")
   // `!model default` pins crush's default and forgets the choice.
-  process.send(t, thread.ModelCommand(models.UseDefault, "U1"))
+  process.send(t, thread.ModelCommand(catalog.UseDefault, "U1"))
   let fields = pinned(expect("model"))
   let assert Ok("alpha") = dict.get(fields, "model")
   let assert Error(Nil) = dict.get(fields, "reasoning_effort")
@@ -693,7 +709,11 @@ fn start_woken_registry(name: String) {
     launcher.Launcher(
       launch: fn(key) {
         process.send(launches, Launched(key))
-        Ok(launcher.Launched(socket:, root: "/work"))
+        Ok(
+          launcher.Launched(socket:, root: "/work", post_mortem: fn() {
+            post_mortem.Unknown("test")
+          }),
+        )
       },
       stop: fn(key) {
         process.send(launches, Stopped(key))
@@ -718,10 +738,12 @@ fn start_woken_registry(name: String) {
   let assert Ok(r) =
     registry.start(registry_config.Config(
       launcher: fake,
-      client:,
-      token: "xoxb-test",
-      bot_user: "UBOT",
-      team: "T1",
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: s,

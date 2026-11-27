@@ -3,7 +3,7 @@
 //// workspace, so they last through a restart.
 
 import crushling/meta.{type Link, Link}
-import crushling/slack
+import crushling/slack/text
 import crushling/store.{type Store}
 import crushling/store/threads
 import crushling/sys
@@ -60,7 +60,7 @@ pub fn origin(link: Link) -> #(String, String) {
 pub fn is_seed(code: Option(Link), ts: String) -> Bool {
   case code {
     Some(Link(opened_ts:, ..)) if opened_ts != "" ->
-      slack.ts_value(ts) <=. slack.ts_value(opened_ts) +. 1.0
+      text.ts_value(ts) <=. text.ts_value(opened_ts) +. 1.0
     _ -> False
   }
 }

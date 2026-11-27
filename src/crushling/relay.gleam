@@ -76,13 +76,13 @@ pub const default_idle_timeout_ms = 300_000
 const flow_window = 8
 
 /// Start relaying `req` to `upstream` as `outgoing`, once `send` gives it
-/// the body.
+/// the body. Error if the relay's process didn't come up.
 pub fn start(
   upstream: Upstream,
   outgoing: Outgoing,
   req: Request(mist.Connection),
   hooks: Hooks(scan),
-) -> Relay {
+) -> Result(Relay, Nil) {
   start_with(
     upstream,
     outgoing,
@@ -100,7 +100,7 @@ pub fn start_with(
   hooks: Hooks(scan),
   head_ms: Int,
   idle_ms: Int,
-) -> Relay {
+) -> Result(Relay, Nil) {
   let job =
     Job(
       upstream:,
@@ -114,8 +114,13 @@ pub fn start_with(
   let started = process.new_subject()
   let reply = process.new_subject()
   let pid = process.spawn_unlinked(fn() { relay(job, started, reply) })
-  let assert Ok(go) = process.receive(started, 5000)
-  Relay(pid:, go:, reply:, head_ms:)
+  case process.receive(started, 5000) {
+    Ok(go) -> Ok(Relay(pid:, go:, reply:, head_ms:))
+    Error(Nil) -> {
+      process.kill(pid)
+      Error(Nil)
+    }
+  }
 }
 
 /// The relay's process, for counting it.

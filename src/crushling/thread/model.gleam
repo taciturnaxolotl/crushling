@@ -10,10 +10,12 @@
 //// The catalog doesn't change while a server runs, so it is fetched once per
 //// server and handed back in `Done` for the thread to keep.
 
+import crushling/crush/catalog.{type Current, type Model}
 import crushling/crush/client
 import crushling/meta.{type ModelChoice, DefaultReasoning, ModelChoice}
-import crushling/models.{type Current, type Model}
+import crushling/provider
 import crushling/sink.{type Sink}
+import crushling/slack/model_card
 import crushling/sys
 import crushling/thread/conn.{type Connection}
 import crushling/thread/say
@@ -104,7 +106,7 @@ fn with_catalog(
         context,
         client.providers(context.connection.workspace_id),
       ))
-      models.parse_catalog(body)
+      catalog.parse_catalog(body)
       |> result.replace_error("crush offered no models")
     }
   }
@@ -126,7 +128,7 @@ fn current(context: Context) -> Result(Current, String) {
     context,
     client.session_info(connection.workspace_id, connection.session_id),
   ))
-  models.parse_current(body)
+  catalog.parse_current(body)
   |> result.replace_error("crush didn't say which model the session runs")
 }
 
@@ -175,7 +177,7 @@ fn pin(
   choice: ModelChoice,
 ) -> Result(Current, PinError) {
   use model <- result.try(
-    models.check(catalog, choice) |> result.map_error(NotTaken),
+    catalog.check(catalog, choice) |> result.map_error(NotTaken),
   )
   let connection = context.connection
   let pinned =
@@ -184,12 +186,12 @@ fn pin(
       client.set_session_model(
         workspace_id: connection.workspace_id,
         session_id: connection.session_id,
-        provider: models.provider,
+        provider: provider.id,
         choice:,
       ),
     )
   case pinned {
-    Ok(Nil) -> Ok(models.after(model, choice))
+    Ok(Nil) -> Ok(catalog.after(model, choice))
     Error(client.Status(_, reason)) -> Error(Refused(reason))
     Error(other) -> Error(Unreachable(conn.describe(other)))
   }
@@ -207,13 +209,13 @@ pub fn restore(context: Context, saved: Option(ModelChoice)) -> Done {
         sys.warn("crushling: couldn't pin " <> choice.model <> ": " <> reason)
       }
       use context, catalog <- with_catalog(context, failed)
-      case models.find(catalog, choice.model) {
+      case catalog.find(catalog, choice.model) {
         Error(_) -> {
           tell(context, say.model_gone(choice.model))
           BackToDefault
         }
         Ok(model) -> {
-          let #(choice, change) = case models.fits(model, choice.reasoning) {
+          let #(choice, change) = case catalog.fits(model, choice.reasoning) {
             True -> #(choice, Keep)
             False -> {
               tell(context, say.reasoning_dropped(model.id))
@@ -242,14 +244,14 @@ pub fn restore(context: Context, saved: Option(ModelChoice)) -> Done {
 /// `!model`, with or without a model to switch to.
 pub fn command(
   context: Context,
-  request: models.Request,
+  request: catalog.Request,
   user: String,
 ) -> Done {
   case request {
-    models.ShowCard -> show(context)
-    models.Choose(choice) ->
+    catalog.ShowCard -> show(context)
+    catalog.Choose(choice) ->
       set(context, user, fn(_) { Ok(#(choice, Picked(choice))) })
-    models.UseDefault ->
+    catalog.UseDefault ->
       set(context, user, fn(context) {
         default(context) |> result.map(fn(choice) { #(choice, BackToDefault) })
       })
@@ -263,7 +265,7 @@ fn show(context: Context) -> Done {
     use current <- result.try(current(context))
     context.sink.post_blocks(
       say.model_card_text(current),
-      models.card(current, current, catalog, context.home, ""),
+      model_card.card(current, current, catalog, context.home, ""),
     )
   }
   case shown {
@@ -305,7 +307,7 @@ fn set(
 /// card ends up true: a refused confirm puts the menus back.
 pub fn pick(
   context: Context,
-  pick: models.Pick,
+  pick: model_card.Pick,
   card_ts: String,
   user: String,
 ) -> Done {
@@ -318,17 +320,17 @@ pub fn pick(
     }
     Ok(before) ->
       case pick {
-        models.Preview(id) -> {
+        model_card.Preview(id) -> {
           let shown =
-            models.find(catalog, id)
+            catalog.find(catalog, id)
             |> result.map(fn(model) {
-              models.after(model, ModelChoice(id, DefaultReasoning))
+              catalog.after(model, ModelChoice(id, DefaultReasoning))
             })
             |> result.unwrap(before)
           redraw(context, card_ts, catalog, before, shown, "", "")
           Keep
         }
-        models.Confirm(choice) ->
+        model_card.Confirm(choice) ->
           case pin(context, catalog, choice) |> result.map_error(describe) {
             // The card has done its job. If it can't be deleted (it may
             // be somewhere the sink can't reach), show the new model on it.
@@ -369,7 +371,7 @@ fn redraw(
     context.sink.update_blocks(
       card_ts,
       say.model_card_text(current),
-      models.card(current, shown, catalog, context.home, note),
+      model_card.card(current, shown, catalog, context.home, note),
     )
   case updated, fallback {
     Ok(Nil), _ | Error(_), "" -> Nil

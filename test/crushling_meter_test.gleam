@@ -103,3 +103,41 @@ pub fn a_failed_save_is_tried_again_test() {
     process.receive(saves, 1000)
   let assert Error(Nil) = process.receive(saves, 200)
 }
+
+/// A flush at shutdown waits for the timer's save in flight, and keeps its
+/// batch if that save fails.
+pub fn a_flush_waits_for_the_save_in_flight_test() {
+  let saves = process.new_subject()
+  let gates = process.new_subject()
+  let keeper =
+    meter.Keeper(
+      thread_total: fn(_) { Ok(usage.zero) },
+      team_total: fn(_) { Ok(usage.zero) },
+      save: fn(spent) {
+        let gate = process.new_subject()
+        process.send(gates, gate)
+        let assert Ok(result) = process.receive(gate, 5000)
+        process.send(saves, spent)
+        result
+      },
+      every_ms: 50,
+    )
+  let assert Ok(started) = meter.start_with(limits(), Some(keeper), None)
+  let m = started.data
+  meter.record(m, "T1-C1-1.0", one)
+  // The timer's save starts and holds.
+  let assert Ok(first) = process.receive(gates, 1000)
+  meter.record(m, "T1-C1-1.0", one)
+  let flushed = process.new_subject()
+  process.spawn(fn() { process.send(flushed, meter.flush(m)) })
+  let assert Error(Nil) = process.receive(flushed, 100)
+  process.send(first, Error("database is locked"))
+  let assert Ok([#("T1-C1-1.0", Usage(10, 5, 0.25, 1))]) =
+    process.receive(saves, 1000)
+  // The flush saves the failed batch with what came after.
+  let assert Ok(second) = process.receive(gates, 1000)
+  process.send(second, Ok(Nil))
+  let assert Ok([#("T1-C1-1.0", Usage(20, 10, 0.5, 2))]) =
+    process.receive(saves, 1000)
+  let assert Ok(Ok(Nil)) = process.receive(flushed, 1000)
+}

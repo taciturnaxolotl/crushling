@@ -16,16 +16,18 @@
 //// reading their diffs) runs in a process of its own and reports back with
 //// an `Internal` message, so the actor stays free to answer.
 
+import crushling/agent/post_mortem.{type PostMortem}
 import crushling/conversation.{type Conversation}
+import crushling/crush/catalog
 import crushling/crush/client
 import crushling/crush/event
 import crushling/git
 import crushling/gun
 import crushling/meta.{type ModelChoice}
-import crushling/models
 import crushling/pr
 import crushling/run
 import crushling/sink.{type Sink, type Surface}
+import crushling/slack/model_card
 import crushling/sys
 import crushling/thread/channel
 import crushling/thread/conn.{type Connection}
@@ -92,7 +94,7 @@ pub type Config {
     title: String,
     /// Where the work starts.
     venue: Venue,
-    /// The sink for each venue (`slack.surface`): the thread posts through
+    /// The sink for each venue (`slack/sink.surface`): the thread posts through
     /// the one for where its work is now.
     sink: Surface,
     /// How often an in-progress message is re-rendered, in milliseconds.
@@ -109,6 +111,9 @@ pub type Config {
     model: Option(ModelChoice),
     /// The thread's own channel and ts, for its `!model` cards.
     home: #(String, String),
+    /// Why the agent went quiet, asked once reconnecting gives up and
+    /// before the agent is stopped, for the note ending the run.
+    post_mortem: fn() -> PostMortem,
   )
 }
 
@@ -156,9 +161,9 @@ pub type Message {
   Reconnect
   Gun(gun.Message)
   /// `!model`, with or without a model to switch to.
-  ModelCommand(request: models.Request, user: String)
+  ModelCommand(request: catalog.Request, user: String)
   /// Someone picked on the card posted as `card_ts`.
-  CardPicked(pick: models.Pick, card_ts: String, user: String)
+  CardPicked(pick: model_card.Pick, card_ts: String, user: String)
   /// Count the agent's running background jobs for the registry's idle
   /// check of `generation`; answered with `JobsRunning`.
   CountJobs(generation: Int)
@@ -223,7 +228,7 @@ type State {
     /// The model picked for the thread, pinned on every connect.
     model: Option(ModelChoice),
     /// The connected server's model catalog, once fetched.
-    catalog: Option(List(models.Model)),
+    catalog: Option(List(catalog.Model)),
   )
 }
 
@@ -510,8 +515,10 @@ fn connected(state: State, result: Result(Connection, String)) -> State {
       state
     }
     link.GaveUp -> {
+      // Asked first: the registry stops what's left once it hears.
+      let why = state.config.post_mortem()
       state.config.notify(Lost)
-      replay(state) |> fail_everything(say.lost)
+      replay(state) |> fail_everything(say.lost(why))
     }
     link.Stale -> state
   }
@@ -591,8 +598,8 @@ fn with_model(state: State, step: fn(model.Context) -> model.Done) -> State {
 
 // Turns -----------------------------------------------------------------------
 
-fn fail_everything(state: State, reason: String) -> State {
-  let note = say.aside(reason)
+/// End every run with `note`, already mrkdwn.
+fn fail_everything(state: State, note: String) -> State {
   let open =
     option.then(state.turn, fn(current) {
       turn.reply(current) |> option.map(fn(_) { current })

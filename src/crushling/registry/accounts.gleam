@@ -5,15 +5,14 @@
 import crushling/conversation.{Conversation}
 import crushling/github/broker
 import crushling/github/connect
+import crushling/github/nudge
 import crushling/github/repo
-import crushling/home
 import crushling/home/publisher
 import crushling/pr
 import crushling/registry/core.{type State, PrSettled, State}
 import crushling/registry/entry.{Entry, Live}
-import crushling/registry/say
 import crushling/registry/text
-import crushling/slack
+import crushling/slack/workspace
 import crushling/sys
 import crushling/thread
 import gleam/dict
@@ -22,9 +21,6 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set
-import slackline/api/chat
-import slackline/api/chat/update
-import slackline/httpc
 
 /// Asked to connect GitHub at most this often per person and thread.
 const nudge_every_ms = 600_000
@@ -49,8 +45,8 @@ pub fn show_home(
     Connect(from:), True ->
       process.send(state.connect, connect.Connect(user, from))
     Connect(from: Some(connect.Place(channel:, thread_ts:, ..))), False ->
-      say.privately(
-        state.config.client,
+      core.tell_privately(
+        state,
         conversation.from_slack(channel, thread_ts),
         user,
         text.cant_use,
@@ -69,13 +65,14 @@ pub fn show_home(
 }
 
 /// What a press on a PR card answers with, privately, through `respond`.
-pub fn responder(respond: Option(String)) -> fn(String) -> Nil {
+pub fn responder(
+  state: State(msg),
+  respond: Option(String),
+) -> fn(String) -> Nil {
+  let workspace = state.config.workspace
   fn(text) {
     case respond {
-      Some(url) -> {
-        process.spawn_unlinked(fn() { slack.reply_ephemeral(url, text) })
-        Nil
-      }
+      Some(url) -> workspace.respond_later(workspace, url, text, False)
       None -> Nil
     }
   }
@@ -113,19 +110,19 @@ pub fn press(
       state
     }
     Some(github) -> {
-      let client = state.config.client
+      let workspace = state.config.workspace
       let settle = fn(outcome) {
         let #(text, blocks) = pr.settled(proposal, outcome)
-        let _ =
-          chat.update(channel:, ts: card_ts)
-          |> update.text(text)
-          |> update.blocks(blocks)
-          |> httpc.send(client)
-        Nil
+        workspace.update_later(
+          workspace,
+          channel,
+          card_ts,
+          workspace.Message(text, blocks),
+        )
       }
       case choice {
         "dismiss" -> {
-          process.spawn_unlinked(fn() { settle(text.pr_dismissed(user)) })
+          settle(text.pr_dismissed(user))
           State(..state, proposals: dict.delete(state.proposals, card_ts))
         }
         _ -> {
@@ -185,28 +182,27 @@ pub fn nudge(
   }
   case recently, asked, dict.get(state.threads, key) {
     False, Ok(asked), Ok(entry) -> {
-      let client = state.config.client
+      let workspace = state.config.workspace
       let broker = state.broker
       let #(channel, thread_ts) = #(entry.channel, entry.thread_ts)
       process.spawn_unlinked(fn() {
         let ask = case need {
           broker.Connect(repo:) ->
-            Some(home.ask_connect(channel, thread_ts, repo))
+            Some(nudge.ask_connect(channel, thread_ts, repo))
           broker.Install(repo:) ->
             broker.accounts(broker)
             |> option.map(fn(accounts) {
-              home.ask_install(repo, accounts.install_url)
+              nudge.ask_install(repo, accounts.install_url)
             })
           broker.Unavailable(..) -> None
         }
         case ask {
           Some(#(text, blocks)) ->
-            slack.whisper_blocks(
-              client,
+            workspace.whisper_later(
+              workspace,
               Conversation(channel, Some(thread_ts)),
               user,
-              text,
-              blocks,
+              workspace.Message(text, blocks),
             )
           None -> Nil
         }

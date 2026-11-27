@@ -18,7 +18,8 @@
 ////
 //// With a `Keeper`, totals start from what the store kept (read the first
 //// time a thread or workspace is seen) and new spend is saved there every
-//// `every_ms`; a batch the store refuses is kept for the next try. These
+//// `every_ms`; a batch the store refuses is kept for the next try, and a
+//// flush waits for any save in flight, so nothing is lost at exit. These
 //// are still soft limits: usage is only known when a response finishes, so
 //// requests already in flight when a cap is reached can overshoot it, each
 //// by at most its own cost (and a thread has at most `max_per_thread` in
@@ -118,8 +119,10 @@ type State {
     /// Batches taken and not yet settled.
     taken: Dict(Int, List(#(String, Usage))),
     next_batch: Int,
-    /// Whether the keeper's save is running.
-    saving: Bool,
+    /// The keeper's saves running off the actor: batch id to its worker.
+    saving: Dict(Int, Pid),
+    /// Flushes waiting for those saves to settle first.
+    flushing: List(Subject(Result(Nil, String))),
     allowed: Set(String),
     overrides: Dict(String, Cap),
     admitted: Dict(Pid, Admission),
@@ -167,7 +170,8 @@ pub fn start_with(
         undrained: dict.new(),
         taken: dict.new(),
         next_batch: 1,
-        saving: False,
+        saving: dict.new(),
+        flushing: [],
         allowed: set.new(),
         overrides: dict.new(),
         admitted: dict.new(),
@@ -288,10 +292,16 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
           )
         Error(Nil) -> actor.continue(state)
       }
-    OwnerDown(owner) ->
-      actor.continue(
-        State(..state, admitted: dict.delete(state.admitted, owner)),
-      )
+    OwnerDown(owner) -> {
+      let state = State(..state, admitted: dict.delete(state.admitted, owner))
+      // A save that died without settling: its batch goes back.
+      let lost =
+        dict.filter(state.saving, fn(_, worker) { worker == owner })
+        |> dict.keys
+      list.fold(lost, state, fn(state, id) { settle_batch(state, id, False) })
+      |> after_settle
+      |> actor.continue
+    }
     Check(key, reply) -> {
       let state = seed(state, key)
       process.send(reply, check(state, key))
@@ -355,41 +365,47 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       process.send(reply, batch)
       actor.continue(state)
     }
-    Settle(id, kept) -> actor.continue(settle_batch(state, id, kept))
-    Flush(reply) -> {
-      let #(state, batch) = take_batch(state)
-      let saved = case state.keeper, batch.spent {
-        _, [] | None, _ -> Ok(Nil)
-        Some(keeper), spent -> keeper.save(spent)
+    Settle(id, kept) ->
+      settle_batch(state, id, kept) |> after_settle |> actor.continue
+    // A batch in flight may yet fail and come back, so wait for it.
+    Flush(reply) ->
+      case dict.is_empty(state.saving) {
+        True -> actor.continue(flush_now(state, [reply]))
+        False ->
+          actor.continue(State(..state, flushing: [reply, ..state.flushing]))
       }
-      process.send(reply, saved)
-      actor.continue(settle_batch(state, batch.id, result.is_ok(saved)))
-    }
     FlushTick ->
       case state.keeper {
         None -> actor.continue(state)
         Some(keeper) -> {
           process.send_after(state.self, keeper.every_ms, FlushTick)
-          case state.saving || dict.is_empty(state.undrained) {
+          case !dict.is_empty(state.saving) || dict.is_empty(state.undrained) {
             True -> actor.continue(state)
             False -> {
               let #(state, batch) = take_batch(state)
               let self = state.self
               // Off the actor, so a slow store doesn't hold up admission.
-              process.spawn(fn() {
-                let kept = case keeper.save(batch.spent) {
-                  Ok(Nil) -> True
-                  Error(reason) -> {
-                    sys.warn(
-                      "crushling: saving spend failed, keeping it for the next try: "
-                      <> reason,
-                    )
-                    False
+              let worker =
+                process.spawn_unlinked(fn() {
+                  let kept = case keeper.save(batch.spent) {
+                    Ok(Nil) -> True
+                    Error(reason) -> {
+                      sys.warn(
+                        "crushling: saving spend failed, keeping it for the next try: "
+                        <> reason,
+                      )
+                      False
+                    }
                   }
-                }
-                process.send(self, Settle(batch.id, kept))
-              })
-              actor.continue(State(..state, saving: True))
+                  process.send(self, Settle(batch.id, kept))
+                })
+              process.monitor(worker)
+              actor.continue(
+                State(
+                  ..state,
+                  saving: dict.insert(state.saving, batch.id, worker),
+                ),
+              )
             }
           }
         }
@@ -426,7 +442,34 @@ fn settle_batch(state: State, id: Int, kept: Bool) -> State {
         )
       })
   }
-  State(..state, undrained:, taken: dict.delete(state.taken, id), saving: False)
+  State(
+    ..state,
+    undrained:,
+    taken: dict.delete(state.taken, id),
+    saving: dict.delete(state.saving, id),
+  )
+}
+
+/// Run the flushes that waited, once no save is in flight.
+fn after_settle(state: State) -> State {
+  case dict.is_empty(state.saving), state.flushing {
+    True, [_, ..] as waiting -> flush_now(State(..state, flushing: []), waiting)
+    _, _ -> state
+  }
+}
+
+/// Save what is unsaved now, on the actor, and tell each of `replies`.
+fn flush_now(
+  state: State,
+  replies: List(Subject(Result(Nil, String))),
+) -> State {
+  let #(state, batch) = take_batch(state)
+  let saved = case state.keeper, batch.spent {
+    _, [] | None, _ -> Ok(Nil)
+    Some(keeper), spent -> keeper.save(spent)
+  }
+  list.each(replies, process.send(_, saved))
+  settle_batch(state, batch.id, result.is_ok(saved))
 }
 
 /// Whether the thread may spend, and its caps, without the in-flight limits.

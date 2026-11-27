@@ -14,11 +14,11 @@ import crushling/registry/entry.{
   no_turn, tailnet_view,
 }
 import crushling/registry/idle
-import crushling/registry/say
 import crushling/registry/shutdown
 import crushling/registry/tailnet
 import crushling/registry/text
-import crushling/slack
+import crushling/slack/sink as slack_sink
+import crushling/slack/workspace
 import crushling/sys
 import crushling/thread
 import crushling/venue
@@ -42,35 +42,27 @@ pub fn launch(state: State(msg), key: String, entry: Entry) -> State(msg) {
   let state = set_meta(state, key, entry, meta)
   // A thread actor that can't start would leave nothing driving the agent, so the owner stops it.
   let attach = fn(launched: launcher.Launched) {
-    let sink = case meta.venue {
-      venue.CodeChannel(channel: code, ..) -> {
-        // Channels opened before commands existed get them now.
-        slack.set_code_commands(config.client, code)
-        slack.sink(config.client, config.team, code, slack.InCodeChannel)
-      }
-      _ ->
-        slack.sink(
-          config.client,
-          config.team,
-          channel,
-          slack.InThread(thread_ts),
-        )
+    case meta.venue {
+      // Channels opened before commands existed get them now.
+      venue.CodeChannel(channel: code, ..) ->
+        workspace.set_commands(config.workspace, code)
+      _ -> Nil
     }
-    thread.start(
-      thread.Config(
-        socket: launched.socket,
-        root: launched.root,
-        title: "slack " <> channel <> " " <> thread_ts,
-        venue: meta.venue,
-        sink:,
-        flush_ms: config.flush_ms,
-        mode: config.mode,
-        notify: fn(notice) { tell(FromThread(key, notice)) },
-        on_connect: fn(_) { Nil },
-        model: meta.model,
-        home: #(channel, thread_ts),
-      ),
-    )
+    let sink = slack_sink.surface(config.workspace, #(channel, thread_ts))
+    thread.start(thread.Config(
+      socket: launched.socket,
+      root: launched.root,
+      title: "slack " <> channel <> " " <> thread_ts,
+      venue: meta.venue,
+      sink:,
+      flush_ms: config.flush_ms,
+      mode: config.mode,
+      notify: fn(notice) { tell(FromThread(key, notice)) },
+      on_connect: fn(_) { Nil },
+      model: meta.model,
+      home: #(channel, thread_ts),
+      post_mortem: launched.post_mortem,
+    ))
     |> result.map(fn(thread) { tell(Started(key, launch, Ok(thread))) })
     |> result.map_error(fn(error) { "thread: " <> string.inspect(error) })
   }
@@ -98,10 +90,15 @@ pub fn started(
       if current == launch
     -> {
       sys.warn("crushling: could not start " <> key <> ": " <> reason)
-      say.post(
-        state.config.client,
+      core.say(
+        state,
         Conversation(entry.channel, Some(entry.thread_ts)),
         text.could_not_start(reason),
+      )
+      // The registry marked it working when the message came in.
+      workspace.session_done_later(
+        state.config.workspace,
+        entry.conversation(entry),
       )
       State(..state, threads: dict.delete(state.threads, key))
     }
@@ -249,11 +246,7 @@ pub fn stopped(
             <> " tries: "
             <> reason,
           )
-          say.post(
-            state.config.client,
-            entry.conversation(entry),
-            text.could_not_stop,
-          )
+          core.say(state, entry.conversation(entry), text.could_not_stop)
           State(..state, threads: dict.delete(state.threads, key), abandoned: [
             key,
             ..state.abandoned
@@ -273,18 +266,18 @@ pub fn thread_down(state: State(msg), down: process.Down) -> State(msg) {
         _, _ -> False
       }
     })
-  let client = state.config.client
+  let workspace = state.config.workspace
   dict.each(gone, fn(key, dead) {
     sys.warn("crushling: thread " <> key <> " stopped unexpectedly")
-    say.post(
-      client,
+    core.say(
+      state,
       Conversation(dead.channel, Some(dead.thread_ts)),
       text.stopped_unexpectedly,
     )
   })
   // Nothing will clear "Working…" for a thread that died mid-run.
   dict.each(gone, fn(_, dead) {
-    say.session_done(client, entry.conversation(dead))
+    workspace.session_done_later(workspace, entry.conversation(dead))
   })
   // Its container may still be running, and on the tailnet.
   dict.fold(gone, state, fn(state, key, _) { stop_agent(state, key) })

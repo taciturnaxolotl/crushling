@@ -8,6 +8,7 @@ import crushling/crush/client
 import crushling/github
 import crushling/github/broker
 import crushling/github/connect
+import crushling/github/nudge
 import crushling/github/repo
 import crushling/home
 import crushling/key
@@ -17,6 +18,8 @@ import crushling/proxy/meter
 import crushling/registry
 import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
+import crushling/slack/action_ref
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/github as accounts
 import crushling/store/schema
@@ -468,16 +471,19 @@ pub fn home_view_test() {
 
 pub fn nudge_test() {
   let assert Ok(hyper) = repo.parse_path("octo", "hyper")
-  let #(text, blocks) = home.ask_connect("C1", "1.5", Some(hyper))
+  let #(text, blocks) = nudge.ask_connect("C1", "1.5", Some(hyper))
   let assert True =
     text
     == "crushling would like private access to `octo/hyper`. Would you like to connect crushling to your GitHub account?"
   let assert True = string.contains(string.inspect(blocks), "C1|1.5")
-  let #(text, blocks) = home.ask_install(hyper, "https://x/install")
+  let #(text, blocks) = nudge.ask_install(hyper, "https://x/install")
   let assert True = string.contains(text, "isn't set up on *octo*")
   let assert True = string.contains(string.inspect(blocks), "https://x/install")
-  let assert Ok(#("C1", "1.5")) = home.nudged_from("C1|1.5")
-  let assert Error(Nil) = home.nudged_from("")
+  let assert Ok(action_ref.ThreadRef("C1", "1.5")) =
+    action_ref.decode(action_ref.encode(action_ref.ThreadRef("C1", "1.5")))
+  // Asks posted before refs had a version still name their thread.
+  let assert Ok(action_ref.ThreadRef("C1", "1.5")) = action_ref.decode("C1|1.5")
+  let assert Error(Nil) = action_ref.decode("")
 }
 
 pub fn github_command_test() {
@@ -807,10 +813,12 @@ fn start_registry(
         rekey: fn(_, _) { Ok(Nil) },
         run_in_sandbox: None,
       ),
-      client:,
-      token: "xoxb-test",
-      bot_user: "UBOT",
-      team: "T1",
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       allowed:,
       admins: set.new(),
       store: s,

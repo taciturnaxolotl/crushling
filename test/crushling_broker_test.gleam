@@ -6,6 +6,7 @@ import crushling/github
 import crushling/github/broker.{Anonymous, AsPerson, Connect, OpenPr, Push, Read}
 import crushling/github/connect
 import crushling/github/repo
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/github as accounts
 import crushling/store/schema
@@ -53,9 +54,13 @@ fn start(s: store.Store, config: github.Config) -> broker.Broker {
     slackline.new("xoxb-test") |> slackline.with_base_url("http://127.0.0.1:1")
   let assert Ok(c) =
     connect.start(connect.Setup(
-      client:,
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       store: s,
-      team: "T1",
       github: Some(config),
     ))
   let assert Ok(b) =
@@ -217,9 +222,13 @@ pub fn waiting_for_a_connection_is_told_test() {
     slackline.new("xoxb-test") |> slackline.with_base_url("http://127.0.0.1:1")
   let assert Ok(c) =
     connect.start(connect.Setup(
-      client:,
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       store: s,
-      team: "T1",
       github: Some(config),
     ))
   let assert Ok(b) =

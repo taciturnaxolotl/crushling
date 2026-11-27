@@ -1,13 +1,16 @@
 //// What a thread says in Slack, as mrkdwn and blocks. Everything here is
 //// pure; the thread decides when to say it.
 
+import crushling/agent/post_mortem.{type PostMortem}
+import crushling/crush/catalog.{type Current}
 import crushling/git.{type PushState, type RepoInfo}
-import crushling/models.{type Current}
 import crushling/render
+import crushling/slack/blocks
 import crushling/snapshot.{type Change}
 import crushling/text
 import gleam/int
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import slackline/block
@@ -29,8 +32,70 @@ pub fn session_title(prompt: String) -> String {
 pub const stalled =
   "_no word from the agent in 10 minutes; it may be stuck. Reply `!stop` to stop it._"
 
-pub const lost =
-  "The agent stopped unexpectedly (its sandbox may have run out of memory), so this run is over. Send a message to start it again; the workspace is kept."
+/// The note ending a run whose agent went away, saying why as best the
+/// backend could tell, with crush's last complaint quoted when there is one.
+pub fn lost(why: PostMortem) -> String {
+  let #(cause, words) = case why {
+    post_mortem.StillRunning(last_words:) -> #(
+      "The connection to the agent's sandbox dropped and couldn't be restored",
+      last_words,
+    )
+    post_mortem.Vanished -> #("The agent's sandbox was deleted", "")
+    post_mortem.OutOfMemory(limit: "") -> #(
+      "The agent's sandbox ran out of memory and was killed",
+      "",
+    )
+    post_mortem.OutOfMemory(limit:) -> #(
+      "The agent's sandbox ran out of memory (its limit is "
+        <> memory(limit)
+        <> ") and was killed",
+      "",
+    )
+    post_mortem.Exited(code: Some(137), last_words:) -> #(
+      "The agent's sandbox was killed (exit code 137)",
+      last_words,
+    )
+    post_mortem.Exited(code: Some(0), last_words:) -> #(
+      "The agent quit mid-run (exit code 0)",
+      last_words,
+    )
+    post_mortem.Exited(code: Some(code), last_words:) -> #(
+      "The agent crashed (exit code " <> int.to_string(code) <> ")",
+      last_words,
+    )
+    post_mortem.Exited(code: None, last_words:) -> #(
+      "The agent crashed",
+      last_words,
+    )
+    post_mortem.Unknown(reason:) -> #(
+      "The agent stopped for an unknown reason",
+      reason,
+    )
+  }
+  aside(
+    cause
+    <> ", so this run is over. Send a message to start it again; the workspace is kept.",
+  )
+  <> case words {
+    "" -> ""
+    words -> "\n> `" <> text.clip(words, 300) <> "`"
+  }
+}
+
+/// A docker memory size, such as `4g`, in words: "4 GB".
+fn memory(limit: String) -> String {
+  let lower = string.lowercase(string.trim(limit))
+  let unit = fn(suffix, name) {
+    case string.ends_with(lower, suffix) {
+      True -> Ok(string.drop_end(lower, 1) <> " " <> name)
+      False -> Error(Nil)
+    }
+  }
+  unit("g", "GB")
+  |> result.lazy_or(fn() { unit("m", "MB") })
+  |> result.lazy_or(fn() { unit("k", "KB") })
+  |> result.unwrap(limit)
+}
 
 pub const no_repo = "_No repository here yet._"
 
@@ -75,7 +140,7 @@ pub fn status(
   let changed = case changes {
     [] -> "nothing yet"
     _ ->
-      count(list.length(changes), "file", "files")
+      blocks.count(list.length(changes), "file", "files")
       <> ", +"
       <> int.to_string(added)
       <> " −"
@@ -85,7 +150,7 @@ pub fn status(
     "", _ -> "not pushed"
     upstream, Ok(0) -> "pushed to `" <> upstream <> "`, up to date"
     upstream, Ok(ahead) ->
-      count(ahead, "commit", "commits")
+      blocks.count(ahead, "commit", "commits")
       <> " not pushed yet (`"
       <> upstream
       <> "`)"
@@ -93,7 +158,7 @@ pub fn status(
   }
   let github = case push.uncommitted {
     0 -> github
-    n -> github <> "; " <> count(n, "file", "files") <> " not committed"
+    n -> github <> "; " <> blocks.count(n, "file", "files") <> " not committed"
   }
   let branch = case info.branch, info.base {
     "", _ -> "unknown"
@@ -101,15 +166,6 @@ pub fn status(
     branch, base -> "`" <> branch <> "` (from `" <> base <> "`)"
   }
   "*Branch* " <> branch <> "\n*Changed* " <> changed <> "\n*GitHub* " <> github
-}
-
-fn count(n: Int, one: String, many: String) -> String {
-  int.to_string(n)
-  <> " "
-  <> case n {
-    1 -> one
-    _ -> many
-  }
 }
 
 // Models ----------------------------------------------------------------------
@@ -158,7 +214,7 @@ pub fn switched(user: String, current: Current) -> String {
     "<@"
     <> user
     <> "> switched the model to "
-    <> models.summary(current)
+    <> catalog.summary(current)
     <> ". It applies from the next turn.",
   )
 }
@@ -178,10 +234,7 @@ pub fn subagent_card(
   status: String,
 ) -> #(String, List(block.Block)) {
   let line = "*" <> who <> "* · " <> scope
-  #(line, [
-    block.section(text: block.mrkdwn(line), with: []),
-    block.context(elements: [block.context_mrkdwn(status)], with: []),
-  ])
+  #(line, [blocks.text(line), blocks.context(status)])
 }
 
 pub const subagent_working = "Subagent · working"
@@ -230,10 +283,7 @@ pub fn subagent_done(
   }
   let line = "*" <> who <> "* " <> verb <> " " <> scope
   #(line, [
-    block.section(
-      text: block.mrkdwn(line <> " · <" <> link <> "|open its thread>"),
-      with: [],
-    ),
-    block.context(elements: [block.context_mrkdwn(status)], with: []),
+    blocks.text(line <> " · <" <> link <> "|open its thread>"),
+    blocks.context(status),
   ])
 }

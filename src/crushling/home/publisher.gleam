@@ -5,6 +5,7 @@
 import crushling/github
 import crushling/github/connect
 import crushling/home
+import crushling/slack/workspace.{type Workspace}
 import crushling/store.{type Store}
 import crushling/store/github as accounts
 import crushling/store/usage
@@ -23,9 +24,8 @@ import slackline/httpc
 
 pub type Setup {
   Setup(
-    client: slackline.Client,
+    workspace: Workspace,
     store: Store,
-    team: String,
     /// Whether people can connect GitHub here at all.
     github: Bool,
     /// Where the GitHub App is installed, asked when a Home shows a
@@ -101,7 +101,10 @@ fn publish(state: State, user: String, note: Option(String)) -> Nil {
   let status = dict.get(state.statuses, user) |> result.unwrap(connect.Idle)
   let view =
     home.view(draw(setup, threads, github_of(setup, user, status, note)))
-  case views.publish(user_id: user, view:) |> httpc.send(setup.client) {
+  case
+    views.publish(user_id: user, view:)
+    |> httpc.send(workspace.client(setup.workspace))
+  {
     Ok(_) -> Nil
     Error(error) ->
       sys.warn(
@@ -125,7 +128,7 @@ fn github_of(
     True, connect.ShowingCode(code:, url:, until:) ->
       home.Connecting(code:, url:, minutes: { until - sys.now() + 59 } / 60)
     True, connect.Idle ->
-      case accounts.get(setup.store, setup.team, user) {
+      case accounts.get(setup.store, workspace.team(setup.workspace), user) {
         Ok(Some(account)) ->
           home.Connected(
             login: account.login,
@@ -150,7 +153,7 @@ fn draw(
     None -> home.NotAllowed
     Some(threads) -> {
       let total = fn(since) {
-        usage.team_total(setup.store, setup.team, since)
+        usage.team_total(setup.store, workspace.team(setup.workspace), since)
         |> or_zero("the workspace's spend")
       }
       home.Home(
@@ -177,7 +180,7 @@ fn draw(
 fn permalink(setup: Setup, thread: Thread) -> Option(String) {
   case
     chat.get_permalink(channel: thread.channel, message_ts: thread.thread_ts)
-    |> httpc.send(setup.client)
+    |> httpc.send(workspace.client(setup.workspace))
   {
     Ok(found) -> Some(found.permalink)
     Error(error) -> {

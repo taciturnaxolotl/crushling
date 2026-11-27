@@ -278,9 +278,35 @@ pub fn team_totals(proxy: Proxy, team: String) -> Usage {
 }
 
 /// Save unsaved spend with the keeper now, as at shutdown.
+///
+/// A meter that is down or restarting is an error, not a crash, so the
+/// caller still exits.
 pub fn flush(proxy: Proxy) -> Result(Nil, String) {
-  meter.flush(proxy.meter)
+  let reply = process.new_subject()
+  let pid =
+    process.spawn_unlinked(fn() {
+      process.send(reply, meter.flush(proxy.meter))
+    })
+  let monitor = process.monitor(pid)
+  let answer =
+    process.new_selector()
+    |> process.select(reply)
+    |> process.select_specific_monitor(monitor, fn(down) {
+      Error("the meter is down: " <> string.inspect(down.reason))
+    })
+    |> process.selector_receive(flush_wait_ms)
+  process.demonitor_process(monitor)
+  case answer {
+    Ok(saved) -> saved
+    Error(Nil) -> {
+      process.kill(pid)
+      Error("the meter didn't answer in time")
+    }
+  }
 }
+
+/// A little over the meter's own flush timeout.
+const flush_wait_ms = 31_000
 
 /// The requests that are served, as method and path; the path is also the
 /// upstream path.
@@ -439,7 +465,7 @@ fn forward(
 ) -> Response(mist.ResponseData) {
   let hooks = hooks(proxy, key)
   let upstream = proxy.upstream
-  let relay =
+  let started =
     relay.start(
       relay.Upstream(upstream.host, upstream.port, upstream.tls),
       relay.Outgoing(
@@ -450,6 +476,7 @@ fn forward(
       req,
       hooks,
     )
+  use relay <- or_else(started, fn() { hooks.failed(502) })
   // The relay holds the request's admission until it exits.
   case meter.admit(proxy.meter, key, relay.pid(relay)) {
     Error(denial) -> {
@@ -562,5 +589,12 @@ fn float_parse(text: String) -> Result(Float, Nil) {
   case int.parse(text) {
     Ok(whole) -> Ok(int.to_float(whole))
     Error(Nil) -> float.parse(text)
+  }
+}
+
+fn or_else(found: Result(a, Nil), otherwise: fn() -> b, next: fn(a) -> b) -> b {
+  case found {
+    Ok(value) -> next(value)
+    Error(Nil) -> otherwise()
   }
 }

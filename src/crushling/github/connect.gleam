@@ -12,7 +12,7 @@
 
 import crushling/conversation
 import crushling/github.{type Tokens}
-import crushling/slack
+import crushling/slack/workspace.{type Workspace}
 import crushling/store.{type Store}
 import crushling/store/github as accounts
 import crushling/sys
@@ -22,13 +22,12 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
-import slackline
 
 pub type Setup {
   Setup(
-    client: slackline.Client,
+    /// The Slack workspace whose people connect here.
+    workspace: Workspace,
     store: Store,
-    team: String,
     github: Option(github.Config),
   )
 }
@@ -290,7 +289,7 @@ fn granted(state: State, poller: Pid, tokens: Tokens, login: String) -> State {
       let user = found.user
       let account =
         accounts.Account(
-          team: state.setup.team,
+          team: workspace.team(state.setup.workspace),
           user:,
           login:,
           tokens:,
@@ -349,8 +348,9 @@ fn disconnect(state: State, user: String, from: Option(Place)) -> State {
     Error(Nil) -> state
   }
   let setup = state.setup
-  let found = accounts.get(setup.store, setup.team, user)
-  let forgot = accounts.delete(setup.store, setup.team, user)
+  let found = accounts.get(setup.store, workspace.team(setup.workspace), user)
+  let forgot =
+    accounts.delete(setup.store, workspace.team(setup.workspace), user)
   let self = state.self
   case found, forgot {
     Error(reason), _ | _, Error(reason) -> {
@@ -403,23 +403,17 @@ fn code_note(code: github.DeviceCode) -> String {
 
 /// Answer privately where a `!github` command was given.
 fn reply(state: State, from: Option(Place), user: String, text: String) -> Nil {
+  let workspace = state.setup.workspace
   case from {
-    Some(Place(respond: Some(url), ..)) -> {
-      process.spawn_unlinked(fn() { slack.replace_ephemeral(url, text) })
-      Nil
-    }
-    Some(Place(channel:, thread_ts:, respond: None)) -> {
-      let client = state.setup.client
-      process.spawn_unlinked(fn() {
-        slack.whisper(
-          client,
-          conversation.from_slack(channel, thread_ts),
-          user,
-          text,
-        )
-      })
-      Nil
-    }
+    Some(Place(respond: Some(url), ..)) ->
+      workspace.respond_later(workspace, url, text, True)
+    Some(Place(channel:, thread_ts:, respond: None)) ->
+      workspace.whisper_later(
+        workspace,
+        conversation.from_slack(channel, thread_ts),
+        user,
+        workspace.Message(text, []),
+      )
     None -> Nil
   }
 }

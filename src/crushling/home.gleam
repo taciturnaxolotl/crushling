@@ -4,17 +4,14 @@
 //// time; pure, so the view is easy to test.
 
 import crushling/github
-import crushling/github/repo.{type Repo}
+import crushling/slack/blocks.{button_section, context, dollars, plural, text}
 import crushling/usage.{type Usage}
-import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import slackline/block
-import slackline/block/section
-import slackline/element
-import slackline/element/button
+import slackline/interaction
 import slackline/view
 
 pub const connect_action = "crushling_github_connect"
@@ -215,25 +212,28 @@ fn note_block(note: Option(String)) -> List(block.Block) {
   }
 }
 
-fn text(markdown: String) -> block.Block {
-  block.section(text: block.mrkdwn(markdown), with: [])
+/// What a press on the Home's buttons asks for.
+pub type Pressed {
+  Connect(user: String)
+  Disconnect(user: String)
 }
 
-fn context(markdown: String) -> block.Block {
-  block.context(elements: [block.context_mrkdwn(markdown)], with: [])
+pub fn actions() -> List(String) {
+  [connect_action, disconnect_action]
 }
 
-fn button_section(
-  markdown: String,
-  label: String,
-  action_id: String,
-  style: block.ButtonStyle,
-) -> block.Block {
-  block.section(text: block.mrkdwn(markdown), with: [
-    section.accessory(
-      element.button(text: label, action_id:, with: [button.style(style)]),
-    ),
-  ])
+/// A press on the Home's buttons.
+pub fn decode(
+  action: interaction.BlockAction,
+  payload: interaction.BlockActionsPayload,
+) -> Result(Pressed, Nil) {
+  case action {
+    interaction.ButtonAction(action_id:, ..) if action_id == connect_action ->
+      Ok(Connect(payload.user.id))
+    interaction.ButtonAction(action_id:, ..) if action_id == disconnect_action ->
+      Ok(Disconnect(payload.user.id))
+    _ -> Error(Nil)
+  }
 }
 
 fn strip(url: String) -> String {
@@ -241,98 +241,4 @@ fn strip(url: String) -> String {
     "https://" <> rest -> rest
     rest -> rest
   }
-}
-
-fn plural(n: Int, word: String) -> String {
-  int.to_string(n)
-  <> " "
-  <> word
-  <> case n {
-    1 -> ""
-    _ -> "s"
-  }
-}
-
-/// Dollars to the cent.
-pub fn dollars(amount: Float) -> String {
-  let cents = float.round(amount *. 100.0)
-  "$"
-  <> int.to_string(cents / 100)
-  <> "."
-  <> string.pad_start(int.to_string(cents % 100), 2, "0")
-}
-
-/// Asked in a thread when its agent couldn't read `repo` on GitHub for
-/// want of the person's connection: Connect answers there, with the code.
-/// The text, and the blocks.
-pub fn ask_connect(
-  channel: String,
-  thread_ts: String,
-  on: Option(Repo),
-) -> #(String, List(block.Block)) {
-  let what = case on {
-    Some(target) -> "`" <> repo.full(target) <> "`"
-    None -> "your private repositories"
-  }
-  let text =
-    "crushling would like private access to "
-    <> what
-    <> ". Would you like to connect crushling to your GitHub account?"
-  #(text, [
-    block.section(text: block.mrkdwn(text), with: [
-      section.accessory(
-        element.button(text: "Connect GitHub", action_id: connect_action, with: [
-          button.style(block.Primary),
-          button.value(channel <> "|" <> thread_ts),
-        ]),
-      ),
-    ]),
-  ])
-}
-
-pub const install_action = "crushling_github_install"
-
-/// Asked when the person is connected but crushling's GitHub App isn't on
-/// the account `target` belongs to: the button opens GitHub's page to
-/// add it.
-pub fn ask_install(
-  target: Repo,
-  install_url: String,
-) -> #(String, List(block.Block)) {
-  let owner = repo.owner(target)
-  let text =
-    "crushling would like access to `"
-    <> repo.full(target)
-    <> "`, but it isn't set up on *"
-    <> owner
-    <> "* yet. Would you like to add it? If you don't own "
-    <> owner
-    <> ", GitHub asks its owners to approve."
-  #(text, [
-    block.section(text: block.mrkdwn(text), with: [
-      section.accessory(
-        element.button(
-          text: "Add to " <> owner,
-          action_id: install_action,
-          with: [
-            button.style(block.Primary),
-            button.url(install_url),
-            button.value(owner),
-          ],
-        ),
-      ),
-    ]),
-  ])
-}
-
-/// Said in place of the install ask once its button is pressed.
-pub fn installing(owner: String) -> String {
-  "Once crushling is on *"
-  <> owner
-  <> "*, the agent carries on by itself. If an owner has to approve it, the agent waits up to 10 minutes."
-}
-
-/// The thread a Connect button was pressed for, from its value.
-pub fn nudged_from(value: String) -> Result(#(String, String), Nil) {
-  string.split_once(value, "|")
 }

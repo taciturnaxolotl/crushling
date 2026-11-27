@@ -2,6 +2,7 @@
 //// itself.
 
 import crushling/agents.{type Agents}
+import crushling/conversation.{type Conversation}
 import crushling/github/broker.{type Broker}
 import crushling/github/connect
 import crushling/home/publisher
@@ -18,6 +19,7 @@ import crushling/registry/incoming.{type Incoming}
 import crushling/registry/links.{type Links}
 import crushling/registry/shutdown
 import crushling/registry/tailnet
+import crushling/slack/workspace
 import crushling/store/threads
 import crushling/sys
 import crushling/thread
@@ -202,7 +204,7 @@ pub fn set_meta(
   let thread =
     threads.Thread(
       key:,
-      team: state.config.team,
+      team: team(state),
       channel: entry.channel,
       thread_ts: entry.thread_ts,
       meta:,
@@ -253,4 +255,45 @@ pub fn busy(state: State(msg)) -> Bool {
       Asleep | Starting(..) | Stopping(..) -> False
     }
   })
+}
+
+/// The workspace's id.
+pub fn team(state: State(msg)) -> String {
+  workspace.team(state.config.workspace)
+}
+
+/// Say `text` in `place`, through the workspace's outbox.
+pub fn say(state: State(msg), place: Conversation, text: String) -> Nil {
+  workspace.say_later(state.config.workspace, place, text)
+}
+
+/// Say `text` to `user` alone in `place`, through the workspace's outbox.
+pub fn tell_privately(
+  state: State(msg),
+  place: Conversation,
+  user: String,
+  text: String,
+) -> Nil {
+  workspace.whisper_later(
+    state.config.workspace,
+    place,
+    user,
+    workspace.Message(text, []),
+  )
+}
+
+/// Answer whoever sent `incoming`, privately.
+pub fn whisper(state: State(msg), incoming: Incoming, text: String) -> Nil {
+  tell_privately(state, incoming.conversation(incoming), incoming.user, text)
+}
+
+/// Say `text` where everyone who saw `incoming` sees it; see
+/// `incoming.announce_place`.
+pub fn announce(
+  state: State(msg),
+  incoming: Incoming,
+  origin: Option(#(String, String)),
+  text: String,
+) -> Nil {
+  say(state, incoming.announce_place(incoming, origin), text)
 }

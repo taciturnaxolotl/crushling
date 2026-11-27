@@ -4,6 +4,7 @@
 //// falls back to checking the session on a resync, and never handles an
 //// event twice.
 
+import crushling/agent/post_mortem
 import crushling/conversation
 import crushling/crush/client
 import crushling/crush/event
@@ -178,6 +179,7 @@ fn start(name: String) -> #(Server, Subject(thread.Message), Subject(Seen)) {
         on_connect: fn(_) { Nil },
         model: None,
         home: #("C", "1.0"),
+        post_mortem: fn() { post_mortem.Unknown("test") },
       ),
     )
   #(server, t, seen)

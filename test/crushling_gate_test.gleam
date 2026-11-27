@@ -1,5 +1,6 @@
 import crushling/people
 import crushling/registry/gate
+import crushling/slack/workspace
 import gleam/erlang/process
 import slackline
 
@@ -10,8 +11,17 @@ fn client() -> slackline.Client {
   client
 }
 
+fn ws() -> workspace.Workspace {
+  workspace.new(
+    team: "T1",
+    bot_user: "UBOT",
+    client: client(),
+    token: "xoxb-test",
+  )
+}
+
 pub fn listed_users_pass_and_others_dont_test() {
-  let g = gate.new(people.only(["U1"]), client(), "T1", fn(_, _) { Nil })
+  let g = gate.new(people.only(["U1"]), ws(), fn(_, _) { Nil })
   let assert gate.Allowed = gate.check(g, "U1", "hi")
   let assert gate.Denied = gate.check(g, "U2", "hi")
 }
@@ -19,7 +29,7 @@ pub fn listed_users_pass_and_others_dont_test() {
 pub fn messages_wait_for_a_lookup_and_come_back_in_order_test() {
   let answers = process.new_subject()
   let g =
-    gate.new(people.parse("*"), client(), "T1", fn(answer, ms) {
+    gate.new(people.parse("*"), ws(), fn(answer, ms) {
       process.send(answers, #(answer, ms))
     })
   let assert gate.Waiting(g) = gate.check(g, "U9", "first")

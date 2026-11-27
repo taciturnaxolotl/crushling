@@ -78,6 +78,7 @@ pub fn every_error_at_once_test() {
   let assert Error(reasons) =
     config.parse(
       env([
+        #("HOME", "/home/op"),
         #("CRUSHLING_MODE", "careful"),
         #("CRUSHLING_LAUNCHER", "podman"),
         #("CRUSHLING_IDLE_MINUTES", "soon"),
@@ -211,4 +212,33 @@ pub fn optional_sections_test() {
       ]),
     )
   let assert True = string.starts_with(reason, "CRUSHLING_GITHUB_PRIVATE_KEY")
+}
+
+pub fn empty_github_settings_are_unset_test() {
+  let assert Ok(c) =
+    config.parse(
+      with([
+        #("CRUSHLING_GITHUB_CLIENT_ID", ""),
+        #("CRUSHLING_GITHUB_PRIVATE_KEY", ""),
+      ]),
+    )
+  let assert None = c.github
+  let assert Ok(c) =
+    config.parse(
+      with([
+        #("CRUSHLING_GITHUB_CLIENT_ID", "Iv1"),
+        #("CRUSHLING_GITHUB_CLIENT_SECRET", ""),
+        #("CRUSHLING_GITHUB_PRIVATE_KEY", ""),
+      ]),
+    )
+  let assert Some(config.GitHub("Iv1", None, None)) = c.github
+}
+
+pub fn root_tilde_test() {
+  let assert Ok(c) = config.parse(with([#("CRUSHLING_ROOT", "~")]))
+  let assert "/home/op" = c.root
+  let no_home = list.filter(minimal, fn(pair) { pair.0 != "HOME" })
+  let assert Error(errors) =
+    config.parse(env([#("CRUSHLING_ROOT", "~/x"), ..no_home]))
+  let assert True = list.any(errors, string.contains(_, "HOME is not set"))
 }

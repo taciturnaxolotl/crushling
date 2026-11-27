@@ -7,17 +7,20 @@ import crushling/github
 import crushling/github/http
 import crushling/github/repo.{type Repo}
 import crushling/github/route
+import crushling/slack/blocks
 import crushling/snapshot
 import gleam/dynamic/decode
 import gleam/http as gleam_http
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, Some}
 import gleam/result
 import gleam/string
 import slackline/block
 import slackline/element
 import slackline/element/button
+import slackline/interaction
 
 /// A PR to open, as the card shows it.
 pub type Proposal {
@@ -168,18 +171,40 @@ pub fn actions() -> List(String) {
   [open_action, draft_action, dismiss_action]
 }
 
-fn summary(p: Proposal) -> String {
-  let count = fn(n, one, many) {
-    int.to_string(n)
-    <> " "
-    <> case n {
-      1 -> one
-      _ -> many
-    }
+/// A press on a PR card: who, the card, what they chose (`open`, `draft`
+/// or `dismiss`), and where to answer them privately.
+pub type Pressed {
+  Pressed(
+    user: String,
+    card_ts: String,
+    choice: String,
+    respond: Option(String),
+  )
+}
+
+/// A press on a PR card's buttons.
+pub fn decode(
+  action: interaction.BlockAction,
+  payload: interaction.BlockActionsPayload,
+) -> Result(Pressed, Nil) {
+  case action, payload.container {
+    interaction.ButtonAction(value: Some(choice), ..),
+      Some(interaction.MessageContainer(message_ts: Some(card_ts), ..))
+    ->
+      Ok(Pressed(
+        user: payload.user.id,
+        card_ts:,
+        choice:,
+        respond: payload.response_url,
+      ))
+    _, _ -> Error(Nil)
   }
-  count(p.commits, "commit", "commits")
+}
+
+fn summary(p: Proposal) -> String {
+  blocks.count(p.commits, "commit", "commits")
   <> " · "
-  <> count(p.files, "file", "files")
+  <> blocks.count(p.files, "file", "files")
   <> ", +"
   <> int.to_string(p.added)
   <> " −"
@@ -201,13 +226,8 @@ fn heading(p: Proposal) -> String {
 pub fn card(p: Proposal) -> #(String, List(block.Block)) {
   let text = "Pull request ready: " <> p.title
   #(text, [
-    block.markdown(heading(p), []),
-    block.context(
-      elements: [
-        block.context_mrkdwn(summary(p) <> " · opens as whoever presses"),
-      ],
-      with: [],
-    ),
+    blocks.markdown(heading(p)),
+    blocks.context(summary(p) <> " · opens as whoever presses"),
     block.actions(
       elements: [
         element.button(text: "Open PR", action_id: open_action, with: [
@@ -228,10 +248,7 @@ pub fn card(p: Proposal) -> #(String, List(block.Block)) {
 
 /// The card once something happened to it: `outcome` says what.
 pub fn settled(p: Proposal, outcome: String) -> #(String, List(block.Block)) {
-  #(p.title, [
-    block.markdown(heading(p), []),
-    block.context(elements: [block.context_mrkdwn(outcome)], with: []),
-  ])
+  #(p.title, [blocks.markdown(heading(p)), blocks.context(outcome)])
 }
 
 // Opening it ----------------------------------------------------------------

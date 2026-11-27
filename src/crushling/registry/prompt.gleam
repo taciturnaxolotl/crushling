@@ -3,55 +3,58 @@
 //// kept on the bridge for the agent to fetch, with small images and text
 //// sent along.
 
+import crushling/attachments.{type Keep}
 import crushling/conversation
 import crushling/registry/incoming.{type Incoming}
-import crushling/slack
+import crushling/slack/text
+import crushling/slack/workspace.{type Workspace}
+import crushling/sys
 import crushling/thread
 import gleam/list
 import gleam/string
-import slackline
 
 /// How many earlier messages a prompt carries at most.
 const catch_up_limit = 10
 
-/// What building a prompt needs: the Slack client and bot token, the bot's
-/// user id, and where the thread's attachments are kept.
-pub type Source {
-  Source(
-    client: slackline.Client,
-    token: String,
-    bot_user: String,
-    keep: slack.Keep,
-  )
-}
-
-/// The prompt for `message`. `cursor` is the last message the agent read,
-/// and `catch_up` the thread to catch up on, or "" for a whole code channel.
+/// The prompt for `message`, keeping its files under `keep`. `cursor` is
+/// the last message the agent read, and `catch_up` the thread to catch up
+/// on, or "" for a whole code channel.
 pub fn build(
-  source: Source,
+  workspace: Workspace,
+  keep: Keep,
   message: Incoming,
   cursor: String,
   catch_up: String,
 ) -> thread.Message {
-  let request = slack.prompt_text(message.text, source.bot_user)
+  let request = text.prompt_text(message.text, workspace.bot_user(workspace))
   let first = catch_up != "" && message.ts == message.thread_ts && cursor == ""
-  let slack.CatchUp(text: context, earlier:) = case first {
+  let text.CatchUp(text: context, earlier:) = case first {
     // The thread's first message: nothing came before.
-    True -> slack.CatchUp("", [])
+    True -> text.nothing
     False ->
-      slack.catch_up(
-        source.client,
-        conversation.from_slack(message.channel, catch_up),
-        cursor,
-        message.ts,
-        source.bot_user,
-        catch_up_limit,
-      )
+      case
+        workspace.catch_up(
+          workspace,
+          conversation.from_slack(message.channel, catch_up),
+          cursor,
+          message.ts,
+          catch_up_limit,
+        )
+      {
+        Ok(caught_up) -> caught_up
+        // The prompt still goes, without what came before.
+        Error(reason) -> {
+          sys.warn(
+            "crushling: catching up in " <> message.channel <> ": " <> reason,
+          )
+          text.nothing
+        }
+      }
   }
   let #(earlier_files, earlier_seen) =
-    slack.keep_earlier_attachments(source.token, earlier, source.keep)
+    workspace.keep_earlier(workspace, earlier, keep)
   let #(files, seen) =
-    slack.keep_attachments(source.token, message.files, source.keep)
+    workspace.keep_attachments(workspace, message.files, keep)
   let from = case incoming.is_dm(message.channel) {
     True -> ""
     False -> "From <@" <> message.user <> ">:\n"

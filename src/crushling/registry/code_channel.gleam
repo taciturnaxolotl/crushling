@@ -1,23 +1,20 @@
 //// Threads that moved their work to a code channel: opening one, linking
 //// it to its thread, and archiving it once the work is done.
 
-import crushling/conversation.{Conversation}
 import crushling/meta.{Link, Meta}
 import crushling/registry/core.{
-  type State, Deferred, State, apply_tailnet, set_meta,
+  type State, Deferred, State, announce, apply_tailnet, set_meta, whisper,
 }
 import crushling/registry/entry.{type Entry, Entry, is_quiet, tailnet_view}
 import crushling/registry/incoming.{type Incoming}
 import crushling/registry/lifecycle.{stop_agent}
 import crushling/registry/links
-import crushling/registry/say.{announce, whisper}
 import crushling/registry/tailnet
 import crushling/registry/text
-import crushling/slack
+import crushling/slack/workspace
 import crushling/sys
 import crushling/venue
 import gleam/dict
-import gleam/erlang/process
 import gleam/option.{type Option, None, Some}
 import gleam/set
 
@@ -94,18 +91,7 @@ pub fn archive(
   note: Option(String),
 ) -> State(msg) {
   sys.info("crushling: archiving code channel " <> channel)
-  let client = state.config.client
-  process.spawn_unlinked(fn() {
-    case note {
-      Some(note) -> slack.say(client, Conversation(channel, None), note)
-      None -> Nil
-    }
-    case slack.archive_code_channel(client, channel, summary_ts) {
-      Ok(Nil) -> Nil
-      Error(reason) ->
-        sys.warn("crushling: archiving " <> channel <> " failed: " <> reason)
-    }
-  })
+  workspace.archive_later(state.config.workspace, channel, note, summary_ts)
   case entry {
     Some(entry) ->
       tailnet.end(
@@ -134,17 +120,17 @@ pub fn wrap_up(
 ) -> State(msg) {
   case entry.meta.venue, is_quiet(entry) {
     venue.CodeChannel(channel:, repo:), True -> {
-      announce(state.config, incoming, origin, text.wrapping_up)
+      announce(state, incoming, origin, text.wrapping_up)
       // Its sink posts to the old channel; the next message starts anew.
       archive(state, key, Some(entry), channel, repo, entry.summary_ts, None)
       |> stop_agent(key)
     }
     venue.CodeChannel(..), False -> {
-      whisper(state.config, incoming, text.still_working)
+      whisper(state, incoming, text.still_working)
       state
     }
     _, _ -> {
-      whisper(state.config, incoming, text.no_code_channel)
+      whisper(state, incoming, text.no_code_channel)
       state
     }
   }

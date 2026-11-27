@@ -5,21 +5,16 @@ import crushling/github/broker
 import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
 import crushling/registry/tailnet
+import crushling/slack/workspace.{type Workspace}
 import crushling/store.{type Store}
 import gleam/option.{type Option}
 import gleam/set.{type Set}
-import slackline
 
 pub type Config {
   Config(
     launcher: Launcher,
-    client: slackline.Client,
-    /// The bot token, for downloading attachments.
-    token: String,
-    /// The bot's own user id, so mentions of it can be stripped.
-    bot_user: String,
-    /// The workspace's id.
-    team: String,
+    /// The Slack workspace it serves.
+    workspace: Workspace,
     /// Who may drive agents: listed ids, and maybe every workspace member.
     allowed: People,
     /// Who may approve tailnet access; when empty, the ids allowed (nobody when that's everyone).

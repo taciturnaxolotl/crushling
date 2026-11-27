@@ -8,13 +8,14 @@ import crushling/launcher
 import crushling/meta
 import crushling/people
 import crushling/registry/shutdown
-import crushling/slack_tools
-import crushling/socket
+import crushling/slack/router
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/schema
 import crushling/store/teams
 import crushling/store/threads
 import crushling/sys
+import crushling/tools
 import gleam/bytes_tree
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
@@ -22,6 +23,7 @@ import gleam/http/response
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/otp/static_supervisor as supervisor
 import gleam/result
 import gleam/set
 import gleam/string
@@ -175,7 +177,7 @@ pub fn events_reach_only_their_own_workspace_test() {
   let assert Ok(teams) = instance.start(shared(s, dir, launches, api, None))
   let assert Ok([]) = instance.start_stored(teams, s)
   let assert 2 = list.length(instance.all(teams))
-  let router = socket.router(app.unverified(), instance.finder(teams))
+  let router = router.router(app.unverified(), instance.finder(teams))
 
   deliver(router, mention_frame("TA", "e1"))
   let assert Ok("TA-C1-10.1") = process.receive(launches, 2000)
@@ -247,7 +249,7 @@ pub fn self_host_seeds_its_workspace_test() {
   let assert Ok(teams) =
     instance.start(shared(s, dir, launches, api, Some(env)))
   let assert Ok(started) = instance.start_team(teams, seeded)
-  let assert "TA" = started.team
+  let assert "TA" = workspace.team(started.workspace)
   // Starting the stored teams doesn't start it twice.
   let assert Ok([]) = instance.start_stored(teams, s)
   let assert [_] = instance.all(teams)
@@ -265,11 +267,11 @@ pub fn tools_reach_the_thread_s_own_workspace_test() {
   let assert Ok(teams) =
     instance.start(shared(s, dir, process.new_subject(), "http://x/api", None))
   let assert Ok([]) = instance.start_stored(teams, s)
-  let context = instance.tools_context(teams, s)
-  let assert Ok(slack_tools.Workspace(bot_user: "UBOTTA", ..)) =
-    context.workspace("TA-C1-1.0")
-  let assert Ok(slack_tools.Workspace(bot_user: "UBOTTB", ..)) =
-    context.workspace("TB-C1-1.0")
+  let context = instance.tools_context(teams, s, tools.Features(tailnet: False))
+  let assert Ok(a) = context.workspace("TA-C1-1.0")
+  let assert "UBOTTA" = workspace.bot_user(a)
+  let assert Ok(b) = context.workspace("TB-C1-1.0")
+  let assert "UBOTTB" = workspace.bot_user(b)
   let assert Error(_) = context.workspace("TZ-C1-1.0")
   // No agent is up, so there is no thread to use.
   let assert None = context.lookup("TA-C1-1.0")
@@ -333,4 +335,41 @@ pub fn old_threads_move_only_for_the_self_host_workspace_test() {
 fn owner(fake: launcher.Launcher) -> agents.Agents {
   let assert Ok(owner) = agents.start(fake)
   owner
+}
+
+/// The teams actor restarting takes its registries with it, so it never
+/// starts a second registry beside one it forgot.
+pub fn a_teams_restart_never_duplicates_a_registry_test() {
+  let dir = tmp()
+  let s = open_store(dir)
+  let assert Ok(Nil) = teams.put_team(s, team("TA", "xoxb-a"))
+  let name = process.new_name("instance_test_teams")
+  let assert Ok(_) =
+    supervisor.new(supervisor.OneForOne)
+    |> supervisor.add(instance.supervised(
+      shared(s, dir, process.new_subject(), "http://x/api", None),
+      name,
+    ))
+    |> supervisor.start
+  let teams = instance.named(name)
+  let assert Ok([]) = instance.started(teams, 5000)
+  let assert Some(a) = instance.find(teams, "TA")
+  let assert Ok(a_pid) = process.subject_owner(a.registry)
+  let assert Ok(teams_pid) = process.named(name)
+  process.send_abnormal_exit(teams_pid, "boom")
+  process.sleep(200)
+  // The workspaces are started again, by the new teams actor.
+  let assert Ok([]) = instance.started(teams, 5000)
+  let assert Some(again) = instance.find(teams, "TA")
+  let assert Ok(again_pid) = process.subject_owner(again.registry)
+  let assert False = process.is_alive(a_pid)
+  let assert True = again_pid != a_pid
+  let assert [_] = instance.all(teams)
+}
+
+/// Shutdown with the workspaces unreachable still returns, for the bridge
+/// to save spend and exit.
+pub fn shutdown_survives_unreachable_workspaces_test() {
+  let teams = instance.named(process.new_name("instance_test_nobody"))
+  let assert shutdown.Incomplete(_) = instance.shutdown(teams, 100)
 }

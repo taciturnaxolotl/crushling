@@ -2,6 +2,7 @@ import crushling/agent/spec
 import crushling/provider
 import crushling/sandbox
 import crushling/sys
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
@@ -151,6 +152,21 @@ pub fn parse_inspect_test() {
       "{\"State\":{\"Running\":false},\"Config\":{\"Labels\":null}}",
     )
   let assert sandbox.Missing = sandbox.parse_inspect("")
+}
+
+// What a real gVisor sandbox reported, killed with a 2 GB limit.
+pub fn parse_remains_test() {
+  let assert Ok(sandbox.Stopped(oom: False, code: 137)) =
+    sandbox.parse_remains(
+      "{\"State\":{\"Status\":\"exited\",\"Running\":false,\"OOMKilled\":false,\"ExitCode\":137,\"Error\":\"\"}}",
+    )
+  let assert Ok(sandbox.Stopped(oom: True, code: 137)) =
+    sandbox.parse_remains(
+      "{\"State\":{\"Running\":false,\"OOMKilled\":true,\"ExitCode\":137}}",
+    )
+  let assert Ok(sandbox.Running) =
+    sandbox.parse_remains("{\"State\":{\"Running\":true}}")
+  let assert Error(Nil) = sandbox.parse_remains("{}")
 }
 
 pub fn an_unreachable_engine_is_an_error_test() {
@@ -323,4 +339,36 @@ fn real_docker() -> Nil {
   let assert Ok(Nil) = sandbox.remove(p, key)
   let assert Ok(Nil) = sandbox.stop(p, key)
   Nil
+}
+
+/// Containers carry their bridge's root id; ones made before that are
+/// still known by their workspace mount, so none is orphaned.
+pub fn only_this_bridge_s_containers_are_its_own_test() {
+  let p = policy()
+  let text = body(p, "k")
+  let assert True =
+    field(text, ["Labels", sandbox.root_label], decode.string)
+    == sandbox.root_id(p)
+  let other = sandbox.Policy(..p, root: "/srv/other")
+  let assert False = sandbox.root_id(p) == sandbox.root_id(other)
+  let labelled = fn(id) { dict.from_list([#(sandbox.root_label, id)]) }
+  let assert True = sandbox.owned(p, labelled(sandbox.root_id(p)), [])
+  let assert False = sandbox.owned(p, labelled(sandbox.root_id(other)), [])
+  let mine = ["/storage/crushling/workspaces/k/work"]
+  let assert True = sandbox.owned(p, dict.new(), mine)
+  let assert False = sandbox.owned(p, dict.new(), ["/srv/other/k/work"])
+  let assert False = sandbox.owned(p, dict.new(), [])
+  // The label isn't part of the fingerprint, so it recreates nothing.
+  let assert True = sandbox.fingerprint(p) == sandbox.fingerprint(policy())
+}
+
+pub fn image_refs_split_at_the_tag_test() {
+  let assert #("crushling-sandbox", "latest") =
+    sandbox.image_ref("crushling-sandbox:latest")
+  let assert #("crushling-sandbox", "latest") =
+    sandbox.image_ref("crushling-sandbox")
+  let assert #("ghcr.io/a/b", "v2") = sandbox.image_ref("ghcr.io/a/b:v2")
+  let assert #("reg:5000/a/b", "latest") = sandbox.image_ref("reg:5000/a/b")
+  let assert #("reg:5000/a/b", "1.0") = sandbox.image_ref("reg:5000/a/b:1.0")
+  let assert #("a/b", "sha256:abc") = sandbox.image_ref("a/b@sha256:abc")
 }

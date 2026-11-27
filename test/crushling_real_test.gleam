@@ -20,6 +20,7 @@
 //// history), never wording, beyond asking the model to echo a marker word.
 
 import crushling/agent/backend
+import crushling/agent/post_mortem
 import crushling/agent/spec
 import crushling/conversation
 import crushling/crush/client
@@ -37,11 +38,12 @@ import crushling/registry/shutdown
 import crushling/render
 import crushling/sandbox_http
 import crushling/sink
-import crushling/slack_tools
+import crushling/slack/workspace
 import crushling/store
 import crushling/store/schema
 import crushling/sys
 import crushling/thread
+import crushling/tools
 import crushling/tunnel
 import crushling/usage as spend
 import crushling/venue
@@ -363,6 +365,7 @@ fn start_observed(
         on_connect:,
         model: None,
         home: #("C", "1.0"),
+        post_mortem: fn() { post_mortem.Unknown("test") },
       ),
     )
   #(t, calls)
@@ -598,10 +601,12 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
   let assert Ok(r) =
     registry.start(registry_config.Config(
       launcher: watched,
-      client:,
-      token: "xoxb-test",
-      bot_user: "UBOT",
-      team: "T1",
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: real_store(root),
@@ -698,10 +703,12 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
   let assert Ok(r) =
     registry.start(registry_config.Config(
       launcher: watched,
-      client:,
-      token: "xoxb-test",
-      bot_user: "UBOT",
-      team: "T1",
+      workspace: workspace.new(
+        team: "T1",
+        bot_user: "UBOT",
+        client:,
+        token: "xoxb-test",
+      ),
       allowed: people.only(["U1"]),
       admins: set.new(),
       store: real_store(root),
@@ -813,6 +820,7 @@ fn subagents_get_their_own_threads(wiring: Wiring) -> Nil {
       on_connect: fn(_) { Nil },
       model: None,
       home: #("C", "1.0"),
+      post_mortem: fn() { post_mortem.Unknown("test") },
     ))
   process.send(
     t,
@@ -1005,6 +1013,7 @@ fn reading_stays_in_the_thread(wiring: Wiring) -> Nil {
         on_connect: fn(_) { Nil },
         model: None,
         home: #("C", "1.0"),
+        post_mortem: fn() { post_mortem.Unknown("test") },
       ),
     )
   process.send(
@@ -1049,6 +1058,7 @@ fn clone_and_edit(env: Env, opens: Bool) -> List(CodeCall) {
         on_connect: fn(_) { Nil },
         model: None,
         home: #("C", "1.0"),
+        post_mortem: fn() { post_mortem.Unknown("test") },
       ),
     )
   process.send(
@@ -1144,7 +1154,7 @@ fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
       proxy.route(wiring.proxy),
       mcp.route(
         secret,
-        slack_tools.tools(tailnet: False),
+        tools.tools(tools.Features(tailnet: False)),
         fn(key, name, arguments) {
           process.send(calls, #(key, name, arguments))
           Ok("posted")

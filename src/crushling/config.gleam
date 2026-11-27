@@ -299,12 +299,16 @@ fn mode(getenv: Getenv) -> Parsed(client.PermissionMode) {
 }
 
 fn root(getenv: Getenv) -> Parsed(String) {
-  let root = case
+  let raw =
     setting(getenv, "CRUSHLING_ROOT", "~/.local/state/crushling/threads")
-  {
-    "~/" <> rest -> setting(getenv, "HOME", "") <> "/" <> rest
-    root -> root
-  }
+  let home = filled(getenv, "HOME")
+  use root <- result.try(case raw, home {
+    "~", Some(home) -> Ok(home)
+    "~/" <> rest, Some(home) -> Ok(home <> "/" <> rest)
+    "~" <> _, None ->
+      Error(["CRUSHLING_ROOT starts with ~ but HOME is not set"])
+    root, _ -> Ok(root)
+  })
   tunnel.check_root(root)
   |> result.replace(root)
   |> result.map_error(fn(reason) { ["CRUSHLING_ROOT: " <> reason] })
@@ -439,15 +443,13 @@ fn proxy_settings(getenv: Getenv) -> Parsed(Proxy) {
 /// The GitHub App people connect their accounts through: on when
 /// `CRUSHLING_GITHUB_CLIENT_ID` is set.
 fn github(getenv: Getenv) -> Parsed(Option(GitHub)) {
-  case getenv("CRUSHLING_GITHUB_CLIENT_ID") {
-    Error(Nil) -> Ok(None)
-    Ok(client_id) -> {
-      let client_secret =
-        option.from_result(getenv("CRUSHLING_GITHUB_CLIENT_SECRET"))
-      case getenv("CRUSHLING_GITHUB_PRIVATE_KEY") {
-        Error(Nil) ->
-          Ok(Some(GitHub(client_id:, client_secret:, private_key: None)))
-        Ok(pem) ->
+  case filled(getenv, "CRUSHLING_GITHUB_CLIENT_ID") {
+    None -> Ok(None)
+    Some(client_id) -> {
+      let client_secret = filled(getenv, "CRUSHLING_GITHUB_CLIENT_SECRET")
+      case filled(getenv, "CRUSHLING_GITHUB_PRIVATE_KEY") {
+        None -> Ok(Some(GitHub(client_id:, client_secret:, private_key: None)))
+        Some(pem) ->
           case github_app.parse_key(pem) {
             Ok(key) ->
               Ok(
@@ -460,6 +462,14 @@ fn github(getenv: Getenv) -> Parsed(Option(GitHub)) {
           }
       }
     }
+  }
+}
+
+/// A setting's value, with set-but-empty counted as unset as env files often leave them.
+fn filled(getenv: Getenv, name: String) -> Option(String) {
+  case getenv(name) {
+    Ok("") | Error(Nil) -> None
+    Ok(value) -> Some(value)
   }
 }
 

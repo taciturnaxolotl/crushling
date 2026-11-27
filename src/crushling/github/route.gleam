@@ -722,9 +722,13 @@ fn attempt(
   hooks: relay.Hooks(Nil),
   deny: fn(Int) -> Option(Need),
 ) -> relay.Attempt(Need) {
-  let relay =
+  case
     relay.start(upstream, relay.Outgoing(method, path, headers), req, hooks)
-  relay.attempt(relay, req, option.unwrap(body, <<>>), hooks, deny)
+  {
+    Ok(relay) ->
+      relay.attempt(relay, req, option.unwrap(body, <<>>), hooks, deny)
+    Error(Nil) -> relay.Answered(hooks.failed(502))
+  }
 }
 
 fn hooks(
