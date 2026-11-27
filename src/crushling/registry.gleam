@@ -50,6 +50,7 @@ import crushling/thread
 import crushling/venue
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
+import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -1008,6 +1009,17 @@ fn act(state: State, route: Route, command: slack.Command) -> State {
 /// Queue a prompt, and wake or start the thread's agent.
 fn queue(state: State, route: Route, known: Option(Entry)) -> State {
   let incoming = route.incoming
+  // "Working…" now, not once the agent is up and the prompt is ready.
+  let client = state.config.client
+  let #(channel, thread_ts) = case known {
+    Some(Entry(meta: Meta(venue: venue.CodeChannel(channel:, ..), ..), ..)) -> #(
+      channel,
+      None,
+    )
+    Some(entry) -> #(entry.channel, Some(entry.thread_ts))
+    None -> #(incoming.channel, Some(incoming.thread_ts))
+  }
+  process.spawn_unlinked(fn() { slack.mark_working(client, channel, thread_ts) })
   case known {
     Some(entry) -> {
       let entry =
@@ -1680,6 +1692,15 @@ fn prepared(
 ) -> State {
   case dict.get(state.threads, key) {
     Ok(Entry(agent: Live(thread:, ..), ..) as entry) -> {
+      // How long the person waited for their message to reach the agent.
+      let waited = sys.system_ms() - float.round(slack.ts_value(ts) *. 1000.0)
+      sys.info(
+        "crushling: "
+        <> key
+        <> " prompt ready "
+        <> int.to_string(waited)
+        <> "ms after it was sent",
+      )
       process.send(thread, prompt)
       let entry =
         Entry(..entry, in_flight: entry.in_flight + 1, preparing: False)

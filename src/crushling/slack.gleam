@@ -444,6 +444,16 @@ pub fn archive_code_channel(
 /// Set an agent session's status: a thread's, or a whole code channel's
 /// when there is no thread. Best effort: it is decoration, and Slack times
 /// a working session out after an hour regardless.
+/// Show the agent session in `channel` (and thread, if any) as working at
+/// once, before its agent is even up: the thread's sink does the rest.
+pub fn mark_working(
+  client: slackline.Client,
+  channel: String,
+  thread_ts: Option(String),
+) -> Nil {
+  session_status(client, channel, thread_ts, agents.Processing)
+}
+
 fn session_status(
   client: slackline.Client,
   channel: String,

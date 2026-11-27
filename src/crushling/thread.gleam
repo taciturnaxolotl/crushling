@@ -164,7 +164,13 @@ pub type Message {
 }
 
 type Queued {
-  Queued(text: String, attachments: List(client.Attachment), from: String)
+  Queued(
+    text: String,
+    attachments: List(client.Attachment),
+    from: String,
+    /// When it reached the thread, in monotonic ms.
+    at_ms: Int,
+  )
 }
 
 type Active {
@@ -331,7 +337,9 @@ fn step(state: State, message: Message) -> State {
     Prompt(text, attachments, from) ->
       State(
         ..state,
-        waiting: list.append(state.waiting, [Queued(text, attachments, from)]),
+        waiting: list.append(state.waiting, [
+          Queued(text, attachments, from, sys.monotonic_ms()),
+        ]),
       )
       |> send_next
     Where(reply) -> {
@@ -596,6 +604,13 @@ fn send_prompt(state: State, connection: Connection, next: Queued) -> State {
     )
   case sent {
     Ok(Nil) -> {
+      sys.info(
+        "crushling: "
+        <> state.config.title
+        <> ": prompt sent "
+        <> int.to_string(sys.monotonic_ms() - next.at_ms)
+        <> "ms after it reached the thread",
+      )
       state.sink.working(True)
       case state.titled {
         True -> Nil
