@@ -6,9 +6,12 @@ import crushling/launcher
 import crushling/meta
 import crushling/people
 import crushling/registry
+import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
 import crushling/registry/legacy
+import crushling/registry/shutdown
 import crushling/registry/tailnet
+import crushling/registry/tailnet/card as tailnet_card
 import crushling/slack
 import crushling/socket
 import crushling/store
@@ -203,7 +206,7 @@ fn start_registry_as(
     slackline.new("xoxb-test")
     |> slackline.with_base_url("http://127.0.0.1:1/api")
   let assert Ok(r) =
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: fake,
       client:,
       token: "xoxb-test",
@@ -283,7 +286,7 @@ pub fn shutdown_with_nothing_running_stops_at_once_test() {
   let r = start_registry(launches)
   let done = process.new_subject()
   process.send(r, registry.Shutdown(60_000, done))
-  let assert Ok(registry.Clean) = process.receive(done, 1000)
+  let assert Ok(shutdown.Clean) = process.receive(done, 1000)
 }
 
 pub fn native_stop_reaches_the_registry_test() {
@@ -547,7 +550,7 @@ pub fn messages_wait_while_a_code_channel_opens_test() {
   let launches = process.new_subject()
   let r = start_registry(launches)
   let opener = k("C3", "1.0")
-  process.send(r, registry.FromThread(opener, thread.Opening))
+  process.send(r, registry.notice(opener, thread.Opening))
   // Possibly the new channel's seed: held until the thread says where it
   // went.
   process.send(
@@ -559,7 +562,7 @@ pub fn messages_wait_while_a_code_channel_opens_test() {
   let assert Error(Nil) = process.receive(launches, 400)
   process.send(
     r,
-    registry.FromThread(opener, thread.Moved(venue.ThreadOnly("./demo"), "")),
+    registry.notice(opener, thread.Moved(venue.ThreadOnly("./demo"), "")),
   )
   let assert Ok(Launched(key)) = process.receive(launches, 1000)
   let assert True = key == k("CNEW", "5.0")
@@ -609,9 +612,9 @@ pub fn tailscale_basics_test() {
   let assert True = string.contains(body, "\"ephemeral\":true")
   let assert True = string.contains(body, "\"reusable\":false")
   let assert True = string.contains(body, "\"tags\":[\"tag:crushling\"]")
-  let assert "58 minutes" = tailnet.remaining(3_500_000)
-  let assert "1 hour" = tailnet.remaining(3_700_000)
-  let assert "8 hours" = tailnet.remaining(8 * 3_600_000 - 10_000)
+  let assert "58 minutes" = tailnet_card.remaining(3_500_000)
+  let assert "1 hour" = tailnet_card.remaining(3_700_000)
+  let assert "8 hours" = tailnet_card.remaining(8 * 3_600_000 - 10_000)
 }
 
 pub fn tailnet_buttons_round_trip_test() {

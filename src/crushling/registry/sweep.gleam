@@ -4,13 +4,19 @@
 //// code channel or not, loses its sandbox and workspace: whatever matters
 //// is on GitHub by then, and its next message starts afresh.
 
+import crushling/registry/code_channel
+import crushling/registry/core.{type State, known_entry}
+import crushling/registry/entry.{Asleep, Entry}
 import crushling/store
+import crushling/sys
 import crushling/venue
+import gleam/dict
+import gleam/erlang/process
 import gleam/list
+import gleam/option.{Some}
 
 pub type Action {
-  /// Archive code channel `channel` of thread `key`, whose repository is in
-  /// workspace directory `repo`.
+  /// Archive thread `key`'s code `channel`; its repository is in workspace directory `repo`.
   Archive(key: String, channel: String, repo: String)
   /// Remove the thread's sandbox and workspace.
   Forget(key: String)
@@ -24,10 +30,7 @@ pub const forget_after_s = 2_592_000
 
 pub const every_ms = 3_600_000
 
-/// What to do with threads quiet since before `now - archive_after_s`,
-/// each with when it last saw work (Unix seconds). `busy` threads (with an
-/// agent up) are left alone; `exists` says whether a workspace is left to
-/// remove.
+/// Threads quiet since `now - archive_after_s`, with when they last saw work; `busy` ones are left alone.
 pub fn plan(
   threads: List(#(store.Thread, Int)),
   now: Int,
@@ -59,3 +62,51 @@ pub fn plan(
 
 pub const archive_note =
   "_Quiet for a week, so this channel is archived. Mention me in the original thread to pick the work up again._"
+
+/// Carry out the plan: Slack and the disk are touched off the registry.
+pub fn run(state: State(msg)) -> State(msg) {
+  let config = state.config
+  let now = sys.system_ms() / 1000
+  case store.quiet_threads(config.store, config.team, now - archive_after_s) {
+    Error(reason) -> {
+      sys.warn("crushling: sweeping quiet threads: " <> reason)
+      state
+    }
+    Ok(threads) -> {
+      let busy = fn(key) {
+        case dict.get(state.threads, key) {
+          Ok(Entry(agent: Asleep, ..)) | Error(Nil) -> False
+          Ok(_) -> True
+        }
+      }
+      plan(threads, now, busy, config.launcher.exists)
+      |> list.fold(state, fn(state, action) {
+        case action {
+          Archive(key:, channel:, repo:) ->
+            known_entry(state, key)
+            |> code_channel.archive(
+              state,
+              key,
+              _,
+              channel,
+              repo,
+              "",
+              Some(archive_note),
+            )
+          Forget(key) -> {
+            sys.info("crushling: clearing out " <> key <> ", quiet for a month")
+            let forget = config.launcher.forget
+            process.spawn_unlinked(fn() {
+              case forget(key) {
+                Ok(Nil) -> Nil
+                Error(reason) ->
+                  sys.warn("crushling: clearing out " <> key <> ": " <> reason)
+              }
+            })
+            state
+          }
+        }
+      })
+    }
+  }
+}

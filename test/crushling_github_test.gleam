@@ -13,6 +13,7 @@ import crushling/launcher
 import crushling/people
 import crushling/proxy/meter
 import crushling/registry
+import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
 import crushling/store
 import crushling/store/github as accounts
@@ -789,7 +790,7 @@ fn start_registry(
   let assert Ok(client) =
     slackline.new("xoxb-test") |> slackline.with_base_url(api)
   let assert Ok(r) =
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: launcher.Launcher(
         launch: fn(_) { Error("no agents in this test") },
         stop: fn(_) { Ok(Nil) },

@@ -29,7 +29,9 @@ import crushling/people
 import crushling/provider
 import crushling/proxy
 import crushling/registry
+import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
+import crushling/registry/shutdown
 import crushling/render
 import crushling/sandbox_http
 import crushling/sink
@@ -568,7 +570,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
     slackline.new("xoxb-test")
     |> slackline.with_base_url("http://127.0.0.1:1/api")
   let assert Ok(r) =
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: watched,
       client:,
       token: "xoxb-test",
@@ -668,7 +670,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
     slackline.new("xoxb-test")
     |> slackline.with_base_url("http://127.0.0.1:1/api")
   let assert Ok(r) =
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: watched,
       client:,
       token: "xoxb-test",
@@ -709,7 +711,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
   process.send(r, registry.Shutdown(2000, done))
   let assert Ok(Stopped(stopped)) = process.receive(launches, 60_000)
   let assert True = stopped == key
-  let assert Ok(registry.Clean) = process.receive(done, 60_000)
+  let assert Ok(shutdown.Clean) = process.receive(done, 60_000)
   let assert "" = string.trim(sh("/tmp", "pgrep -f '" <> dialing(key) <> "'"))
   Nil
 }

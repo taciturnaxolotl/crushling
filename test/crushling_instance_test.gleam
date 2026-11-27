@@ -6,7 +6,7 @@ import crushling/instance
 import crushling/launcher
 import crushling/meta
 import crushling/people
-import crushling/registry
+import crushling/registry/shutdown
 import crushling/slack_tools
 import crushling/socket
 import crushling/store
@@ -298,7 +298,7 @@ pub fn a_crashed_registry_is_restarted_alone_test() {
   let assert True = again_pid != a_pid
   let assert True = process.is_alive(again_pid)
   // Shutdown stops them for good.
-  let assert registry.Clean = instance.shutdown(teams, 100)
+  let assert shutdown.Clean = instance.shutdown(teams, 100)
   process.sleep(1200)
   let assert [] = instance.all(teams)
 }

@@ -13,7 +13,7 @@ import crushling/launcher
 import crushling/mcp
 import crushling/provider
 import crushling/proxy
-import crushling/registry
+import crushling/registry/shutdown
 import crushling/registry/tailnet
 import crushling/sandbox
 import crushling/sandbox_http
@@ -235,11 +235,11 @@ pub fn run(config: Config) -> Result(Int, String) {
   // Turns that finished during the grace period spent too.
   save_spend(proxy, store)
   case outcome {
-    registry.Clean -> {
+    shutdown.Clean -> {
       io.println("crushling: stopped")
       Ok(0)
     }
-    registry.TimedOut -> {
+    shutdown.TimedOut -> {
       io.println_error("crushling: shutdown timed out")
       Ok(1)
     }

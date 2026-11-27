@@ -6,6 +6,7 @@
 import crushling/conversation.{type Conversation}
 import crushling/meta.{type Card, type Grant}
 import crushling/people.{type People}
+import crushling/registry/tailnet/card as tailnet_card
 import crushling/sys
 import crushling/tailscale
 import gleam/dict.{type Dict}
@@ -18,11 +19,7 @@ import gleam/string
 import slackline
 import slackline/api/chat
 import slackline/api/chat/post_ephemeral
-import slackline/api/chat/post_message
-import slackline/api/chat/update
 import slackline/block
-import slackline/element
-import slackline/element/button
 import slackline/httpc
 
 /// What the registry needs to put sandboxes on the tailnet.
@@ -75,7 +72,7 @@ pub opaque type Tailnets {
     setup: Option(Setup),
     client: slackline.Client,
     /// Who may press the buttons. Never everyone (see
-    /// `registry.approvers`), so no membership lookup is needed.
+    /// `gate.approvers`), so no membership lookup is needed.
     approvers: People,
     /// Send an event about a thread back after a delay in milliseconds.
     later: fn(String, Event, Int) -> Nil,
@@ -179,9 +176,10 @@ pub fn ask(
     _, _, True -> #(t, Error("a request is already waiting for an answer"))
     Some(setup), False, False -> {
       let client = t.client
-      let blocks = ask_blocks(by, reason, key, setup.api.tag, thread.home)
+      let blocks =
+        tailnet_card.ask_blocks(by, reason, key, setup.api.tag, thread.home)
       let place = thread.conversation
-      process.spawn_unlinked(fn() { post_card(client, place, blocks) })
+      process.spawn_unlinked(fn() { tailnet_card.post(client, place, blocks) })
       #(
         Tailnets(..t, asking: dict.insert(t.asking, key, sys.system_ms())),
         Ok(
@@ -194,7 +192,7 @@ pub fn ask(
 
 fn show(t: Tailnets, card: Card, blocks: List(block.Block)) -> Nil {
   let client = t.client
-  process.spawn_unlinked(fn() { update_card(client, card, blocks) })
+  process.spawn_unlinked(fn() { tailnet_card.update(client, card, blocks) })
   Nil
 }
 
@@ -225,14 +223,16 @@ fn pressed(
       keep(t)
     }
     True, None, _ -> {
-      show(t, card, done_blocks("_This thread is gone._"))
+      show(t, card, tailnet_card.done_blocks("_This thread is gone._"))
       keep(t)
     }
     True, Some(_), Deny -> {
       show(
         t,
         card,
-        done_blocks("_<@" <> user <> "> kept the sandbox off the tailnet._"),
+        tailnet_card.done_blocks(
+          "_<@" <> user <> "> kept the sandbox off the tailnet._",
+        ),
       )
       keep(t)
     }
@@ -241,14 +241,14 @@ fn pressed(
       case thread.grant {
         Some(_) -> end(t, key, thread, text)
         None -> {
-          show(t, card, done_blocks(text))
+          show(t, card, tailnet_card.done_blocks(text))
           keep(t)
         }
       }
     }
     True, Some(thread), Allow(hours) -> {
       let until_ms = sys.system_ms() + hours * 3_600_000
-      show(t, card, on_blocks(until_ms, user, thread.home))
+      show(t, card, tailnet_card.on_blocks(until_ms, user, thread.home))
       let grant = meta.Grant(until_ms:, card:)
       Outcome(
         ..check(t, key, Thread(..thread, grant: Some(grant)), Some(user)),
@@ -283,7 +283,7 @@ pub fn end(t: Tailnets, key: String, thread: Thread, text: String) -> Outcome {
   case thread.grant {
     None -> keep(t)
     Some(grant) -> {
-      show(t, grant.card, done_blocks(text))
+      show(t, grant.card, tailnet_card.done_blocks(text))
       Outcome(sync(t, key, thread.running, None, None), Revoked, None)
     }
   }
@@ -388,22 +388,15 @@ pub fn leave(setup: Setup, key: String) -> Nil {
   Nil
 }
 
-const allow_action = "tailnet_allow_"
-
-const deny_action = "tailnet_deny"
-
-const off_action = "tailnet_off"
-
-/// The hours each "allow" button offers.
-const offers = [1, 8]
-
 /// Every button's action id. Slack wants them unique within a block, so each
 /// "allow" button carries its hours in its id.
 pub fn action_ids() -> List(String) {
   [
-    deny_action,
-    off_action,
-    ..list.map(offers, fn(hours) { allow_action <> int.to_string(hours) })
+    tailnet_card.deny_action,
+    tailnet_card.off_action,
+    ..list.map(tailnet_card.offers, fn(hours) {
+      tailnet_card.allow_action <> int.to_string(hours)
+    })
   ]
 }
 
@@ -418,7 +411,7 @@ pub fn read_button(
     "tailnet_allow_" <> hours ->
       case int.parse(hours) {
         Ok(hours) ->
-          case list.contains(offers, hours) {
+          case list.contains(tailnet_card.offers, hours) {
             True -> Ok(Allow(hours))
             False -> Error(Nil)
           }
@@ -444,154 +437,13 @@ pub fn card(
   }
 }
 
-fn lasts(hours: Int) -> String {
-  case hours {
-    1 -> "1 hour"
-    hours -> int.to_string(hours) <> " hours"
-  }
-}
-
-/// Time left, in words: whole hours, or minutes under an hour.
-pub fn remaining(ms: Int) -> String {
-  case ms < 3_600_000 {
-    True ->
-      case int.max({ ms + 30_000 } / 60_000, 1) {
-        1 -> "1 minute"
-        minutes -> int.to_string(minutes) <> " minutes"
-      }
-    False -> lasts({ ms + 1_800_000 } / 3_600_000)
-  }
-}
-
 /// What the agent is told once its sandbox is on the tailnet.
 pub fn joined_note(left_ms: Int) -> String {
   "[crushling] This sandbox is now on the tailnet for "
-  <> remaining(left_ms)
+  <> tailnet_card.remaining(left_ms)
   <> ". ssh reaches tailnet machines by name or 100.x address and goes through Tailscale by itself. For HTTP and other TCP, use the proxy: `curl --proxy socks5h://localhost:"
   <> int.to_string(tailscale.socks_port)
   <> " http://<machine>:<port>/`, or `http_proxy=http://localhost:"
   <> int.to_string(tailscale.http_port)
   <> "`. The tailnet's access rules decide which machines answer. Access ends by itself, or when someone in Slack turns it off. Carry on with what you were doing."
-}
-
-/// A Slack date in each reader's own time zone.
-fn when(ms: Int) -> String {
-  "<!date^"
-  <> int.to_string(ms / 1000)
-  <> "^{date_short_pretty} at {time}|soon>"
-}
-
-fn button(
-  text: String,
-  action_id: String,
-  thread: #(String, String),
-  style: List(block.Attr(block.ButtonElement)),
-) -> block.Element {
-  element.button(text:, action_id:, with: [
-    button.value(thread.0 <> "|" <> thread.1),
-    ..style
-  ])
-}
-
-/// The card that asks to put the sandbox on the tailnet. `by` is who asked,
-/// or "" for the agent. `thread` is the thread's channel and ts.
-pub fn ask_blocks(
-  by: String,
-  reason: String,
-  key: String,
-  tag: String,
-  thread: #(String, String),
-) -> List(block.Block) {
-  let who = case by {
-    "" -> "The agent wants"
-    user -> "<@" <> user <> "> wants"
-  }
-  let why = case string.trim(reason) {
-    "" -> ""
-    reason ->
-      string.split(reason, "\n")
-      |> list.map(fn(line) { "\n> " <> line })
-      |> string.concat
-  }
-  let allow =
-    list.map(offers, fn(hours) {
-      button(
-        "Allow for " <> lasts(hours),
-        allow_action <> int.to_string(hours),
-        thread,
-        [],
-      )
-    })
-  [
-    block.markdown(
-      who
-        <> " this sandbox on the tailnet."
-        <> why
-        <> "\nIt would join as `"
-        <> tailscale.hostname(key)
-        <> "`, tagged `"
-        <> tag
-        <> "`. The tailnet's access rules decide which machines it can reach.",
-      [],
-    ),
-    block.actions(
-      elements: list.append(allow, [button("Deny", deny_action, thread, [])]),
-      with: [],
-    ),
-  ]
-}
-
-/// The card while access is on, with a button that turns it off.
-pub fn on_blocks(
-  until_ms: Int,
-  by: String,
-  thread: #(String, String),
-) -> List(block.Block) {
-  [
-    block.markdown(
-      "The sandbox is on the tailnet until "
-        <> when(until_ms)
-        <> ". <@"
-        <> by
-        <> "> allowed it.",
-      [],
-    ),
-    block.actions(
-      elements: [
-        button("Turn off", off_action, thread, [button.style(block.Danger)]),
-      ],
-      with: [],
-    ),
-  ]
-}
-
-/// A card with nothing left to press.
-pub fn done_blocks(text: String) -> List(block.Block) {
-  [block.markdown(text, [])]
-}
-
-fn post_card(
-  client: slackline.Client,
-  place: Conversation,
-  blocks: List(block.Block),
-) -> Nil {
-  let _ =
-    chat.post_message(channel: place.channel, text: "Tailnet access")
-    |> post_message.blocks(blocks)
-    |> conversation.in_thread(place, post_message.thread_ts)
-    |> httpc.send(client)
-  Nil
-}
-
-pub fn update_card(
-  client: slackline.Client,
-  card: Card,
-  blocks: List(block.Block),
-) -> Nil {
-  let _ =
-    chat.update(channel: card.channel, ts: card.ts)
-    |> update.text("Tailnet access")
-    |> update.blocks(blocks)
-    |> httpc.send(client)
-  Nil
 }

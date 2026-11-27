@@ -12,6 +12,7 @@ import crushling/meta.{DefaultReasoning, Effort, ModelChoice, Thinking}
 import crushling/models
 import crushling/people
 import crushling/registry
+import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
 import crushling/sink
 import crushling/socket
@@ -713,7 +714,7 @@ fn start_woken_registry(name: String) {
     slackline.new("xoxb-test")
     |> slackline.with_base_url("http://127.0.0.1:1/api")
   let assert Ok(r) =
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: fake,
       client:,
       token: "xoxb-test",

@@ -6,6 +6,8 @@ import crushling/instance
 import crushling/launcher
 import crushling/people
 import crushling/registry
+import crushling/registry/config as registry_config
+import crushling/registry/gate
 import crushling/registry/incoming as msg
 import crushling/store
 import gleam/bit_array
@@ -193,7 +195,7 @@ fn start_registry(
     store.parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
   let assert Ok(s) = store.start(":memory:", key)
   let assert Ok(r) =
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: launcher_reporting(launches),
       client: slack_client(api),
       token: "xoxb-test",
@@ -318,14 +320,14 @@ pub fn everyone_is_accepted_at_startup_test() {
 
 pub fn everyone_without_admins_means_nobody_approves_test() {
   let assert True =
-    people.is_empty(registry.approvers(people.parse("*"), set.new()))
+    people.is_empty(gate.approvers(people.parse("*"), set.new()))
   let assert True =
-    people.is_empty(registry.approvers(people.parse("*,U1"), set.new()))
+    people.is_empty(gate.approvers(people.parse("*,U1"), set.new()))
   // Explicit admins still approve.
   let assert True =
-    registry.approvers(people.parse("*"), set.from_list(["U2"]))
+    gate.approvers(people.parse("*"), set.from_list(["U2"]))
     == people.only(["U2"])
   // Without everyone, the ids allowed approve, as before.
   let assert True =
-    registry.approvers(people.parse("U1"), set.new()) == people.only(["U1"])
+    gate.approvers(people.parse("U1"), set.new()) == people.only(["U1"])
 }

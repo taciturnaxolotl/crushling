@@ -156,7 +156,8 @@ pub fn code_tab_covers_every_changed_repo_test() {
   let shell = real_shell(work)
   let info = git.info(shell, "./wish")
   // Only the channel's own repository changed: plain paths, its base.
-  test_fs.write(work <> "/wish/a.txt", "two\n")
+  // A new size, so git's same-second stat cache can't hide the edit.
+  test_fs.write(work <> "/wish/a.txt", "two lines\n")
   repo.show(shell, tab, "./wish", info)
   let assert Ok(#(diff, "main")) = process.receive(code, 1000)
   let assert True = string.contains(diff, "+++ b/a.txt")

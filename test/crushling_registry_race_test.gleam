@@ -7,7 +7,9 @@ import crushling/key
 import crushling/launcher
 import crushling/people
 import crushling/registry
+import crushling/registry/config as registry_config
 import crushling/registry/incoming as msg
+import crushling/registry/shutdown
 import crushling/store
 import crushling/thread
 import gleam/erlang/process.{type Subject}
@@ -63,7 +65,7 @@ fn start_with(
     slackline.new("xoxb-test")
     |> slackline.with_base_url("http://127.0.0.1:1/api")
   let assert Ok(r) =
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: blocking_launcher(calls),
       client:,
       token: "xoxb-test",
@@ -171,7 +173,7 @@ pub fn shutdown_during_a_launch_stops_what_it_starts_test() {
   let assert True = stopped == key
   let assert Error(Nil) = process.receive(done, 200)
   process.send(stop_go, Ok(Nil))
-  let assert Ok(registry.Clean) = process.receive(done, 5000)
+  let assert Ok(shutdown.Clean) = process.receive(done, 5000)
   Nil
 }
 
@@ -231,15 +233,14 @@ pub fn a_stop_that_always_fails_is_reported_test() {
   nothing(calls)
   let done = process.new_subject()
   process.send(r, registry.Shutdown(1000, done))
-  let assert Ok(registry.Incomplete([failed])) = process.receive(done, 5000)
+  let assert Ok(shutdown.Incomplete([failed])) = process.receive(done, 5000)
   let assert True = failed == key
 }
 
 /// The caller's deadline covers every timer shutdown has.
 pub fn shutdown_budget_covers_its_timers_test() {
-  let assert True = registry.shutdown_budget_ms(60_000) > 60_000 + 130_000
-  let assert True =
-    registry.shutdown_budget_ms(0) == registry.shutdown_budget_ms(1000) - 1000
+  let assert True = shutdown.budget_ms(60_000) > 60_000 + 130_000
+  let assert True = shutdown.budget_ms(0) == shutdown.budget_ms(1000) - 1000
 }
 
 /// An agent whose sandbox died (out of memory, say) is stopped once its
@@ -253,7 +254,7 @@ pub fn a_lost_agent_is_stopped_and_started_again_test() {
   let assert Launch(_, go) = next(calls)
   process.send(go, Nil)
   let _ = wait_live(r, key, 50)
-  process.send(r, registry.FromThread(key, thread.Lost))
+  process.send(r, registry.notice(key, thread.Lost))
   let assert Stop(stopping, stop_go) = next(calls)
   let assert True = stopping == key
   process.send(stop_go, Ok(Nil))

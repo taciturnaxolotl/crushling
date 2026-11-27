@@ -36,8 +36,10 @@ collect(Port, Acc, Deadline) ->
     end.
 
 tmp_dir() ->
-    Dir = filename:join("/tmp", "crushling-proxy-" ++
-                            integer_to_list(erlang:unique_integer([positive]))),
+    %% unique_integer restarts with each VM; the pid and clock keep runs apart.
+    Dir = filename:join("/tmp", lists:concat(["crushling-proxy-", os:getpid(), "-",
+                            erlang:system_time(microsecond), "-",
+                            erlang:unique_integer([positive])])),
     ok = filelib:ensure_path(Dir),
     unicode:characters_to_binary(Dir).
 

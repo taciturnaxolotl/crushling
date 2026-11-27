@@ -18,7 +18,9 @@ import crushling/key as thread_key
 import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
 import crushling/registry
+import crushling/registry/config as registry_config
 import crushling/registry/legacy
+import crushling/registry/shutdown
 import crushling/registry/tailnet
 import crushling/slack_tools
 import crushling/socket
@@ -326,7 +328,7 @@ fn start_instance(
     None -> False
   }
   use registry <- result.map(
-    registry.start(registry.Config(
+    registry.start(registry_config.Config(
       launcher: shared.launcher,
       client:,
       token: team.bot_token,
@@ -465,7 +467,7 @@ pub fn finder(teams: Teams) -> socket.Find {
 
 /// Shut every instance down with `grace_ms` for running turns, all at
 /// once, and wait for all of them: Clean only if every one was.
-pub fn shutdown(teams: Teams, grace_ms: Int) -> registry.ShutdownOutcome {
+pub fn shutdown(teams: Teams, grace_ms: Int) -> shutdown.ShutdownOutcome {
   let instances = process.call(teams.subject, timeout_ms, Drain)
   let replies =
     list.map(instances, fn(instance) {
@@ -473,22 +475,22 @@ pub fn shutdown(teams: Teams, grace_ms: Int) -> registry.ShutdownOutcome {
       process.send(instance.registry, registry.Shutdown(grace_ms, done))
       done
     })
-  let budget = registry.shutdown_budget_ms(grace_ms)
+  let budget = shutdown.budget_ms(grace_ms)
   let deadline = sys.monotonic_ms() + budget
-  list.fold(replies, registry.Clean, fn(outcome, done) {
+  list.fold(replies, shutdown.Clean, fn(outcome, done) {
     let left = int_max(deadline - sys.monotonic_ms(), 0)
     let this = case process.receive(done, left) {
       Ok(this) -> this
-      Error(Nil) -> registry.TimedOut
+      Error(Nil) -> shutdown.TimedOut
     }
     case outcome, this {
-      registry.TimedOut, _ | _, registry.TimedOut -> registry.TimedOut
-      registry.Incomplete(a), registry.Incomplete(b) ->
-        registry.Incomplete(list.append(a, b))
-      registry.Incomplete(a), registry.Clean
-      | registry.Clean, registry.Incomplete(a)
-      -> registry.Incomplete(a)
-      registry.Clean, registry.Clean -> registry.Clean
+      shutdown.TimedOut, _ | _, shutdown.TimedOut -> shutdown.TimedOut
+      shutdown.Incomplete(a), shutdown.Incomplete(b) ->
+        shutdown.Incomplete(list.append(a, b))
+      shutdown.Incomplete(a), shutdown.Clean
+      | shutdown.Clean, shutdown.Incomplete(a)
+      -> shutdown.Incomplete(a)
+      shutdown.Clean, shutdown.Clean -> shutdown.Clean
     }
   })
 }
