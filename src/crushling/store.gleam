@@ -567,8 +567,6 @@ fn thread_decoder() -> decode.Decoder(Thread) {
   use venue_json <- decode.field(7, decode.string)
   use tailnet_json <- decode.field(8, decode.optional(decode.string))
   use model_json <- decode.field(9, decode.optional(decode.string))
-  let venue =
-    json.parse(venue_json, venue.decoder()) |> result.unwrap(venue.Thread)
   let tailnet =
     option.then(tailnet_json, fn(text) {
       json.parse(text, meta.grant_decoder()) |> option.from_result
@@ -577,13 +575,22 @@ fn thread_decoder() -> decode.Decoder(Thread) {
     option.then(model_json, fn(text) {
       json.parse(text, meta.model_choice_decoder()) |> option.from_result
     })
-  decode.success(Thread(
-    key:,
-    team:,
-    channel:,
-    thread_ts:,
-    meta: Meta(follow:, paused:, cursor:, venue:, tailnet:, model:),
-  ))
+  case json.parse(venue_json, venue.decoder()) {
+    Error(_) ->
+      decode.failure(empty_thread(), "a known venue, not " <> venue_json)
+    Ok(venue) ->
+      decode.success(Thread(
+        key:,
+        team:,
+        channel:,
+        thread_ts:,
+        meta: Meta(follow:, paused:, cursor:, venue:, tailnet:, model:),
+      ))
+  }
+}
+
+fn empty_thread() -> Thread {
+  Thread(key: "", team: "", channel: "", thread_ts: "", meta: meta.new(False))
 }
 
 pub fn thread(store: Store, key: String) -> Result(Option(Thread), String) {

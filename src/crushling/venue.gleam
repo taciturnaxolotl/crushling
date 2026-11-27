@@ -56,6 +56,7 @@ pub fn decoder() -> decode.Decoder(Venue) {
       use repo <- decode.field("repo", decode.string)
       decode.success(Archived(repo:))
     }
-    _ -> decode.success(Thread)
+    "thread" -> decode.success(Thread)
+    _ -> decode.failure(Thread, "Venue")
   }
 }

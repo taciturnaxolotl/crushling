@@ -640,7 +640,13 @@ fn send_prompt(state: State, connection: Connection, next: Queued) -> State {
         state.sink.post(
           "_couldn't send that to the agent: " <> conn.describe(error) <> "_",
         )
-      send_next(state)
+      // The registry marked the thread working when the message arrived.
+      let state = send_next(state)
+      case state.active, state.waiting {
+        None, [] -> state.sink.working(False)
+        _, _ -> Nil
+      }
+      state
     }
   }
 }

@@ -71,6 +71,9 @@ pub fn nothing_to_propose_test() {
       "",
     )
   let assert True = string.contains(why, "has no commits")
+  let assert Error(why) =
+    pr.from_facts(facts("origin/main", "0", "origin/main"), "", "")
+  let assert True = string.contains(why, "isn't one crushling pushed")
 }
 
 pub fn github_repo_test() {

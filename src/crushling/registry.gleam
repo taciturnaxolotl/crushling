@@ -208,6 +208,12 @@ type Waiting {
   WaitingMessage(Incoming)
   WaitingStop(channel: String, thread_ts: String, user: String)
   WaitingHome(user: String, ask: HomeAsk)
+  WaitingPr(
+    user: String,
+    card_ts: String,
+    choice: String,
+    respond: Option(String),
+  )
   WaitingPick(
     home: #(String, String),
     pick: models.Pick,
@@ -444,6 +450,8 @@ fn member_known(
             WaitingPick(home, pick, card, user), None ->
               model_picked(state, home, pick, card, user)
             WaitingHome(user, ask), None -> home_ask(state, user, ask)
+            WaitingPr(user, card_ts, choice, respond), None ->
+              pr_pressed(state, user, card_ts, choice, respond)
           }
         })
       case result {
@@ -546,6 +554,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       actor.continue(
         State(..state, proposals: dict.delete(state.proposals, card_ts)),
       )
+    Slash(..) if state.stopping != None -> actor.continue(state)
     Slash(channel:, user:, text:) -> {
       // Said at the top of the channel, now, and heard as if mentioned.
       let ms = sys.system_ms()
@@ -620,7 +629,8 @@ fn entry_for(
     Error(Nil) -> {
       let config = state.config
       let launcher = config.launcher
-      let saved = saved_thread(config, key)
+      // A row that can't be read is refused, not overwritten.
+      use saved <- result.try(store.thread(config.store, key))
       let exists = launcher.exists(key)
       // Half of it may be under the new key already, from a move that
       // stopped partway: finish it.
@@ -1187,9 +1197,22 @@ fn sweep_quiet(state: State) -> State {
                   )
               }
             })
-            update_meta(state, key, fn(meta) {
-              Meta(..meta, venue: venue.Archived(repo), tailnet: None)
-            })
+            case known_entry(state, key) {
+              Some(entry) ->
+                tailnet.end(
+                  state.tailnets,
+                  key,
+                  tailnet_view(entry),
+                  "_The tailnet access ended with the channel._",
+                )
+                |> apply_tailnet(state, key, Some(entry), _)
+                |> set_meta(
+                  key,
+                  entry,
+                  Meta(..entry.meta, venue: venue.Archived(repo), tailnet: None),
+                )
+              None -> state
+            }
           }
           sweep.Forget(key) -> {
             sys.info("crushling: clearing out " <> key <> ", quiet for a month")
@@ -1236,10 +1259,19 @@ fn pr_pressed(
       say("_This card has expired; `/pr` posts a new one._")
       state
     }
-    _, False, _ -> {
-      say("_You can't use crushling here._")
-      state
-    }
+    _, False, _ ->
+      case unknown(state, user) {
+        True ->
+          wait_for_member(
+            state,
+            user,
+            WaitingPr(user, card_ts, choice, respond),
+          )
+        False -> {
+          say("_You can't use crushling here._")
+          state
+        }
+      }
     _, _, None -> {
       say("_GitHub isn't set up for this crushling._")
       state
@@ -1434,17 +1466,21 @@ fn threads_of(state: State, user: String) -> List(connections.Thread) {
 /// Change a thread's meta, from its entry in memory or, for a thread whose
 /// agent was stopped meanwhile, its row in the store.
 fn update_meta(state: State, key: String, change: fn(Meta) -> Meta) -> State {
-  let entry = case dict.get(state.threads, key) {
+  case known_entry(state, key) {
+    Some(entry) -> set_meta(state, key, entry, change(entry.meta))
+    None -> state
+  }
+}
+
+/// A thread's entry, awake or read back from the store.
+fn known_entry(state: State, key: String) -> Option(Entry) {
+  case dict.get(state.threads, key) {
     Ok(entry) -> Some(entry)
     Error(Nil) ->
       saved_thread(state.config, key)
       |> option.map(fn(saved) {
         new_entry(saved.channel, saved.thread_ts, saved.meta)
       })
-  }
-  case entry {
-    Some(entry) -> set_meta(state, key, entry, change(entry.meta))
-    None -> state
   }
 }
 
@@ -1748,7 +1784,7 @@ fn stop_requested(
           whisper(
             config,
             incoming,
-            "_only the people this agent works for can stop it._",
+            "_You can't use crushling here, so you can't stop it._",
           )
           state
         }

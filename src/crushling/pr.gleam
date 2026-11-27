@@ -88,7 +88,13 @@ pub fn from_facts(
     |> result.replace_error("this repository isn't on GitHub"),
   )
   use head <- result.try(case at(1) {
-    "origin/" <> branch -> Ok(branch)
+    "origin/crushling/" <> _ as upstream -> Ok(string.drop_start(upstream, 7))
+    "origin/" <> branch ->
+      Error(
+        "the branch `"
+        <> branch
+        <> "` isn't one crushling pushed: push it as `crushling/<what>` first",
+      )
     "" ->
       Error(
         "the branch isn't on GitHub yet: push it first, like `git push -u origin HEAD:crushling/<what>`",

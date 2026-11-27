@@ -13,7 +13,6 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import gleam/set.{type Set}
 import gleam/string
 import slackline
 import slackline/api/chat
@@ -80,8 +79,8 @@ pub opaque type Tailnets {
     /// Send an event about a thread back after a delay in milliseconds.
     later: fn(String, Event, Int) -> Nil,
     links: Dict(String, Link),
-    /// Threads with a card nobody has answered yet.
-    asking: Set(String),
+    /// Threads with an unanswered card, and when it was posted.
+    asking: Dict(String, Int),
   )
 }
 
@@ -120,9 +119,12 @@ pub fn new(
     approvers:,
     later:,
     links: dict.new(),
-    asking: set.new(),
+    asking: dict.new(),
   )
 }
+
+/// An unanswered card stops blocking new requests after this long.
+const ask_expires_ms = 3_600_000
 
 fn keep(tailnets: Tailnets) -> Outcome {
   Outcome(tailnets, Unchanged, None)
@@ -166,7 +168,11 @@ pub fn ask(
     Some(grant) -> grant.until_ms > sys.system_ms()
     None -> False
   }
-  case t.setup, on, set.contains(t.asking, key) {
+  let waiting = case dict.get(t.asking, key) {
+    Ok(asked_ms) -> sys.system_ms() - asked_ms < ask_expires_ms
+    Error(Nil) -> False
+  }
+  case t.setup, on, waiting {
     None, _, _ -> #(t, Error("tailnet access isn't set up here"))
     _, True, _ -> #(t, Error("the sandbox is already on the tailnet"))
     _, _, True -> #(t, Error("a request is already waiting for an answer"))
@@ -178,7 +184,7 @@ pub fn ask(
         post_card(client, channel, thread_ts, blocks)
       })
       #(
-        Tailnets(..t, asking: set.insert(t.asking, key)),
+        Tailnets(..t, asking: dict.insert(t.asking, key, sys.system_ms())),
         Ok(
           "Asked in Slack. A message will tell you if someone allows it. Until then, carry on without it.",
         ),
@@ -201,7 +207,7 @@ fn pressed(
   user: String,
   card: Card,
 ) -> Outcome {
-  let t = Tailnets(..t, asking: set.delete(t.asking, key))
+  let t = Tailnets(..t, asking: dict.delete(t.asking, key))
   let approves = people.allows(t.approvers, user, fn(_) { False })
   case approves, thread, choice {
     False, _, _ -> {
@@ -211,7 +217,7 @@ fn pressed(
           chat.post_ephemeral(
             channel: card.channel,
             user:,
-            text: "Only the people this agent works for can change its access.",
+            text: "You can't change this sandbox's tailnet access.",
           )
           |> post_ephemeral.thread_ts(card.thread_ts)
           |> httpc.send(client)
@@ -286,7 +292,8 @@ pub fn end(t: Tailnets, key: String, thread: Thread, text: String) -> Outcome {
 
 /// Forget a sandbox whose container stopped.
 pub fn stopped(t: Tailnets, key: String) -> Tailnets {
-  sync(t, key, False, None, None)
+  Tailnets(..t, asking: dict.delete(t.asking, key))
+  |> sync(key, False, None, None)
 }
 
 fn sync(

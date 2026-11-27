@@ -357,7 +357,10 @@ fn forward_git(
   body: Option(BitArray),
   writes: Bool,
 ) -> Response(mist.ResponseData) {
-  let repo = string.replace(repo, ".git", "")
+  let repo = case string.ends_with(repo, ".git") {
+    True -> string.drop_end(repo, 4)
+    False -> repo
+  }
   let name = owner <> "/" <> repo
   let path =
     string.drop_start(req.path, string.length("/git"))
