@@ -1,24 +1,25 @@
-//// Where a thread's agent runs. `docker` gives each thread its own gVisor
-//// container; `local` runs `crush server` straight on this machine, for
-//// development only: the agent is in YOLO mode with your user's access.
+//// Launching and stopping a thread's agent, written once against a
+//// `Backend` (`crushling/agent/backend`): docker or local.
 ////
 //// Either way crush runs with `--dial`: it connects out to the bridge's
 //// tunnel (`crushling/tunnel`), which the thread reaches through the
 //// tunnel's unix socket shim, and it uses Hyper through the bridge's
-//// inference proxy (`crushling/proxy`) with a token of the thread's own.
-//// The agent's crush.json comes from `provider.config` and holds no key.
+//// inference proxy (`crushling/proxy`) with a token of the thread's own,
+//// which works only while the agent is up. What crush is given comes from
+//// `crushling/agent/spec`.
+////
+//// Nothing here serializes calls for one key: `crushling/agents` owns
+//// that, and is the only caller in the bridge.
 
-import crushling/github/route as github_route
+import crushling/agent/backend.{type Backend}
+import crushling/agent/spec
 import crushling/key as thread_key
-import crushling/mcp
-import crushling/provider
 import crushling/proxy
-import crushling/sandbox
 import crushling/sys
 import crushling/tunnel
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{type Option}
 import gleam/result
 import gleam/string
 
@@ -32,6 +33,7 @@ pub type Launched {
   )
 }
 
+/// A thread's agent, by key. Tests stand in for it with plain functions.
 pub type Launcher {
   Launcher(
     launch: fn(String) -> Result(Launched, String),
@@ -55,28 +57,13 @@ pub type Launcher {
   )
 }
 
-/// What a thread's agent needs from the bridge: the URL it reaches the
-/// sandbox server at (Slack tools, tunnel and proxy share it), its
-/// environment for them, and the tunnel and proxy operations a launch and
-/// a stop go through. `bridge` builds the real one.
-pub type Bridge {
-  Bridge(
-    url: String,
-    /// `NAME=value` pairs for a thread: its Slack tools token, its tunnel
-    /// dial token, and `HYPER_URL` and `HYPER_API_KEY` for the proxy.
-    env: fn(String) -> List(String),
-    /// Open the thread's tunnel endpoint and return its shim's path.
-    open: fn(String) -> Result(String, String),
-    /// Wait this long for the thread's crush to dial in.
-    await_hello: fn(String, Int) -> Result(String, String),
-    /// Tell the thread's crush to exit.
-    bye: fn(String) -> Nil,
-    /// Close the thread's tunnel endpoint.
-    close: fn(String) -> Nil,
-    /// Let the thread's proxy token work again.
-    restore: fn(String) -> Nil,
-    /// Stop the thread's proxy token from working.
-    revoke: fn(String) -> Nil,
+/// What a launch needs from the rest of the bridge.
+pub type Wiring {
+  Wiring(
+    tunnels: tunnel.Tunnels,
+    proxy: proxy.Proxy,
+    /// What every thread's crush is given.
+    spec: spec.Settings,
     /// How long a launch waits for crush to dial in.
     hello_timeout_ms: Int,
   )
@@ -86,68 +73,102 @@ pub type Bridge {
 /// crush take a few seconds to boot.
 pub const default_hello_timeout_ms = 30_000
 
-/// The bridge, from the instance secret, the URL sandboxes reach the
-/// sandbox server at, the tunnels and the proxy. With `github`, git and gh
-/// in sandboxes reach GitHub through the bridge.
-pub fn bridge(
-  url url: String,
-  secret secret: String,
-  tunnels tunnels: tunnel.Tunnels,
-  proxy proxy: proxy.Proxy,
-  github github: Bool,
-  hello_timeout_ms hello_timeout_ms: Int,
-) -> Bridge {
-  Bridge(
-    url:,
-    env: fn(key) {
-      list.flatten([
-        // For the sandbox's file helpers, crushling-fetch and -share.
-        ["CRUSHLING_BRIDGE_URL=" <> url],
-        mcp.env(secret, key),
-        tunnel.env(secret, key),
-        proxy.crush_env(url, secret, key),
-        // GitHub reads through the bridge, when it's set up.
-        case github {
-          True -> github_route.env(url, secret, key)
-          False -> []
-        },
-      ])
-    },
-    open: fn(key) { tunnel.open(tunnels, key) },
-    await_hello: fn(key, timeout_ms) {
-      tunnel.await_hello(tunnels, key, timeout_ms)
-    },
-    bye: fn(key) { tunnel.bye(tunnels, key) },
-    close: fn(key) { tunnel.close(tunnels, key) },
-    restore: fn(key) { proxy.restore(proxy, key) },
-    revoke: fn(key) { proxy.revoke(proxy, key) },
-    hello_timeout_ms:,
-  )
-}
-
 /// Attachments live in the workspace, so the agent can open them, under a
 /// directory the change snapshots leave out.
 pub const attachments_dir = ".slack"
 
-/// Launch the thread's agent with `launcher`, then do `next` with it. If
-/// `next` fails, the agent is stopped again, since nothing would drive it.
-pub fn launch_then(
-  launcher: Launcher,
+/// A launch prepares the thread's directories, opens its tunnel, lets its
+/// proxy token work, then starts (or adopts) its crush and waits for it to
+/// dial in. Any failure after the tunnel opened undoes all of it: crush is
+/// stopped even when starting it reported a failure, since a timed-out
+/// call doesn't prove it didn't start. A stop says bye and undoes the same.
+pub fn new(wiring: Wiring, backend: Backend) -> Launcher {
+  Launcher(
+    launch: fn(key) { launch(wiring, backend, key) },
+    stop: fn(key) {
+      tunnel.bye(wiring.tunnels, key)
+      stop_result(key, cleanup(wiring, backend, key))
+    },
+    exists: backend.exists,
+    rekey: fn(old, new) {
+      // Its tokens came from the old key, so whatever ran under it can't
+      // be reused; remove it rather than leave it running unseen.
+      use _ <- result.try(backend.remove(old))
+      move_dir(backend.root, old, new)
+    },
+    forget: fn(key) {
+      use _ <- result.try(backend.remove(key))
+      delete_thread_dir(backend.root, key)
+    },
+    run_in_sandbox: backend.exec,
+  )
+}
+
+fn launch(
+  wiring: Wiring,
+  backend: Backend,
   key: String,
-  next: fn(Launched) -> Result(a, String),
-) -> Result(a, String) {
-  use launched <- result.try(launcher.launch(key))
-  case next(launched) {
-    Ok(value) -> Ok(value)
+) -> Result(Launched, String) {
+  let spec = spec.build(wiring.spec, backend.root, key, backend.home)
+  use _ <- result.try(backend.prepare(spec))
+  use shim <- result.try(
+    tunnel.open(wiring.tunnels, key)
+    |> result.map_error(fn(reason) { "tunnel: " <> reason }),
+  )
+  proxy.allow(wiring.proxy, key)
+  let started = {
+    use _ <- result.try(backend.start(spec))
+    // Wait here, rather than have the thread spend its reconnect attempts
+    // on a shim with nothing behind it.
+    await_hello(wiring, backend, key, wiring.hello_timeout_ms)
+  }
+  case started {
+    Ok(Nil) -> Ok(Launched(socket: shim, root: spec.workdir))
+    Error(reason) -> Error(undone(key, reason, cleanup(wiring, backend, key)))
+  }
+}
+
+/// Wait for crush to dial in, failing at once if it is no longer alive.
+fn await_hello(
+  wiring: Wiring,
+  backend: Backend,
+  key: String,
+  left_ms: Int,
+) -> Result(Nil, String) {
+  let slice = int.min(500, left_ms)
+  case tunnel.await_hello(wiring.tunnels, key, slice) {
+    Ok(_) -> Ok(Nil)
     Error(reason) ->
-      case launcher.stop(key) {
-        Ok(Nil) -> Error(reason)
-        Error(cleanup) -> {
-          sys.warn("crushling: cleaning up " <> key <> ": " <> cleanup)
-          Error(reason <> " (cleanup failed: " <> cleanup <> ")")
-        }
+      case
+        string.starts_with(reason, "crush did not dial in"),
+        backend.alive(key),
+        left_ms <= slice
+      {
+        // The tunnel closed or went: waiting longer won't help.
+        False, _, _ -> Error(reason)
+        True, False, _ ->
+          Error("crush server exited while starting; see server.log")
+        True, True, True ->
+          Error(
+            "crush did not dial in within "
+            <> int.to_string(wiring.hello_timeout_ms)
+            <> "ms",
+          )
+        True, True, False -> await_hello(wiring, backend, key, left_ms - slice)
       }
   }
+}
+
+/// Stop crush, close the tunnel and disallow the proxy token. Returns what
+/// failed; nothing running is fine.
+fn cleanup(wiring: Wiring, backend: Backend, key: String) -> List(String) {
+  let errors = case backend.stop(key) {
+    Ok(Nil) -> []
+    Error(reason) -> [reason]
+  }
+  tunnel.close(wiring.tunnels, key)
+  proxy.disallow(wiring.proxy, key)
+  errors
 }
 
 /// A launch's error, with whatever its rollback couldn't undo. Those are
@@ -177,123 +198,12 @@ fn stop_result(key: String, errors: List(String)) -> Result(Nil, String) {
   }
 }
 
-/// Stop the thread's container, close its tunnel and revoke its proxy
-/// token. Returns what failed; a container that doesn't exist is fine.
-fn docker_cleanup(
-  policy: sandbox.Policy,
-  bridge: Bridge,
-  key: String,
-) -> List(String) {
-  let errors = case sandbox.stop(policy, key) {
-    Ok(Nil) -> []
-    Error(sandbox.DockerFailed(output:, ..)) ->
-      case string.contains(string.lowercase(output), "no such container") {
-        True -> []
-        False -> ["docker stop: " <> string.trim(output)]
-      }
-    Error(error) -> ["docker stop: " <> string.inspect(error)]
-  }
-  bridge.close(key)
-  bridge.revoke(key)
-  errors
-}
-
-/// `policy.crush_config` should come from `provider.config` with the
-/// bridge's URL, and `policy.bridge_url` should be that URL.
-///
-/// A launch opens the tunnel, restores the proxy token, then starts the
-/// container and waits for its crush to dial in. Any failure after the
-/// tunnel opened undoes all of it: the container is stopped even when
-/// `docker` reported a failure, since a timed-out CLI doesn't prove the
-/// container didn't start.
-pub fn docker(policy: sandbox.Policy, bridge: Bridge) -> Launcher {
-  Launcher(
-    launch: fn(key) {
-      use shim <- result.try(
-        bridge.open(key)
-        |> result.map_error(fn(reason) { "tunnel: " <> reason }),
-      )
-      bridge.restore(key)
-      let undo = fn(reason) {
-        Error(undone(key, reason, docker_cleanup(policy, bridge, key)))
-      }
-      case sandbox.ensure(policy, key, bridge.env(key)) {
-        Error(error) -> undo(string.inspect(error))
-        // Wait here, rather than have the thread spend its reconnect
-        // attempts on a shim with nothing behind it. A sandbox that never
-        // dials in is stopped, or nothing would ever stop it.
-        Ok(Nil) ->
-          case bridge.await_hello(key, bridge.hello_timeout_ms) {
-            Ok(_) -> Ok(Launched(socket: shim, root: sandbox.workspace))
-            Error(reason) -> undo(reason)
-          }
-      }
-    },
-    stop: fn(key) {
-      bridge.bye(key)
-      stop_result(key, docker_cleanup(policy, bridge, key))
-    },
-    exists: fn(key) { file_exists(sandbox.host_workspace(policy, key)) },
-    rekey: fn(old, new) {
-      // Its tokens came from the old key, so the old container can't be
-      // reused; remove it rather than leave it running unseen.
-      use _ <- result.try(case sandbox.remove(policy, old) {
-        Ok(Nil) -> Ok(Nil)
-        Error(sandbox.DockerFailed(output:, ..)) ->
-          case string.contains(string.lowercase(output), "no such container") {
-            True -> Ok(Nil)
-            False -> Error("docker rm: " <> string.trim(output))
-          }
-        Error(error) -> Error("docker rm: " <> string.inspect(error))
-      })
-      move_dir(policy.root, old, new)
-    },
-    forget: fn(key) {
-      use _ <- result.try(case sandbox.remove(policy, key) {
-        Ok(Nil) -> Ok(Nil)
-        Error(sandbox.DockerFailed(output:, ..)) ->
-          case string.contains(string.lowercase(output), "no such container") {
-            True -> Ok(Nil)
-            False -> Error("docker rm: " <> string.trim(output))
-          }
-        Error(error) -> Error("docker rm: " <> string.inspect(error))
-      })
-      delete_thread_dir(policy.root, key)
-    },
-    run_in_sandbox: Some(fn(key, env, script) {
-      sandbox.run_in(policy, key, env, script)
-      |> result.map_error(string.inspect)
-    }),
-  )
-}
-
-@external(erlang, "crushling_local_ffi", "start")
-fn start_server(
-  crush: String,
-  dial_url: String,
-  workdir: String,
-  log: String,
-  env: List(String),
-  pid_file: String,
-) -> Result(Int, String)
-
-@external(erlang, "crushling_local_ffi", "stop")
-fn stop_server(pid_file: String) -> Result(Nil, String)
-
-@external(erlang, "crushling_local_ffi", "alive")
-fn alive(os_pid: Int) -> Bool
-
-@external(erlang, "crushling_ffi", "file_exists")
-fn file_exists(path: String) -> Bool
-
 @external(erlang, "crushling_store_ffi", "dir_exists")
 fn dir_exists(path: String) -> Bool
 
 @external(erlang, "crushling_store_ffi", "rename")
 fn rename(from: String, to: String) -> Result(Nil, String)
 
-/// Rename `root/old` to `root/new`, unless there's nothing to move or the
-/// new one already exists.
 @external(erlang, "crushling_ffi", "delete_tree")
 fn delete_tree(path: String) -> Result(Nil, String)
 
@@ -308,6 +218,8 @@ fn delete_thread_dir(root: String, key: String) -> Result(Nil, String) {
   }
 }
 
+/// Rename `root/old` to `root/new`, unless there's nothing to move or the
+/// new one already exists.
 pub fn move_dir(root: String, old: String, new: String) -> Result(Nil, String) {
   let from = root <> "/" <> old
   let to = root <> "/" <> new
@@ -317,119 +229,5 @@ pub fn move_dir(root: String, old: String, new: String) -> Result(Nil, String) {
       |> result.map_error(fn(reason) { "renaming " <> from <> ": " <> reason })
     True, True -> Error(to <> " already exists")
     False, _ -> Ok(Nil)
-  }
-}
-
-/// Run each thread's `crush server --dial` on this machine, under
-/// `root/<key>`, the same way a sandbox runs it. `crush` is the binary, or
-/// "" for the one on `PATH`. Each server's pid is kept in
-/// `root/<key>/server.pid`, and it is stopped by that pid.
-pub fn local(
-  root: String,
-  crush: String,
-  models: provider.Models,
-  bridge: Bridge,
-) -> Launcher {
-  let dir = fn(key) { root <> "/" <> key }
-  let pid_file = fn(key) { dir(key) <> "/server.pid" }
-  let cleanup = fn(key) {
-    let errors = case stop_server(pid_file(key)) {
-      Ok(Nil) -> []
-      Error(reason) -> ["crush server: " <> reason]
-    }
-    bridge.close(key)
-    bridge.revoke(key)
-    errors
-  }
-  Launcher(
-    launch: fn(key) {
-      let base = dir(key)
-      let work = base <> "/work"
-      // A server left over from an earlier bridge would keep dialing; this
-      // waits for it to exit.
-      use _ <- result.try(
-        stop_server(pid_file(key))
-        |> result.map_error(fn(reason) {
-          "an earlier crush server is still running: " <> reason
-        }),
-      )
-      use shim <- result.try(
-        bridge.open(key)
-        |> result.map_error(fn(reason) { "tunnel: " <> reason }),
-      )
-      bridge.restore(key)
-      let started = {
-        use _ <- result.try(sys.mkdir_p(work))
-        use _ <- result.try(sys.mkdir_p(base <> "/home/config"))
-        use _ <- result.try(sys.mkdir_p(base <> "/home/data"))
-        use _ <- result.try(sys.mkdir_p(base <> "/home/honcho"))
-        use _ <- result.try(sys.write_private(
-          base <> "/home/data/crush.json",
-          provider.config(models, bridge.url),
-        ))
-        let env = [
-          "CRUSH_GLOBAL_CONFIG=" <> base <> "/home/config",
-          "CRUSH_GLOBAL_DATA=" <> base <> "/home/data",
-          // The same goes for the Honcho memory sign-in in ~/.honcho, which
-          // would otherwise record every Slack conversation as yours.
-          "HONCHO_CONFIG_DIR=" <> base <> "/home/honcho",
-          "CRUSH_SERVER_IDLE_TIMEOUT=31536000",
-          "CRUSH_SERVER_DETACH_GRACE=120",
-          ..bridge.env(key)
-        ]
-        use os_pid <- result.try(start_server(
-          crush,
-          tunnel.dial_url(bridge.url, key),
-          work,
-          base <> "/server.log",
-          env,
-          pid_file(key),
-        ))
-        await_local_hello(bridge, key, os_pid, bridge.hello_timeout_ms)
-      }
-      case started {
-        Ok(Nil) -> Ok(Launched(socket: shim, root: work))
-        Error(reason) -> Error(undone(key, reason, cleanup(key)))
-      }
-    },
-    stop: fn(key) {
-      bridge.bye(key)
-      stop_result(key, cleanup(key))
-    },
-    exists: fn(key) { file_exists(dir(key) <> "/work") },
-    rekey: fn(old, new) {
-      use _ <- result.try(
-        stop_server(pid_file(old))
-        |> result.map_error(fn(reason) { "crush server: " <> reason }),
-      )
-      move_dir(root, old, new)
-    },
-    forget: fn(key) {
-      use _ <- result.try(
-        stop_server(pid_file(key))
-        |> result.map_error(fn(reason) { "crush server: " <> reason }),
-      )
-      delete_thread_dir(root, key)
-    },
-    run_in_sandbox: None,
-  )
-}
-
-/// Wait for the local crush to dial in, failing at once if it exits.
-fn await_local_hello(
-  bridge: Bridge,
-  key: String,
-  os_pid: Int,
-  left_ms: Int,
-) -> Result(Nil, String) {
-  let slice = int.min(500, left_ms)
-  case bridge.await_hello(key, slice) {
-    Ok(_) -> Ok(Nil)
-    Error(reason) ->
-      case alive(os_pid), left_ms <= slice {
-        False, _ -> Error("crush server exited while starting; see server.log")
-        True, True -> Error(reason)
-        True, False -> await_local_hello(bridge, key, os_pid, left_ms - slice)
-      }
   }
 }

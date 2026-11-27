@@ -1,11 +1,28 @@
+import crushling/agent/spec
+import crushling/provider
 import crushling/sandbox
+import crushling/sys
+import gleam/dynamic/decode
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/string
 
+fn settings() -> spec.Settings {
+  spec.Settings(
+    bridge_url: "http://172.30.0.1:7469",
+    secret: "sandbox-test-secret",
+    github: False,
+    models: provider.Models(provider.default_large, provider.default_small),
+    env: ["EXTRA=1"],
+    own_team: "",
+    own_env: [],
+  )
+}
+
 fn policy() -> sandbox.Policy {
   sandbox.Policy(
-    docker: "docker",
+    socket: "/nonexistent/docker.sock",
     image: "crushling-sandbox:latest",
     runtime: "runsc",
     network: "sbx-egress",
@@ -15,37 +32,54 @@ fn policy() -> sandbox.Policy {
     uid: 970,
     gid: 970,
     root: "/storage/crushling/workspaces",
-    env: ["EXTRA=1"],
-    own_team: "",
-    own_env: [],
-    crush_config: "{}",
     crush: "",
     dns: [],
-    bridge_url: "http://172.30.0.1:7469",
+    spec: settings(),
   )
 }
 
-pub fn run_args_test() {
-  let args = sandbox.run_args(policy(), "k", [])
-  let pairs = list.window_by_2(args)
-  let has = fn(a, b) { list.contains(pairs, #(a, b)) }
-  let assert True = has("--name", "crushling-k")
-  let assert True = has("--runtime", "runsc")
-  let assert True = has("--network", "sbx-egress")
-  let assert True = has("--user", "970:970")
-  let assert True = has("--cap-drop", "ALL")
-  let assert True = has("--env", "EXTRA=1")
+fn body(p: sandbox.Policy, key: String) -> String {
+  let s = spec.build(p.spec, p.root, key, spec.Contained)
+  let assert Ok(body) = sandbox.create_body(p, s)
+  json.to_string(body)
+}
+
+fn field(text: String, path: List(String), of: decode.Decoder(a)) -> a {
+  let assert Ok(value) = json.parse(text, decode.at(path, of))
+  value
+}
+
+pub fn create_body_test() {
+  let text = body(policy(), "k")
+  let strings = decode.list(decode.string)
+  let assert "crushling-sandbox:latest" = field(text, ["Image"], decode.string)
+  let assert "970:970" = field(text, ["User"], decode.string)
+  let assert "/workspace" = field(text, ["WorkingDir"], decode.string)
+  let assert "runsc" = field(text, ["HostConfig", "Runtime"], decode.string)
+  let assert "sbx-egress" =
+    field(text, ["HostConfig", "NetworkMode"], decode.string)
+  let assert ["ALL"] = field(text, ["HostConfig", "CapDrop"], strings)
+  let assert ["no-new-privileges"] =
+    field(text, ["HostConfig", "SecurityOpt"], strings)
+  let assert 2_000_000_000 = field(text, ["HostConfig", "NanoCpus"], decode.int)
+  let assert 2_147_483_648 = field(text, ["HostConfig", "Memory"], decode.int)
+  let assert 1024 = field(text, ["HostConfig", "PidsLimit"], decode.int)
+  let assert ["/storage/crushling/workspaces/k/work:/workspace"] =
+    field(text, ["HostConfig", "Binds"], strings)
+  let assert "1" = field(text, ["Labels", "crushling-sandbox"], decode.string)
   let assert True =
-    has("--volume", "/storage/crushling/workspaces/k/work:/workspace")
+    field(text, ["Labels", "crushling-sandbox-policy"], decode.string)
+    == sandbox.fingerprint(policy())
   // crush dials the bridge's tunnel: no socket is mounted, so plain runsc
   // will do.
-  let assert False =
-    list.any(args, fn(arg) {
-      string.contains(arg, "/sock") || string.contains(arg, "unix://")
-    })
-  let assert ["server", "--dial", "ws://172.30.0.1:7469/tunnel/k"] =
-    list.drop(args, list.length(args) - 3)
-  let assert ["run", "--detach", ..] = args
+  let assert ["crush", "server", "--dial", "ws://172.30.0.1:7469/tunnel/k"] =
+    field(text, ["Cmd"], strings)
+  let env = field(text, ["Env"], strings)
+  let assert True = list.contains(env, "EXTRA=1")
+  let assert True = list.contains(env, "HOME=/workspace/.home")
+  let assert True = list.contains(env, "CRUSH_SERVER_IDLE_TIMEOUT=31536000")
+  let assert True = list.contains(env, "CRUSHLING_THREAD=k")
+  let assert False = list.any(env, string.starts_with(_, "CRUSH_HYPER_"))
 }
 
 pub fn fingerprint_tracks_policy_test() {
@@ -57,16 +91,21 @@ pub fn fingerprint_tracks_policy_test() {
   let assert False =
     base
     == sandbox.fingerprint(
-      sandbox.Policy(..policy(), bridge_url: "http://10.0.0.1:7469"),
+      sandbox.Policy(
+        ..policy(),
+        spec: spec.Settings(..settings(), bridge_url: "http://10.0.0.1:7469"),
+      ),
     )
 }
 
-/// The fingerprint of the same policy before crush dialed out: containers
-/// made then listen on a socket nobody connects to now, and are recreated.
-pub fn sockets_era_containers_are_recreated_test() {
+/// The fingerprint is the same string the CLI-era bridge labelled
+/// containers with, so moving to the Engine API recreates nothing.
+pub fn the_fingerprint_is_unchanged_test() {
   let p = policy()
   let old =
     [
+      "dial",
+      "http://172.30.0.1:7469",
       p.image,
       p.runtime,
       p.network,
@@ -76,16 +115,17 @@ pub fn sockets_era_containers_are_recreated_test() {
       "970",
       "970",
       p.root,
-      p.crush_config,
+      provider.config(settings().models, "http://172.30.0.1:7469"),
       "",
       "",
-      ..p.env
+      "",
+      "",
+      "EXTRA=1",
     ]
     |> string.join("\u{0}")
     |> sha256_hex
     |> string.slice(0, 16)
-  let assert False = old == sandbox.fingerprint(p)
-  let assert sandbox.Recreate = sandbox.decide(sandbox.Present(True, old), p)
+  let assert True = old == sandbox.fingerprint(p)
 }
 
 @external(erlang, "crushling_ffi", "sha256_hex")
@@ -102,15 +142,45 @@ pub fn decide_test() {
 }
 
 pub fn parse_inspect_test() {
-  let assert sandbox.Present(True, "abc") = sandbox.parse_inspect("true abc\n")
-  let assert sandbox.Present(False, "") = sandbox.parse_inspect("false \n")
-  let assert sandbox.Present(False, "") = sandbox.parse_inspect("false")
+  let assert sandbox.Present(True, "abc") =
+    sandbox.parse_inspect(
+      "{\"State\":{\"Running\":true},\"Config\":{\"Labels\":{\"crushling-sandbox-policy\":\"abc\"}}}",
+    )
+  let assert sandbox.Present(False, "") =
+    sandbox.parse_inspect(
+      "{\"State\":{\"Running\":false},\"Config\":{\"Labels\":null}}",
+    )
   let assert sandbox.Missing = sandbox.parse_inspect("")
 }
 
-pub fn docker_missing_is_unavailable_test() {
-  let p = sandbox.Policy(..policy(), docker: "definitely-not-docker-xyz")
-  let assert Error(sandbox.DockerUnavailable(_)) = sandbox.observe(p, "k")
+pub fn an_unreachable_engine_is_an_error_test() {
+  let assert Error(sandbox.Unreachable(_)) = sandbox.observe(policy(), "k")
+}
+
+pub fn sizes_are_read_as_docker_reads_them_test() {
+  let assert Ok(1_500_000_000) = sandbox.nano_cpus("1.5")
+  let assert Error(_) = sandbox.nano_cpus("lots")
+  let assert Ok(536_870_912) = sandbox.memory_bytes("512m")
+  let assert Ok(4_294_967_296) = sandbox.memory_bytes("4GB")
+  let assert Ok(1024) = sandbox.memory_bytes("1024")
+  let assert Error(_) = sandbox.memory_bytes("big")
+  let assert Error(_) = sandbox.check(sandbox.Policy(..policy(), memory: "0"))
+}
+
+pub fn demux_joins_both_streams_test() {
+  let frames = <<
+    1, 0, 0, 0, 0, 0, 0, 3, "out":utf8, 2, 0, 0, 0, 0, 0, 0, 4, "err!":utf8,
+  >>
+  let assert <<"outerr!":utf8>> = sandbox.demux(frames, <<>>)
+  let assert <<"plain":utf8>> = sandbox.demux(<<"plain":utf8>>, <<>>)
+}
+
+pub fn exec_body_carries_env_in_the_body_test() {
+  let text = json.to_string(sandbox.exec_body(["TS_AUTHKEY=secret"], "echo hi"))
+  let assert ["sh", "-c", "echo hi"] =
+    field(text, ["Cmd"], decode.list(decode.string))
+  let assert ["TS_AUTHKEY=secret"] =
+    field(text, ["Env"], decode.list(decode.string))
 }
 
 pub fn prepare_creates_dirs_test() {
@@ -120,34 +190,24 @@ pub fn prepare_creates_dirs_test() {
       root: "/tmp/crushling-sandbox-test-"
         <> int.to_string(int.absolute_value(unique())),
     )
-  let assert Ok(Nil) = sandbox.prepare(p, "k")
+  let s = spec.build(p.spec, p.root, "k", spec.Contained)
+  let assert Ok(Nil) = sandbox.prepare(p, s)
   let assert True = file_exists(sandbox.host_workspace(p, "k"))
-  let assert False = file_exists(p.root <> "/k/sock")
   let assert True =
-    file_exists(sandbox.host_crush_data(p, "k") <> "/crush.json")
-}
-
-pub fn exec_runs_without_a_shell_test() {
-  // `echo` stands in for docker: it prints its arguments, which are not an
-  // inspect result, so the container reads as missing.
-  let p = sandbox.Policy(..policy(), docker: "echo")
-  let assert Ok(sandbox.Missing) = sandbox.observe(p, "k; rm -rf /")
+    file_exists(
+      sandbox.host_workspace(p, "k") <> "/.home/.local/share/crush/crush.json",
+    )
 }
 
 pub fn a_mounted_crush_runs_from_the_mount_test() {
-  let plain = sandbox.run_args(policy(), "k", [])
+  let strings = decode.list(decode.string)
+  let mounted = body(sandbox.Policy(..policy(), crush: "/opt/crush"), "k")
   let assert True =
-    list.contains(list.window_by_2(plain), #(
-      "crushling-sandbox:latest",
-      "crush",
-    ))
-  let mounted =
-    sandbox.run_args(sandbox.Policy(..policy(), crush: "/opt/crush"), "k", [])
-  let pairs = list.window_by_2(mounted)
-  let assert True =
-    list.contains(pairs, #("--volume", "/opt/crush:/opt/crushling/crush:ro"))
-  let assert True =
-    list.contains(pairs, #("crushling-sandbox:latest", "/opt/crushling/crush"))
+    list.contains(
+      field(mounted, ["HostConfig", "Binds"], strings),
+      "/opt/crush:/opt/crushling/crush:ro",
+    )
+  let assert ["/opt/crushling/crush", ..] = field(mounted, ["Cmd"], strings)
 }
 
 pub fn a_new_crush_binary_changes_the_fingerprint_test() {
@@ -164,18 +224,19 @@ pub fn a_new_crush_binary_changes_the_fingerprint_test() {
 fn write_file(path: String, content: String) -> Result(Nil, String)
 
 pub fn sandboxes_get_their_own_nameservers_test() {
-  let plain = list.window_by_2(sandbox.run_args(policy(), "k", []))
+  let strings = decode.list(decode.string)
+  let resolv = "/storage/crushling/workspaces/resolv.conf:/etc/resolv.conf:ro"
   let assert False =
-    list.contains(plain, #(
-      "--volume",
-      "/storage/crushling/workspaces/resolv.conf:/etc/resolv.conf:ro",
-    ))
+    list.contains(
+      field(body(policy(), "k"), ["HostConfig", "Binds"], strings),
+      resolv,
+    )
   let with_dns = sandbox.Policy(..policy(), dns: ["1.1.1.1"])
   let assert True =
-    list.contains(list.window_by_2(sandbox.run_args(with_dns, "k", [])), #(
-      "--volume",
-      "/storage/crushling/workspaces/resolv.conf:/etc/resolv.conf:ro",
-    ))
+    list.contains(
+      field(body(with_dns, "k"), ["HostConfig", "Binds"], strings),
+      resolv,
+    )
   let assert False =
     sandbox.fingerprint(policy()) == sandbox.fingerprint(with_dns)
 }
@@ -197,4 +258,69 @@ pub fn unused_images_test() {
       ["crushling-sandbox:pinned", "erlang:27"],
       "crushling-sandbox:new",
     )
+}
+
+@external(erlang, "crushling_ffi", "getenv")
+fn getenv(name: String) -> Result(String, Nil)
+
+@external(erlang, "crushling_test_ffi", "make_executable")
+fn make_executable(path: String) -> Nil
+
+/// The Engine API calls against a real docker, with `CRUSHLING_DOCKER=1`
+/// and `alpine:3` pulled: runc stands in for runsc, and a script mounted as
+/// crush sleeps instead of dialing.
+pub fn real_docker_test() {
+  case getenv("CRUSHLING_DOCKER") {
+    Ok("1") -> real_docker()
+    _ -> Nil
+  }
+}
+
+fn real_docker() -> Nil {
+  let root =
+    "/tmp/crushling-docker-test-" <> int.to_string(int.absolute_value(unique()))
+  let crush = root <> "/fake-crush"
+  let assert Ok(Nil) = sys.mkdir_p(root)
+  let assert Ok(Nil) = write_file(crush, "#!/bin/sh\nexec sleep 300\n")
+  make_executable(crush)
+  let p =
+    sandbox.Policy(
+      ..policy(),
+      socket: sandbox.default_socket,
+      image: "alpine:3",
+      runtime: "runc",
+      network: "bridge",
+      cpus: "1",
+      memory: "256m",
+      root:,
+      crush:,
+    )
+  let key = "T1-C1-" <> int.to_string(int.absolute_value(unique()))
+  let s = spec.build(p.spec, p.root, key, spec.Contained)
+  let assert Ok(Nil) = sandbox.prepare(p, s)
+  let assert Ok(sandbox.Missing) = sandbox.observe(p, key)
+  let assert Ok(Nil) = sandbox.ensure(p, s)
+  let current = sandbox.fingerprint(p)
+  let assert Ok(sandbox.Present(True, seen)) = sandbox.observe(p, key)
+  let assert True = seen == current
+  let assert Ok(running) = sandbox.running(p)
+  let assert True = list.contains(running, key)
+  // Adopted as it is.
+  let assert Ok(Nil) = sandbox.ensure(p, s)
+  let assert Ok(out) =
+    sandbox.run_in(p, key, ["GREETING=hi"], "echo $GREETING; echo oops >&2")
+  let assert True = string.contains(out, "hi") && string.contains(out, "oops")
+  let assert Error(sandbox.Exited(3, _)) = sandbox.run_in(p, key, [], "exit 3")
+  let assert Ok(Nil) = sandbox.stop(p, key)
+  let assert Ok(sandbox.Present(False, _)) = sandbox.observe(p, key)
+  // Already stopped is fine; started again under the same policy.
+  let assert Ok(Nil) = sandbox.stop(p, key)
+  let assert Ok(Nil) = sandbox.ensure(p, s)
+  let assert Ok(sandbox.Present(True, _)) = sandbox.observe(p, key)
+  let assert Ok(Nil) = sandbox.remove(p, key)
+  let assert Ok(sandbox.Missing) = sandbox.observe(p, key)
+  // Gone already is fine.
+  let assert Ok(Nil) = sandbox.remove(p, key)
+  let assert Ok(Nil) = sandbox.stop(p, key)
+  Nil
 }

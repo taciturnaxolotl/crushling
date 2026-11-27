@@ -9,6 +9,8 @@ import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/list
 import gleam/option.{type Option}
+import gleam/otp/static_supervisor
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import mist
@@ -23,11 +25,7 @@ pub fn start(
   port: Int,
   routes: List(Route),
 ) -> Result(Nil, String) {
-  let handler = fn(req: Request(mist.Connection)) {
-    list.find_map(routes, fn(route) { option.to_result(route(req), Nil) })
-    |> result.unwrap(reply(404, ""))
-  }
-  mist.new(handler)
+  mist.new(handler(routes))
   |> mist.bind(bind)
   |> mist.port(port)
   |> mist.after_start(fn(_, _, _) { Nil })
@@ -42,6 +40,29 @@ pub fn start(
     <> ": "
     <> string.inspect(error)
   })
+}
+
+/// `start` as a supervised child; a failure to listen is the
+/// supervisor's to report.
+pub fn supervised(
+  bind: String,
+  port: Int,
+  routes: List(Route),
+) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
+  mist.new(handler(routes))
+  |> mist.bind(bind)
+  |> mist.port(port)
+  |> mist.after_start(fn(_, _, _) { Nil })
+  |> mist.supervised
+}
+
+fn handler(
+  routes: List(Route),
+) -> fn(Request(mist.Connection)) -> Response(mist.ResponseData) {
+  fn(req: Request(mist.Connection)) {
+    list.find_map(routes, fn(route) { option.to_result(route(req), Nil) })
+    |> result.unwrap(reply(404, ""))
+  }
 }
 
 /// A response with a plain body.

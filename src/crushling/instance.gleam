@@ -1,20 +1,22 @@
-//// One instance per Slack workspace the bridge serves, and the actor that
-//// keeps them: `team_id -> Instance`.
+//// One instance per Slack workspace the bridge serves, under a supervisor:
+//// `team_id -> Instance`.
 ////
 //// An instance is the workspace's registry and its Slack client (with that
 //// workspace's bot token). Everything else is shared by every instance, one
-//// each per bridge: the launcher, the tunnels and the proxy behind it (thread
-//// keys carry the team, so they never collide), the sandbox server, the
-//// store and the instance secret.
+//// each per bridge: the lifecycle owner, the tunnels and the proxy behind it
+//// (thread keys carry the team, so they never collide), the sandbox server,
+//// the store and the instance secret.
 ////
-//// Each workspace's allowlist and admins come from its `team_settings`; the
-//// workspace seeded from the environment (self-host) falls back to
-//// `CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`.
+//// Each registry is a child of a factory supervisor, registered under a
+//// name of its own: a crash in one workspace leaves the others running, and
+//// the supervisor starts it again (from the store, so with its latest
+//// token) under the same name. The teams actor beside it only remembers the
+//// names. Who may use a workspace is `people.settled` over its settings.
 
+import crushling/agents.{type Agents}
 import crushling/crush/client
 import crushling/github/broker
 import crushling/key as thread_key
-import crushling/launcher.{type Launcher}
 import crushling/people.{type People}
 import crushling/registry
 import crushling/registry/config as registry_config
@@ -32,6 +34,9 @@ import gleam/erlang/process.{type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/otp/factory_supervisor as factory
+import gleam/otp/static_supervisor as supervisor
+import gleam/otp/supervision
 import gleam/result
 import gleam/set.{type Set}
 import gleam/string
@@ -42,7 +47,7 @@ import slackline/httpc
 /// What every instance shares, and how to make each one's parts.
 pub type Shared {
   Shared(
-    launcher: Launcher,
+    agents: Agents,
     store: Store,
     root: String,
     mode: client.PermissionMode,
@@ -80,70 +85,114 @@ pub opaque type Teams {
   Teams(subject: Subject(Message))
 }
 
-type Message {
+pub opaque type Message {
   Start(team: teams.Team, reply: Subject(Result(Instance, String)))
   Find(team: String, reply: Subject(Option(Instance)))
   All(reply: Subject(List(Instance)))
-  /// Shutdown is under way: stop restarting registries, and reply with
-  /// every instance.
+  /// Shutdown is under way: reply with every instance.
   Drain(reply: Subject(List(Instance)))
-  /// A registry stopped.
-  RegistryDown(process.Down)
-  /// Start a team's registry again after it crashed.
-  Restart(team: String)
+  /// Start every active workspace in the store, as the teams actor starts.
+  StartStored
+}
+
+/// What the factory needs to start, and restart, a workspace's registry.
+type Spawn {
+  Spawn(team: String, name: process.Name(registry.Message))
 }
 
 type Running {
-  Running(instance: Instance, monitor: process.Monitor)
+  Running(instance: Instance, name: process.Name(registry.Message))
 }
 
 type State {
   State(
     shared: Shared,
-    self: Subject(Message),
+    registries: factory.Supervisor(Spawn, Subject(registry.Message)),
     running: Dict(String, Running),
-    draining: Bool,
-    /// Threads of the self-host workspace whose old workspace couldn't be
-    /// moved to their key (`registry/legacy`).
-    stranded: Set(String),
   )
 }
 
 const timeout_ms = 10_000
 
-/// How long after a crash a team's registry is started again.
-const restart_ms = 1000
+/// The workspaces as a supervised child: the registries' factory and the
+/// teams actor, restarted together. Reach them with `named(name)`.
+pub fn supervised(
+  shared: Shared,
+  name: process.Name(Message),
+) -> supervision.ChildSpecification(supervisor.Supervisor) {
+  supervision.supervisor(fn() { start_tree(shared, name) })
+}
 
-/// Each team's registry is started by this actor but not linked to it, and
-/// monitored instead: one team's crash leaves the others, and this actor,
-/// alone, and the crashed registry is started again.
+/// The teams registered under `name`.
+pub fn named(name: process.Name(Message)) -> Teams {
+  Teams(process.named_subject(name))
+}
+
+/// The workspaces, linked to the caller, under a fresh name.
 pub fn start(shared: Shared) -> Result(Teams, String) {
+  let name = process.new_name("crushling_teams")
+  start_tree(shared, name)
+  |> result.map(fn(_) { named(name) })
+  |> result.map_error(fn(error) { "teams: " <> string.inspect(error) })
+}
+
+fn start_tree(
+  shared: Shared,
+  name: process.Name(Message),
+) -> actor.StartResult(supervisor.Supervisor) {
   // Only the self-host workspace has threads from before keys carried the
   // workspace. Moved here, once, as moving each can take a docker call.
   let stranded = case shared.env_team {
     Some(env) ->
-      legacy.migrate(shared.store, shared.launcher, shared.root, env.id)
+      legacy.migrate(shared.store, shared.agents, shared.root, env.id)
     None -> set.new()
   }
+  let factory_name = process.new_name("crushling_registries")
+  let registries =
+    factory.worker_child(fn(spawn: Spawn) {
+      start_registry(shared, stranded, spawn)
+    })
+    // A registry that shuts down isn't started again; one that crashes is.
+    |> factory.restart_strategy(supervision.Transient)
+    |> factory.restart_tolerance(intensity: 5, period: 10)
+    |> factory.named(factory_name)
+  supervisor.new(supervisor.RestForOne)
+  |> supervisor.add(factory.supervised(registries))
+  |> supervisor.add(
+    supervision.worker(fn() {
+      start_teams(shared, factory.get_by_name(factory_name), name)
+    }),
+  )
+  |> supervisor.start
+}
+
+fn start_teams(
+  shared: Shared,
+  registries: factory.Supervisor(Spawn, Subject(registry.Message)),
+  name: process.Name(Message),
+) -> actor.StartResult(Subject(Message)) {
   actor.new_with_initialiser(timeout_ms, fn(self) {
-    let selector =
-      process.new_selector()
-      |> process.select(self)
-      |> process.select_monitors(RegistryDown)
-    State(shared:, self:, running: dict.new(), draining: False, stranded:)
+    // After init, so a slow store doesn't hold up the supervisor.
+    process.send(self, StartStored)
+    State(shared:, registries:, running: dict.new())
     |> actor.initialised
-    |> actor.selecting(selector)
     |> actor.returning(self)
     |> Ok
   })
   |> actor.on_message(handle)
+  |> actor.named(name)
   |> actor.start
-  |> result.map(fn(started) { Teams(started.data) })
-  |> result.map_error(fn(error) { "teams: " <> string.inspect(error) })
+}
+
+/// Whether the registry under `name` is up right now.
+fn up(running: Running) -> Bool {
+  result.is_ok(process.named(running.name))
 }
 
 fn instances(state: State) -> List(Instance) {
-  dict.values(state.running) |> list.map(fn(running) { running.instance })
+  dict.values(state.running)
+  |> list.filter(up)
+  |> list.map(fn(running) { running.instance })
 }
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
@@ -152,8 +201,14 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
       process.send(
         reply,
         dict.get(state.running, team)
-          |> option.from_result
-          |> option.map(fn(running) { running.instance }),
+          |> result.try(fn(running) {
+            case up(running) {
+              True -> Ok(running.instance)
+              // Being started again; sending now would fail.
+              False -> Error(Nil)
+            }
+          })
+          |> option.from_result,
       )
       actor.continue(state)
     }
@@ -163,174 +218,143 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
     }
     Drain(reply) -> {
       process.send(reply, instances(state))
-      actor.continue(State(..state, draining: True))
-    }
-    Start(team, reply) ->
-      case dict.get(state.running, team.id) {
-        // A reinstall keeps the running instance; its new token is in the
-        // store for the next start.
-        Ok(running) -> {
-          process.send(reply, Ok(running.instance))
-          actor.continue(state)
-        }
-        Error(Nil) -> {
-          let #(state, started) = launch(state, team)
-          process.send(reply, started)
-          actor.continue(state)
-        }
-      }
-    RegistryDown(process.ProcessDown(monitor:, reason:, ..)) -> {
-      let gone =
-        dict.filter(state.running, fn(_, running) { running.monitor == monitor })
-        |> dict.keys
-      let state = State(..state, running: dict.drop(state.running, gone))
-      case reason, state.draining {
-        // Stopped at shutdown.
-        process.Normal, _ | _, True -> Nil
-        _, False ->
-          list.each(gone, fn(team) {
-            sys.warn(
-              "crushling: the registry for workspace "
-              <> team
-              <> " crashed ("
-              <> string.inspect(reason)
-              <> "); starting it again",
-            )
-            process.send_after(state.self, restart_ms, Restart(team))
-            Nil
-          })
-      }
       actor.continue(state)
     }
-    RegistryDown(_) -> actor.continue(state)
-    Restart(team) ->
-      case state.draining, dict.has_key(state.running, team) {
-        False, False ->
-          // From the store, so it starts with the team's latest token.
-          case teams.team(state.shared.store, team) {
-            Ok(Some(found)) if found.active -> {
-              let #(state, started) = launch(state, found)
-              case started {
-                Ok(_) -> Nil
-                Error(reason) ->
-                  sys.warn(
-                    "crushling: restarting workspace "
-                    <> team
-                    <> " failed: "
-                    <> reason,
-                  )
-              }
-              actor.continue(state)
+    Start(team, reply) -> {
+      let #(state, started) = start_one(state, team)
+      process.send(reply, started)
+      actor.continue(state)
+    }
+    StartStored ->
+      case teams.active_teams(state.shared.store) {
+        Error(reason) -> {
+          sys.warn("crushling: listing workspaces: " <> reason)
+          actor.continue(state)
+        }
+        Ok(teams) ->
+          list.fold(teams, state, fn(state, team) {
+            let #(state, started) = start_one(state, team)
+            case started {
+              Ok(_) -> Nil
+              Error(reason) ->
+                sys.warn(
+                  "crushling: couldn't start workspace "
+                  <> team.id
+                  <> ": "
+                  <> reason,
+                )
             }
-            _ -> actor.continue(state)
-          }
-        _, _ -> actor.continue(state)
+            state
+          })
+          |> actor.continue
       }
   }
 }
 
-fn launch(
+fn start_one(
   state: State,
   team: teams.Team,
 ) -> #(State, Result(Instance, String)) {
-  case start_instance(state.shared, state.stranded, team) {
-    Error(reason) -> #(state, Error(reason))
-    Ok(instance) -> {
-      let assert Ok(pid) = process.subject_owner(instance.registry)
-      // actor.start linked it to this actor.
-      process.unlink(pid)
-      let monitor = process.monitor(pid)
-      #(
-        State(
-          ..state,
-          running: dict.insert(
-            state.running,
-            team.id,
-            Running(instance:, monitor:),
+  case dict.get(state.running, team.id) {
+    // A reinstall keeps the running instance; its new token is in the
+    // store for the next start.
+    Ok(running) -> #(state, Ok(running.instance))
+    Error(Nil) -> {
+      let name = process.new_name("crushling_registry")
+      let started =
+        factory.start_child(state.registries, Spawn(team.id, name))
+        |> result.map_error(fn(error) {
+          "registry for " <> team.id <> ": " <> string.inspect(error)
+        })
+        |> result.map(fn(_) {
+          Instance(
+            team: team.id,
+            bot_user: team.bot_user,
+            client: state.shared.client(team.bot_token),
+            registry: process.named_subject(name),
+          )
+        })
+      case started {
+        Ok(instance) -> #(
+          State(
+            ..state,
+            running: dict.insert(
+              state.running,
+              team.id,
+              Running(instance:, name:),
+            ),
           ),
-        ),
-        Ok(instance),
-      )
+          started,
+        )
+        Error(_) -> #(state, started)
+      }
     }
-  }
-}
-
-/// The self-host workspace's allowlist and admins, from the values of
-/// `CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`. The allowlist must not
-/// be empty; `*` in it means every member of the workspace. Admins approve
-/// tailnet access, so they must be listed by id.
-pub fn env_people(
-  allowed: String,
-  admins: String,
-) -> Result(#(People, Set(String)), String) {
-  let allowed = people.parse(allowed)
-  let admins = people.parse(admins)
-  case people.is_empty(allowed), admins.everyone {
-    // An agent in sysadmin mode that anyone can drive is not a default
-    // worth having: everyone has to be asked for.
-    True, _ ->
-      Error(
-        "CRUSHLING_ALLOWED_USERS is empty; list the Slack user ids, or `*` for everyone in the workspace",
-      )
-    _, True ->
-      Error(
-        "CRUSHLING_ADMINS can't be `*`; admins approve tailnet access, so list their Slack user ids",
-      )
-    False, False -> Ok(#(allowed, admins.ids))
   }
 }
 
 /// A workspace's allowlist and admins: its settings in the store, else the
-/// environment's for the environment's own workspace, else nobody. Admins
-/// are only ever listed ids: a `*` among them is dropped, with a warning.
+/// environment's for the environment's own workspace, else nobody.
 pub fn people(
   shared: Shared,
   team: String,
 ) -> Result(#(People, Set(String)), String) {
   use settings <- result.map(teams.settings(shared.store, team))
   let env = case shared.env_team {
-    Some(env) if env.id == team -> Some(env)
+    Some(env) if env.id == team -> Some(#(env.allowed, env.admins))
     _ -> None
   }
-  let allowed = case dict.get(settings, teams.allowed_users), env {
-    Ok(value), _ -> people.parse(value)
-    Error(Nil), Some(env) -> env.allowed
-    Error(Nil), None -> people.nobody()
+  people.settled(
+    dict.get(settings, teams.allowed_users),
+    dict.get(settings, teams.admins),
+    env,
+    fn() {
+      sys.warn(
+        "crushling: ignoring `*` in the admins setting of "
+        <> team
+        <> "; admins must be listed by id",
+      )
+    },
+  )
+}
+
+/// Start, or start again, a workspace's registry, from its row in the store.
+fn start_registry(
+  shared: Shared,
+  stranded: Set(String),
+  spawn: Spawn,
+) -> actor.StartResult(Subject(registry.Message)) {
+  let failed = fn(reason) {
+    sys.warn("crushling: starting workspace " <> spawn.team <> ": " <> reason)
+    Error(actor.InitFailed(reason))
   }
-  let admins = case dict.get(settings, teams.admins), env {
-    Ok(value), _ -> {
-      let admins = people.parse(value)
-      case admins.everyone {
-        True ->
-          sys.warn(
-            "crushling: ignoring `*` in the admins setting of "
-            <> team
-            <> "; admins must be listed by id",
-          )
-        False -> Nil
+  case teams.team(shared.store, spawn.team) {
+    Ok(Some(team)) ->
+      case people(shared, team.id) {
+        Ok(#(allowed, admins)) ->
+          start_instance(shared, stranded, team, allowed, admins, spawn.name)
+        Error(reason) -> failed(reason)
       }
-      admins.ids
-    }
-    Error(Nil), Some(env) -> env.admins
-    Error(Nil), None -> set.new()
+    Ok(None) -> failed("not in the store")
+    Error(reason) -> failed(reason)
   }
-  #(allowed, admins)
 }
 
 fn start_instance(
   shared: Shared,
   stranded: Set(String),
   team: teams.Team,
-) -> Result(Instance, String) {
-  use #(allowed, admins) <- result.try(people(shared, team.id))
+  allowed: People,
+  admins: Set(String),
+  name: process.Name(registry.Message),
+) -> actor.StartResult(Subject(registry.Message)) {
   let client = shared.client(team.bot_token)
   let is_env = case shared.env_team {
     Some(env) -> env.id == team.id
     None -> False
   }
-  use registry <- result.map(
-    registry.start(registry_config.Config(
-      launcher: shared.launcher,
+  use started <- result.map(registry.start_with(
+    registry_config.Config(
+      launcher: agents.launcher(shared.agents),
       client:,
       token: team.bot_token,
       bot_user: team.bot_user,
@@ -353,11 +377,10 @@ fn start_instance(
       root: shared.root,
       github: shared.github,
       default_model: shared.default_model,
-    ))
-    |> result.map_error(fn(error) {
-      "registry for " <> team.id <> ": " <> string.inspect(error)
-    }),
-  )
+    ),
+    Some(shared.agents),
+    Some(name),
+  ))
   sys.info(
     "crushling: serving workspace "
     <> team.id
@@ -379,7 +402,7 @@ fn start_instance(
       )
     _, _, _ -> Nil
   }
-  Instance(team: team.id, bot_user: team.bot_user, client:, registry:)
+  started
 }
 
 /// Self-host: put the workspace of the bot token in the store, as auth.test

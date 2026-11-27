@@ -1,6 +1,7 @@
 //// A thread's agent from launch to stop: one launch or stop at a time,
 //// and an idle stop once it has been quiet for `idle_ms`.
 
+import crushling/agents
 import crushling/conversation.{Conversation}
 import crushling/launcher
 import crushling/registry/backlog.{pump}
@@ -39,42 +40,45 @@ pub fn launch(state: State(msg), key: String, entry: Entry) -> State(msg) {
   let thread_ts = entry.thread_ts
   let meta = entry.meta
   let state = set_meta(state, key, entry, meta)
-  process.spawn_unlinked(fn() {
-    // A thread actor that can't start would leave nothing driving the agent, so it is stopped.
-    let result = {
-      use launched <- launcher.launch_then(config.launcher, key)
-      let sink = case meta.venue {
-        venue.CodeChannel(channel: code, ..) -> {
-          // Channels opened before commands existed get them now.
-          slack.set_code_commands(config.client, code)
-          slack.sink(config.client, config.team, code, slack.InCodeChannel)
-        }
-        _ ->
-          slack.sink(
-            config.client,
-            config.team,
-            channel,
-            slack.InThread(thread_ts),
-          )
+  // A thread actor that can't start would leave nothing driving the agent, so the owner stops it.
+  let attach = fn(launched: launcher.Launched) {
+    let sink = case meta.venue {
+      venue.CodeChannel(channel: code, ..) -> {
+        // Channels opened before commands existed get them now.
+        slack.set_code_commands(config.client, code)
+        slack.sink(config.client, config.team, code, slack.InCodeChannel)
       }
-      thread.start(
-        thread.Config(
-          socket: launched.socket,
-          root: launched.root,
-          title: "slack " <> channel <> " " <> thread_ts,
-          venue: meta.venue,
-          sink:,
-          flush_ms: config.flush_ms,
-          mode: config.mode,
-          notify: fn(notice) { tell(FromThread(key, notice)) },
-          on_connect: fn(_) { Nil },
-          model: meta.model,
-          home: #(channel, thread_ts),
-        ),
-      )
-      |> result.map_error(fn(error) { "thread: " <> string.inspect(error) })
+      _ ->
+        slack.sink(
+          config.client,
+          config.team,
+          channel,
+          slack.InThread(thread_ts),
+        )
     }
-    tell(Started(key, launch, result))
+    thread.start(
+      thread.Config(
+        socket: launched.socket,
+        root: launched.root,
+        title: "slack " <> channel <> " " <> thread_ts,
+        venue: meta.venue,
+        sink:,
+        flush_ms: config.flush_ms,
+        mode: config.mode,
+        notify: fn(notice) { tell(FromThread(key, notice)) },
+        on_connect: fn(_) { Nil },
+        model: meta.model,
+        home: #(channel, thread_ts),
+      ),
+    )
+    |> result.map(fn(thread) { tell(Started(key, launch, Ok(thread))) })
+    |> result.map_error(fn(error) { "thread: " <> string.inspect(error) })
+  }
+  agents.launch(state.agents, key, attach, fn(result) {
+    case result {
+      Ok(Nil) -> Nil
+      Error(reason) -> tell(Started(key, launch, Error(reason)))
+    }
   })
   State(
     ..put(state, key, Entry(..entry, agent: Starting(launch))),
@@ -105,6 +109,7 @@ pub fn started(
       if current == launch
     -> {
       let assert Ok(pid) = process.subject_owner(thread)
+      tether(pid)
       let live =
         Live(
           thread:,
@@ -183,11 +188,29 @@ pub fn retry_stop(state: State(msg), key: String) -> Nil {
   }
 }
 
-/// Run the launcher's stop for `key` on its own process.
+/// Ask the lifecycle owner to stop `key`'s agent; it answers with `Stopped`.
 fn run_stop(state: State(msg), key: String) -> Nil {
-  let stop = state.config.launcher.stop
   let tell = core.teller(state)
-  process.spawn_unlinked(fn() { tell(Stopped(key, stop(key))) })
+  agents.stop(state.agents, key, fn(result) { tell(Stopped(key, result)) })
+}
+
+/// A thread actor goes when the registry that started it does, so a restarted registry starts from nothing running.
+fn tether(thread: process.Pid) -> Nil {
+  let registry = process.self()
+  process.spawn_unlinked(fn() {
+    let selector =
+      process.new_selector()
+      |> process.select_specific_monitor(process.monitor(registry), fn(_) {
+        True
+      })
+      |> process.select_specific_monitor(process.monitor(thread), fn(_) {
+        False
+      })
+    case process.selector_receive_forever(selector) {
+      True -> process.kill(thread)
+      False -> Nil
+    }
+  })
   Nil
 }
 

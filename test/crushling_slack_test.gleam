@@ -1,3 +1,4 @@
+import crushling/agents
 import crushling/commands
 import crushling/crush/client
 import crushling/events
@@ -748,7 +749,7 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
       threads.Thread("C5-1.0", "T2", "C5", "1.0", meta.new(True)),
     )
   let #(fake, launches, rekeys) = migrating_launcher(root, False)
-  let assert True = set.is_empty(legacy.migrate(s, fake, root, "T1"))
+  let assert True = set.is_empty(legacy.migrate(s, owner(fake), root, "T1"))
   let assert Ok(#("C9-1.0", "T1-C9-1.0")) = process.receive(rekeys, 100)
   let assert Error(Nil) = process.receive(rekeys, 50)
   let new = k("C9", "1.0")
@@ -760,7 +761,7 @@ pub fn threads_under_their_old_key_move_to_the_new_one_test() {
   let assert Ok(Some(_)) = threads.thread(s, "C5-1.0")
   let assert True = file_exists(root <> "/C5-1.0/work")
   // Only once.
-  let assert True = set.is_empty(legacy.migrate(s, fake, root, "T1"))
+  let assert True = set.is_empty(legacy.migrate(s, owner(fake), root, "T1"))
   let assert Error(Nil) = process.receive(rekeys, 50)
   let r = start_registry_using(fake, s, None)
   // A plain reply: the thread follows along, as its old meta says.
@@ -816,7 +817,7 @@ fn migrating_launcher(root: String, rekey_fails: Bool) {
 /// after moving its old threads.
 fn migrating_registry(root: String, s: store.Store, rekey_fails: Bool) {
   let #(fake, launches, rekeys) = migrating_launcher(root, rekey_fails)
-  let stranded = legacy.migrate(s, fake, root, "T1")
+  let stranded = legacy.migrate(s, owner(fake), root, "T1")
   #(start_registry_as(fake, s, None, stranded), launches, rekeys)
 }
 
@@ -899,7 +900,7 @@ pub fn a_failed_move_starts_nothing_test() {
   let assert Error(Nil) = process.receive(launches, 150)
   // The next start tries again.
   let #(fake, _, rekeys) = migrating_launcher(root, True)
-  let assert False = set.is_empty(legacy.migrate(s, fake, root, "T1"))
+  let assert False = set.is_empty(legacy.migrate(s, owner(fake), root, "T1"))
   let assert Ok(_) = process.receive(rekeys, 1000)
   Nil
 }
@@ -923,4 +924,9 @@ pub fn events_route_to_the_installation_they_were_delivered_to_test() {
 
 fn thread_key(team: String, channel: String, ts: String) -> String {
   key.new(team, channel, ts) |> key.to_string
+}
+
+fn owner(fake: launcher.Launcher) -> agents.Agents {
+  let assert Ok(owner) = agents.start(fake)
+  owner
 }

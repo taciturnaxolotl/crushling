@@ -19,6 +19,8 @@
 //// `CRUSHLING_TEST_SMALL`. Assertions are about structure (order, diffs,
 //// history), never wording, beyond asking the model to echo a marker word.
 
+import crushling/agent/backend
+import crushling/agent/spec
 import crushling/conversation
 import crushling/crush/client
 import crushling/gun
@@ -162,9 +164,15 @@ type Wiring {
     models: provider.Models,
     /// The bridge every test's agents use: the proxy and the tunnels,
     /// served on one port as in production.
-    bridge: launcher.Bridge,
+    bridge: Bridge,
+    launch: launcher.Wiring,
     proxy: proxy.Proxy,
   )
+}
+
+/// Where a test's crush reaches the bridge, and what it is given there.
+type Bridge {
+  Bridge(url: String, env: fn(String) -> List(String))
 }
 
 /// One proxy and one set of tunnels for every test, as for every thread in
@@ -179,16 +187,20 @@ fn start_wiring() -> Wiring {
   let started = process.new_subject()
   process.spawn_unlinked(fn() {
     let assert Ok(p) =
-      proxy.start(proxy.Config(
-        secret:,
-        org_key:,
-        upstream: proxy.upstream_from(api_key),
-        thread_cap: spend.unlimited,
-        instance_cap: spend.unlimited,
-        max_per_thread: proxy.default_max_per_thread,
-        max_uploads: proxy.default_max_uploads,
-        upload_timeout_ms: proxy.default_upload_timeout_ms,
-      ))
+      proxy.start(
+        proxy.named(proxy.Config(
+          secret:,
+          org_key:,
+          upstream: proxy.upstream_from(api_key),
+          thread_cap: spend.unlimited,
+          team_cap: spend.unlimited,
+          max_per_thread: proxy.default_max_per_thread,
+          max_uploads: proxy.default_max_uploads,
+          upload_timeout_ms: proxy.default_upload_timeout_ms,
+          keeper: None,
+          name: None,
+        )),
+      )
     let assert Ok(tunnels) =
       tunnel.start(tunnel.config(
         secret,
@@ -203,14 +215,27 @@ fn start_wiring() -> Wiring {
     process.sleep_forever()
   })
   let assert Ok(#(p, tunnels)) = process.receive(started, 10_000)
+  let settings =
+    spec.Settings(
+      bridge_url: url,
+      secret:,
+      github: False,
+      models: models(),
+      env: [],
+      own_team: "",
+      own_env: [],
+    )
   Wiring(
     models: models(),
-    bridge: launcher.bridge(
-      url:,
-      secret:,
+    bridge: Bridge(url:, env: fn(key) {
+      // Only a thread whose agent is up may spend.
+      proxy.allow(p, key)
+      spec.key_env(settings, key)
+    }),
+    launch: launcher.Wiring(
       tunnels:,
       proxy: p,
-      github: False,
+      spec: settings,
       hello_timeout_ms: launcher.default_hello_timeout_ms,
     ),
     proxy: p,
@@ -235,7 +260,7 @@ fn setup(name: String, wiring: Wiring) -> Env {
 
 /// A server on a unix socket, using `bridge` for its Slack tools and
 /// inference.
-fn setup_with(name: String, wiring: Wiring, bridge: launcher.Bridge) -> Env {
+fn setup_with(name: String, wiring: Wiring, bridge: Bridge) -> Env {
   let dir =
     "/tmp/crushling-real-"
     <> name
@@ -542,7 +567,7 @@ fn registry_launches_and_idles(wiring: Wiring) -> Nil {
     "/tmp/crushling-real-registry-"
     <> int.to_string(int.absolute_value(unique()))
   let key = thread_key("T1", "C1", "10.1")
-  let local = launcher.local(root, "", wiring.models, wiring.bridge)
+  let local = launcher.new(wiring.launch, backend.local(root, ""))
   let launches = process.new_subject()
   let watched =
     launcher.Launcher(
@@ -642,7 +667,7 @@ fn shutdown_cancels_and_stops(wiring: Wiring) -> Nil {
     "/tmp/crushling-real-shutdown-"
     <> int.to_string(int.absolute_value(unique()))
   let key = thread_key("T1", "C1", "20.1")
-  let local = launcher.local(root, "", wiring.models, wiring.bridge)
+  let local = launcher.new(wiring.launch, backend.local(root, ""))
   let launches = process.new_subject()
   let watched =
     launcher.Launcher(
@@ -1129,8 +1154,9 @@ fn agent_uses_slack_tools(wiring: Wiring) -> Nil {
   let keys = process.new_subject()
   let url = "http://127.0.0.1:" <> int.to_string(port)
   let bridge =
-    launcher.Bridge(..wiring.bridge, url:, env: fn(key) {
+    Bridge(url:, env: fn(key) {
       process.send(keys, key)
+      proxy.allow(wiring.proxy, key)
       list.append(mcp.env(secret, key), proxy.crush_env(url, secret, key))
     })
   let env = setup_with("mcp", wiring, bridge)

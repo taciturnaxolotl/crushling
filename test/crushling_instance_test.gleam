@@ -1,6 +1,7 @@
 //// One bridge, several workspaces: each event reaches only its own
 //// workspace's registry, which talks to Slack with its own token.
 
+import crushling/agents
 import crushling/crush/client
 import crushling/instance
 import crushling/launcher
@@ -106,7 +107,7 @@ fn shared(
   env_team: option.Option(instance.EnvTeam),
 ) -> instance.Shared {
   instance.Shared(
-    launcher: failing(launches),
+    agents: owner(failing(launches)),
     store: s,
     root: dir,
     mode: client.Sysadmin,
@@ -327,4 +328,9 @@ pub fn old_threads_move_only_for_the_self_host_workspace_test() {
   let assert Ok(Some(threads.Thread(team: "TA", ..))) =
     threads.thread(s, "TA-C9-1.0")
   Nil
+}
+
+fn owner(fake: launcher.Launcher) -> agents.Agents {
+  let assert Ok(owner) = agents.start(fake)
+  owner
 }

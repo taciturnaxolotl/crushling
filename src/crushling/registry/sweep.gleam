@@ -4,6 +4,7 @@
 //// code channel or not, loses its sandbox and workspace: whatever matters
 //// is on GitHub by then, and its next message starts afresh.
 
+import crushling/agents
 import crushling/registry/code_channel
 import crushling/registry/core.{type State, known_entry}
 import crushling/registry/entry.{Asleep, Entry}
@@ -11,7 +12,6 @@ import crushling/store/threads
 import crushling/sys
 import crushling/venue
 import gleam/dict
-import gleam/erlang/process
 import gleam/list
 import gleam/option.{Some}
 
@@ -95,9 +95,9 @@ pub fn run(state: State(msg)) -> State(msg) {
             )
           Forget(key) -> {
             sys.info("crushling: clearing out " <> key <> ", quiet for a month")
-            let forget = config.launcher.forget
-            process.spawn_unlinked(fn() {
-              case forget(key) {
+            // The owner runs it after anything already asked for this key.
+            agents.forget(state.agents, key, fn(result) {
+              case result {
                 Ok(Nil) -> Nil
                 Error(reason) ->
                   sys.warn("crushling: clearing out " <> key <> ": " <> reason)

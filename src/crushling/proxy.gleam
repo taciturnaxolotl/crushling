@@ -19,10 +19,10 @@
 //// away cancels the upstream request.
 ////
 //// On the way through, the `usage` Hyper reports is added to the thread's
-//// and the instance's totals (`proxy/meter`). Past a cap, new requests get
-//// a 429 and a stream in flight is cut at its next chunk; a revoked thread
-//// gets a 403 the same way. Caps are soft limits kept in one process: see
-//// `proxy/meter` for what that allows.
+//// and its workspace's totals (`proxy/meter`). Past a cap, new requests get
+//// a 429 and a stream in flight is cut at its next chunk; a thread whose
+//// agent isn't up gets a 403 the same way. Caps are soft limits kept in one
+//// process: see `proxy/meter` for what that allows.
 ////
 //// crush ignores a configured `base_url` for Hyper and derives every URL
 //// (catalog, credits, inference) from `$HYPER_URL`, so the sandbox needs
@@ -30,6 +30,7 @@
 //// override `<NAME>`, so a sandbox must not also get `CRUSH_HYPER_API_KEY`
 //// or `CRUSH_HYPER_URL`.
 
+import crushling/agent/env as agent_env
 import crushling/proxy/meter
 import crushling/proxy/usage
 import crushling/relay
@@ -49,6 +50,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
 import gleam/result
 import gleam/string
 import gleam/uri
@@ -114,10 +116,15 @@ pub type Config {
     /// the host is a loopback address.
     upstream: String,
     thread_cap: Cap,
-    instance_cap: Cap,
+    /// Each workspace's cap, over all its threads.
+    team_cap: Cap,
     max_per_thread: Int,
     max_uploads: Int,
     upload_timeout_ms: Int,
+    /// Where spend is kept, so caps survive a restart.
+    keeper: Option(meter.Keeper),
+    /// The meter's name, so it can be restarted under a supervisor.
+    name: Option(process.Name(meter.Message)),
   )
 }
 
@@ -135,26 +142,54 @@ type Upstream {
   Upstream(host: String, port: Int, tls: Bool, prefix: String)
 }
 
-/// Start the proxy. Errors describe the problem without repeating any
-/// setting's value.
+/// Start the proxy and its meter, linked to the caller. Errors describe
+/// the problem without repeating any setting's value.
 pub fn start(config: Config) -> Result(Proxy, String) {
-  use upstream <- result.try(parse_upstream(config.upstream))
-  use meter <- result.map(
-    meter.start(meter.Limits(
-      thread_cap: config.thread_cap,
-      instance_cap: config.instance_cap,
-      max_per_thread: config.max_per_thread,
-      max_uploads: config.max_uploads,
-    ))
+  use proxy <- result.try(new(config))
+  use _ <- result.map(
+    start_meter(config)
     |> result.replace_error("the proxy's meter could not start"),
   )
+  proxy
+}
+
+/// The proxy for `config`, whose meter runs under `config.name`, started
+/// with `start_meter` (under a supervisor, say).
+pub fn new(config: Config) -> Result(Proxy, String) {
+  use upstream <- result.try(parse_upstream(config.upstream))
+  use name <- result.map(case config.name {
+    Some(name) -> Ok(name)
+    None -> Error("the proxy needs its meter's name; use start")
+  })
   Proxy(
-    meter:,
+    meter: process.named_subject(name),
     secret: config.secret,
     org_key: config.org_key,
     upstream:,
     upload_timeout_ms: config.upload_timeout_ms,
   )
+}
+
+/// Start the meter `new` expects, under `config.name`.
+pub fn start_meter(
+  config: Config,
+) -> actor.StartResult(Subject(meter.Message)) {
+  meter.start_with(
+    meter.Limits(
+      thread_cap: config.thread_cap,
+      team_cap: config.team_cap,
+      max_per_thread: config.max_per_thread,
+      max_uploads: config.max_uploads,
+    ),
+    config.keeper,
+    config.name,
+  )
+}
+
+/// `config` with a fresh name for its meter, for a proxy started with
+/// `start`.
+pub fn named(config: Config) -> Config {
+  Config(..config, name: Some(process.new_name("crushling_meter")))
 }
 
 fn parse_upstream(url: String) -> Result(Upstream, String) {
@@ -195,11 +230,6 @@ pub fn token(secret: String, key: String) -> String {
   bearer.mint(secret, bearer.Proxy, key)
 }
 
-/// The thread's proxy token, as environment.
-pub fn env(secret: String, key: String) -> List(String) {
-  ["CRUSHLING_PROXY_TOKEN=" <> token(secret, key)]
-}
-
 /// What a thread's crush needs to use the proxy as Hyper: `bridge_url` is
 /// how the sandbox reaches the sandbox server, e.g. `http://10.0.0.1:7469`.
 pub fn crush_env(
@@ -208,8 +238,8 @@ pub fn crush_env(
   key: String,
 ) -> List(String) {
   [
-    "HYPER_URL=" <> base_url(bridge_url, key),
-    "HYPER_API_KEY=" <> token(secret, key),
+    agent_env.pair(agent_env.hyper_url, base_url(bridge_url, key)),
+    agent_env.pair(agent_env.hyper_api_key, token(secret, key)),
   ]
 }
 
@@ -222,14 +252,14 @@ pub fn base_url(bridge_url: String, key: String) -> String {
   bridge <> "/proxy/" <> key
 }
 
-/// Stop `key`'s token from working, from its next request or chunk on.
-pub fn revoke(proxy: Proxy, key: String) -> Nil {
-  meter.revoke(proxy.meter, key)
+/// Let `key`'s token work, while its agent is up.
+pub fn allow(proxy: Proxy, key: String) -> Nil {
+  meter.allow(proxy.meter, key)
 }
 
-/// Undo `revoke`, for a thread that resumes.
-pub fn restore(proxy: Proxy, key: String) -> Nil {
-  meter.restore(proxy.meter, key)
+/// Stop `key`'s token from working, from its next request or chunk on.
+pub fn disallow(proxy: Proxy, key: String) -> Nil {
+  meter.disallow(proxy.meter, key)
 }
 
 /// Hold one thread to its own cap, or back to the default with `None`.
@@ -237,24 +267,19 @@ pub fn set_thread_cap(proxy: Proxy, key: String, cap: Option(Cap)) -> Nil {
   meter.set_thread_cap(proxy.meter, key, cap)
 }
 
-/// What `key` has spent since the bridge started.
+/// What `key` has spent, as its cap counts it.
 pub fn totals(proxy: Proxy, key: String) -> Usage {
   meter.totals(proxy.meter, key)
 }
 
-/// What each thread spent since the last call, for keeping elsewhere.
-pub fn drain(proxy: Proxy) -> List(#(String, Usage)) {
-  meter.drain(proxy.meter)
+/// What workspace `team` has spent, as its cap counts it.
+pub fn team_totals(proxy: Proxy, team: String) -> Usage {
+  meter.team_totals(proxy.meter, team)
 }
 
-/// What every thread together has spent since the bridge started.
-pub fn instance_totals(proxy: Proxy) -> Usage {
-  meter.instance_totals(proxy.meter)
-}
-
-/// Every thread's totals.
-pub fn all_totals(proxy: Proxy) -> List(#(String, Usage)) {
-  meter.all_totals(proxy.meter)
+/// Save unsaved spend with the keeper now, as at shutdown.
+pub fn flush(proxy: Proxy) -> Result(Nil, String) {
+  meter.flush(proxy.meter)
 }
 
 /// The requests that are served, as method and path; the path is also the
@@ -350,10 +375,10 @@ fn describe(denial: meter.Denial) -> #(Int, String, String) {
       "rate_limit_error",
       "This thread has reached its inference spending cap.",
     )
-    meter.InstanceCap -> #(
+    meter.TeamCap -> #(
       429,
       "rate_limit_error",
-      "This crushling instance has reached its inference spending cap.",
+      "This workspace has reached its inference spending cap.",
     )
     meter.ThreadBusy -> #(
       429,

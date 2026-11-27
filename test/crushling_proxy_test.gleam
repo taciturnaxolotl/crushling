@@ -186,15 +186,24 @@ fn config(upstream: String) -> proxy.Config {
     org_key:,
     upstream:,
     thread_cap: spend.unlimited,
-    instance_cap: spend.unlimited,
+    team_cap: spend.unlimited,
     max_per_thread: proxy.default_max_per_thread,
     max_uploads: proxy.default_max_uploads,
     upload_timeout_ms: proxy.default_upload_timeout_ms,
+    keeper: None,
+    name: None,
   )
+  |> proxy.named
 }
+
+/// The keys these tests use; only threads whose agent is up may spend.
+const keys = [
+  "k", "j", "a", "b", "real", "crush", "C1-1.0", "T1-C1-1.0", "T2-C1-1.0",
+]
 
 fn start_proxy(config: proxy.Config) -> #(proxy.Proxy, Int) {
   let assert Ok(p) = proxy.start(config)
+  list.each(keys, proxy.allow(p, _))
   let route = proxy.route(p)
   let port =
     serve(fn(req) { route(req) |> option.unwrap(sandbox_http.reply(404, "")) })
@@ -583,7 +592,7 @@ pub fn json_passes_through_and_is_metered_test() {
   let assert True = bits(body) == usage_json
   let assert Ok("application/json") = list.key_find(headers, "content-type")
   let assert spend.Usage(9, 2, 0.25, 1) = proxy.totals(setup.proxy, "k")
-  let assert spend.Usage(9, 2, 0.25, 1) = proxy.instance_totals(setup.proxy)
+  let assert spend.Usage(9, 2, 0.25, 1) = proxy.team_totals(setup.proxy, "")
   // Upstream errors pass through as they are.
   let result = post_later(setup, completions("k"), [auth("k")])
   reply_json(
@@ -663,17 +672,34 @@ pub fn over_the_cap_is_429_test() {
   let assert Ok(gun.Response(status: 200, ..)) = answered(result)
 }
 
-pub fn instance_cap_in_dollars_test() {
+pub fn team_cap_in_dollars_test() {
   let setup =
     setup_with(fn(config) {
-      proxy.Config(..config, instance_cap: Cap(tokens: None, usd: Some(0.2)))
+      proxy.Config(..config, team_cap: Cap(tokens: None, usd: Some(0.2)))
     })
   let result = post_later(setup, completions("a"), [auth("a")])
   reply_json(next_arrival(setup), 200, usage_json)
   let assert Ok(gun.Response(status: 200, ..)) = answered(result)
   let assert Ok(gun.Response(status: 429, body:, ..)) =
     post(setup, completions("b"), [auth("b")])
-  let assert True = string.contains(bits(body), "instance")
+  let assert True = string.contains(bits(body), "workspace")
+}
+
+/// One workspace at its cap leaves the others alone.
+pub fn the_team_cap_is_per_workspace_test() {
+  let setup =
+    setup_with(fn(config) {
+      proxy.Config(..config, team_cap: Cap(tokens: None, usd: Some(0.2)))
+    })
+  let result = post_later(setup, completions("T1-C1-1.0"), [auth("T1-C1-1.0")])
+  reply_json(next_arrival(setup), 200, usage_json)
+  let assert Ok(gun.Response(status: 200, ..)) = answered(result)
+  let assert Ok(gun.Response(status: 429, ..)) =
+    post(setup, completions("T1-C1-1.0"), [auth("T1-C1-1.0")])
+  let result = post_later(setup, completions("T2-C1-1.0"), [auth("T2-C1-1.0")])
+  reply_json(next_arrival(setup), 200, "{}")
+  let assert Ok(gun.Response(status: 200, ..)) = answered(result)
+  let assert spend.Usage(9, 2, 0.25, 1) = proxy.team_totals(setup.proxy, "T1")
 }
 
 pub fn requests_in_flight_per_thread_are_limited_test() {
@@ -731,14 +757,14 @@ pub fn a_stream_crossing_the_cap_is_cut_test() {
   let assert Ok(Nil) = process.receive(setup.closed, 2000)
 }
 
-pub fn revoke_then_restore_test() {
+pub fn disallow_then_allow_test() {
   let setup = setup()
-  proxy.revoke(setup.proxy, "k")
+  proxy.disallow(setup.proxy, "k")
   let assert Ok(gun.Response(status: 403, body:, ..)) =
     post(setup, completions("k"), [auth("k")])
   let assert True = string.contains(bits(body), "\"permission_error\"")
   let assert Error(Nil) = process.receive(setup.arrivals, 100)
-  proxy.restore(setup.proxy, "k")
+  proxy.allow(setup.proxy, "k")
   let result = post_later(setup, completions("k"), [auth("k")])
   reply_json(next_arrival(setup), 200, "{}")
   let assert Ok(gun.Response(status: 200, ..)) = answered(result)
@@ -746,7 +772,7 @@ pub fn revoke_then_restore_test() {
   let _ = open_stream(setup, "k")
   let #(_, steps) = upstream_stream(setup)
   let assert gun.StreamResponse(status: 200, ..) = next_message()
-  proxy.revoke(setup.proxy, "k")
+  proxy.disallow(setup.proxy, "k")
   process.send(steps, Send(sse_text))
   let assert True = string.contains(rest_of_body(""), "\"permission_error\"")
 }
@@ -823,7 +849,7 @@ pub fn revoking_during_an_upload_stops_the_request_test() {
   let setup = setup()
   let client = raw_open(setup.port, raw_post("k", "content-length: 2\r\n\r\n{"))
   process.sleep(100)
-  proxy.revoke(setup.proxy, "k")
+  proxy.disallow(setup.proxy, "k")
   raw_send(client, "}")
   let assert "HTTP/1.1 403 " <> _ = raw_read_line(client)
   let assert Error(Nil) = process.receive(setup.arrivals, 200)
@@ -916,13 +942,11 @@ pub fn unreachable_upstream_is_a_fixed_502_test() {
 }
 
 pub fn env_and_caps_test() {
-  let assert ["CRUSHLING_PROXY_TOKEN=" <> t] = proxy.env(secret, "C1-1.0")
-  let assert True = t == proxy.token(secret, "C1-1.0")
   let assert [
     "HYPER_URL=http://10.0.0.1:7469/proxy/C1-1.0",
-    "HYPER_API_KEY=" <> t2,
+    "HYPER_API_KEY=" <> t,
   ] = proxy.crush_env("http://10.0.0.1:7469/", secret, "C1-1.0")
-  let assert True = t2 == t
+  let assert True = t == proxy.token(secret, "C1-1.0")
   let assert Ok(Cap(None, None)) = proxy.parse_cap("", "")
   let assert Ok(Cap(Some(1000), Some(2.5))) = proxy.parse_cap("1000", "2.5")
   let assert Ok(Cap(None, Some(3.0))) = proxy.parse_cap("", "3")
@@ -991,16 +1015,21 @@ pub fn real_proxy_test_() -> Dynamic {
 
 fn real_proxy(key: String) -> #(proxy.Proxy, Int) {
   let assert Ok(p) =
-    proxy.start(proxy.Config(
-      secret:,
-      org_key: key,
-      upstream: proxy.upstream_from(api_key),
-      thread_cap: spend.unlimited,
-      instance_cap: spend.unlimited,
-      max_per_thread: proxy.default_max_per_thread,
-      max_uploads: proxy.default_max_uploads,
-      upload_timeout_ms: proxy.default_upload_timeout_ms,
-    ))
+    proxy.start(
+      proxy.named(proxy.Config(
+        secret:,
+        org_key: key,
+        upstream: proxy.upstream_from(api_key),
+        thread_cap: spend.unlimited,
+        team_cap: spend.unlimited,
+        max_per_thread: proxy.default_max_per_thread,
+        max_uploads: proxy.default_max_uploads,
+        upload_timeout_ms: proxy.default_upload_timeout_ms,
+        keeper: None,
+        name: None,
+      )),
+    )
+  list.each(keys, proxy.allow(p, _))
   let route = proxy.route(p)
   let port =
     serve(fn(req) { route(req) |> option.unwrap(sandbox_http.reply(404, "")) })

@@ -120,10 +120,15 @@ characters of `[A-Za-z0-9_.-]`. Every thread's directory, container
 (`crushling-<key>`), tunnel, proxy and Slack tool tokens are named by it,
 so two workspaces never share any of them.
 
-Each registry is started by the teams actor without a link and monitored:
-a crash in one workspace leaves the others running, and its registry is
-started again a second later (from the store, so with its latest token),
-with a log line. Shutdown stops them for good.
+Each registry is a child of a factory supervisor, registered under a name
+of its own: a crash in one workspace leaves the others running, and its
+registry is started again at once (from the store, so with its latest
+token) under the same name. Its thread actors go with it, and the
+lifecycle owner stops that workspace's agents, so the new registry starts
+from nothing running. Shutdown stops them for good. The whole bridge after
+the store runs under one rest-for-one supervisor (`crushling/boot`): the
+proxy's meter, the tunnels, the lifecycle owner, the workspaces and the
+sandbox server.
 
 Honcho memory (`HONCHO_*`) is the operator's own, so only the self-host
 workspace's sandboxes get those settings; other workspaces get no memory
@@ -269,14 +274,14 @@ is required: an address of this machine the sandbox network may reach on
 that port, such as its gateway with the bridge bound there (see
 `docs/sandbox.md`).
 
-A launch opens the thread's tunnel, restores its proxy token, starts the
+A launch opens the thread's tunnel, allows its proxy token, starts the
 sandbox, and waits up to `CRUSHLING_HELLO_TIMEOUT_SECONDS` (default 30) for
 crush to dial in. Any failure along the way undoes every step so far,
 including stopping the container. A stop tells crush to exit, stops the
-sandbox, closes the tunnel and revokes the proxy token. The token is the
+sandbox, closes the tunnel and disallows the proxy token. The token is the
 same on every launch, since it's derived from the thread's key, and it
-only ever lives in that thread's own sandbox and workspace. So restoring
-it on resume is fine. The `local` launcher stops its servers by the pid it
+only ever lives in that thread's own sandbox and workspace; the proxy
+takes it only while that agent is up, also after a restart. The `local` launcher stops its servers by the pid it
 recorded in `<root>/<thread>/server.pid`.
 
 A thread's launch and stop never overlap. While an agent is stopping, its
@@ -488,7 +493,9 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
 | `crushling/registry/links` | Links code channels to their threads, in memory and in the store. |
 | `crushling/slack` | The `Sink` over chat.postMessage/update and slackline's `stream` for run replies, with markdown and plan blocks and file uploads; prompt text cleanup. |
 | `crushling/launcher` | Where an agent runs: `docker` (gVisor sandbox) or `local` (on this machine, dev only). Either way crush dials the tunnel and uses the proxy. |
-| `crushling/sandbox` | `docker run` arguments, a policy fingerprint label, adopt/start/recreate, stop (warm) and remove (cold). |
+| `crushling/sandbox` | The Docker Engine API: the create body, a policy fingerprint label, adopt/start/recreate, stop (warm), remove (cold), exec and image pruning. |
+| `crushling/agents` | The one owner of every agent's lifecycle: per key `Absent`, `Starting`, `Live`, `Stopping` or `Forgetting`, one operation at a time. |
+| `crushling/agent/backend`, `agent/spec` | Where crush runs (docker or local), and what it is given (environment, crush.json, home). |
 
 ## Decisions worth knowing
 
@@ -537,8 +544,7 @@ and `CRUSHLING_CLAUDE_VERSION` are no longer read.
    (today they are rows in `team_settings`); a reinstall's new token is
    stored but the running instance keeps the old one until a restart;
    uninstall events (`app_uninstalled`, `tokens_revoked`) don't mark a
-   workspace inactive yet; the proxy's caps are per bridge, not per
-   workspace.
+   workspace inactive yet.
 5. Smaller things: a cold tier that removes long-idle containers; a prompt
    the thread actor fails to send never counts as finished, so that thread
    never idles; a Cancel button in addition to replying `stop`.

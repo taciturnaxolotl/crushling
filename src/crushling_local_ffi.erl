@@ -3,7 +3,7 @@
 %% Runs `crush server --dial` directly on this machine, for the local
 %% launcher.
 
--export([start/6, stop/1, alive/1]).
+-export([start/6, stop/1, alive/1, recorded_pid/1]).
 
 -define(KEPT, ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL",
                "TERM", "TMPDIR", "TZ"]).
@@ -163,3 +163,15 @@ describe(What, Reason) ->
 %% Whether the process OsPid is still running.
 alive(OsPid) ->
     string:trim(os:cmd("kill -0 " ++ integer_to_list(OsPid) ++ " 2>/dev/null && echo up")) =:= "up".
+
+%% The pid PidFile records, if it records one.
+recorded_pid(PidFile) ->
+    case file:read_file(PidFile) of
+        {ok, Bin} ->
+            [PidText | _] = string:split(unicode:characters_to_list(Bin), "\n"),
+            case string:to_integer(PidText) of
+                {OsPid, ""} when OsPid > 0 -> {ok, OsPid};
+                _ -> {error, nil}
+            end;
+        {error, _} -> {error, nil}
+    end.

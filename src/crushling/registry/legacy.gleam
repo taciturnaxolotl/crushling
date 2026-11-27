@@ -4,8 +4,8 @@
 //// the one of `SLACK_BOT_TOKEN`, has such threads. `migrate` moves them all
 //// to their new keys once, when the bridge starts.
 
+import crushling/agents.{type Agents}
 import crushling/key
-import crushling/launcher.{type Launcher}
 import crushling/store.{type Store}
 import crushling/store/threads
 import crushling/sys
@@ -23,7 +23,7 @@ import gleam/string
 /// their old work.
 pub fn migrate(
   store: Store,
-  launcher: Launcher,
+  owner: Agents,
   root: String,
   team: String,
 ) -> Set(String) {
@@ -46,7 +46,7 @@ pub fn migrate(
     |> list.filter_map(fn(name) {
       case key.parse(name), string.split_once(name, "-") {
         Error(Nil), Ok(#(channel, ts)) if channel != "" ->
-          case is_ts(ts) && launcher.exists(name) {
+          case is_ts(ts) && agents.exists(owner, name) {
             True -> Ok(#(name, channel, ts))
             False -> Error(Nil)
           }
@@ -58,7 +58,7 @@ pub fn migrate(
   |> list.fold(set.new(), fn(stranded, old) {
     let #(old, channel, ts) = old
     let new = key.new(team, channel, ts) |> key.to_string
-    case move(store, launcher, team, old, new) {
+    case move(store, owner, team, old, new) {
       Ok(Nil) -> stranded
       Error(reason) -> {
         sys.warn(
@@ -72,7 +72,7 @@ pub fn migrate(
 
 fn move(
   store: Store,
-  launcher: Launcher,
+  owner: Agents,
   team: String,
   old: String,
   new: String,
@@ -91,13 +91,13 @@ fn move(
   )
   let ours = old_row != Some(False)
   let move_row = old_row == Some(True) && !new_row
-  let move_dir = ours && launcher.exists(old) && !launcher.exists(new)
+  let move_dir = ours && agents.exists(owner, old) && !agents.exists(owner, new)
   case move_row || move_dir {
     False -> Ok(Nil)
     True -> {
       sys.info("crushling: moving " <> old <> " to " <> new)
       use _ <- result.try(case move_dir {
-        True -> launcher.rekey(old, new)
+        True -> agents.rekey(owner, old, new)
         False -> Ok(Nil)
       })
       case move_row {

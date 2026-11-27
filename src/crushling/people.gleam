@@ -105,6 +105,63 @@ pub fn lookup(
   }
 }
 
+// POLICY ----------------------------------------------------------------------
+
+/// The self-host workspace's allowlist and admins, from the values of
+/// `CRUSHLING_ALLOWED_USERS` and `CRUSHLING_ADMINS`. The allowlist must not
+/// be empty; `*` in it means every member of the workspace. Admins approve
+/// tailnet access, so they must be listed by id.
+pub fn env_people(
+  allowed: String,
+  admins: String,
+) -> Result(#(People, Set(String)), String) {
+  let allowed = parse(allowed)
+  let admins = parse(admins)
+  case is_empty(allowed), admins.everyone {
+    // An agent in sysadmin mode that anyone can drive is not a default
+    // worth having: everyone has to be asked for.
+    True, _ ->
+      Error(
+        "CRUSHLING_ALLOWED_USERS is empty; list the Slack user ids, or `*` for everyone in the workspace",
+      )
+    _, True ->
+      Error(
+        "CRUSHLING_ADMINS can't be `*`; admins approve tailnet access, so list their Slack user ids",
+      )
+    False, False -> Ok(#(allowed, admins.ids))
+  }
+}
+
+/// A workspace's allowlist and admins: `allowed` and `admins` from its
+/// settings when set, else `fallback` (the environment's, for the self-host
+/// workspace), else nobody. Admins are only ever listed ids: a `*` among
+/// them is dropped, and `ignored_star` is told.
+pub fn settled(
+  allowed: Result(String, Nil),
+  admins: Result(String, Nil),
+  fallback: Option(#(People, Set(String))),
+  ignored_star: fn() -> Nil,
+) -> #(People, Set(String)) {
+  let allowed = case allowed, fallback {
+    Ok(value), _ -> parse(value)
+    Error(Nil), Some(#(env, _)) -> env
+    Error(Nil), None -> nobody()
+  }
+  let admins = case admins, fallback {
+    Ok(value), _ -> {
+      let admins = parse(value)
+      case admins.everyone {
+        True -> ignored_star()
+        False -> Nil
+      }
+      admins.ids
+    }
+    Error(Nil), Some(#(_, env)) -> env
+    Error(Nil), None -> set.new()
+  }
+  #(allowed, admins)
+}
+
 // CACHE -----------------------------------------------------------------------
 
 /// How long a lookup's answer is kept, yes or no.

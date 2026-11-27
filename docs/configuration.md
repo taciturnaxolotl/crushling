@@ -28,7 +28,8 @@ crushling reads its settings from the environment, else from `./.env`, once at s
 | `CRUSHLING_IMAGE`, `CRUSHLING_RUNTIME`, `CRUSHLING_NETWORK` | for `docker`; defaults `crushling-sandbox:latest`, `runsc`, `sbx-egress` |
 | `CRUSHLING_BRIDGE_PORT`, `CRUSHLING_BRIDGE_BIND` | where the sandbox server listens: the one port agents reach the bridge on, for their tunnels, the inference proxy and their Slack tools; default `7469` on `127.0.0.1`. `CRUSHLING_MCP_PORT` and `CRUSHLING_MCP_BIND` are the old names, still read |
 | `CRUSHLING_BRIDGE_URL` | how an agent reaches that port; default `http://127.0.0.1:<port>` for `local`, required for `docker` (an address the sandbox network may reach, such as its gateway). `CRUSHLING_MCP_URL` is the old name, still read |
-| `CRUSHLING_SANDBOX_CPUS`, `CRUSHLING_SANDBOX_MEMORY` | each docker sandbox's CPU and memory caps, as docker's `--cpus` and `--memory` take them; default `2` and `4g` |
+| `CRUSHLING_SANDBOX_CPUS`, `CRUSHLING_SANDBOX_MEMORY` | each docker sandbox's CPU and memory caps, as docker's `--cpus` and `--memory` take them; default `2` and `4g`. A value the bridge can't read stops it at start |
+| `DOCKER_HOST` | read only as `unix://<path>`: the Docker Engine's socket; default `/var/run/docker.sock` |
 | `CRUSHLING_HELLO_TIMEOUT_SECONDS` | how long a starting agent gets to dial in before it is stopped; default 30 |
 | `CRUSHLING_TAILSCALE_CLIENT_ID`, `CRUSHLING_TAILSCALE_CLIENT_SECRET` | an OAuth client with the `auth_keys` scope that owns the tag; with it, people can put a thread's sandbox on the tailnet for a while |
 | `CRUSHLING_TAILSCALE_API_KEY` | an API access token, instead of the OAuth client |
@@ -36,4 +37,4 @@ crushling reads its settings from the environment, else from `./.env`, once at s
 | `CRUSHLING_TAILSCALE_TAILNET` | the tailnet's name; default `-`, the credential's own |
 | `CRUSHLING_PROXY_UPSTREAM` | where the proxy sends requests; else `HYPER_URL`, else `https://hyper.charm.land` |
 | `CRUSHLING_PROXY_THREAD_CAP_USD`, `CRUSHLING_PROXY_THREAD_CAP_TOKENS` | what one thread may spend through the proxy, in US dollars and/or tokens; unset is unlimited |
-| `CRUSHLING_PROXY_INSTANCE_CAP_USD`, `CRUSHLING_PROXY_INSTANCE_CAP_TOKENS` | the same for all threads together |
+| `CRUSHLING_PROXY_INSTANCE_CAP_USD`, `CRUSHLING_PROXY_INSTANCE_CAP_TOKENS` | the same for each workspace's threads together, over the last 30 days; one workspace at its cap leaves the others alone. The thread cap counts everything the thread ever spent. Both count what the store kept, so they survive restarts |

@@ -107,19 +107,18 @@ fn line_usage(line: BitArray) -> Option(Usage) {
 
 /// The `usage` block of one JSON object, if it has one.
 pub fn parse_usage(text: String) -> Option(Usage) {
-  let count = fn(names: List(String)) {
-    decode.one_of(
-      decode.at([list.first(names) |> unwrap_name], decode.int),
-      list.map(list.drop(names, 1), fn(name) { decode.at([name], decode.int) }),
-    )
-    |> decode.optional
-    |> decode.map(option.unwrap(_, 0))
+  // OpenAI's name for a count, else Anthropic's, else none.
+  let count = fn(name, other) {
+    decode.one_of(decode.at([name], decode.int), [
+      decode.at([other], decode.int),
+      decode.success(0),
+    ])
   }
   let number =
     decode.one_of(decode.float, [decode.int |> decode.map(int.to_float)])
   let usage = {
-    use input <- decode.then(count(["prompt_tokens", "input_tokens"]))
-    use output <- decode.then(count(["completion_tokens", "output_tokens"]))
+    use input <- decode.then(count("prompt_tokens", "input_tokens"))
+    use output <- decode.then(count("completion_tokens", "output_tokens"))
     use cost <- decode.optional_field(
       "cost",
       0.0,
@@ -134,12 +133,5 @@ pub fn parse_usage(text: String) -> Option(Usage) {
   case json.parse(text, decoder) {
     Ok(found) -> found
     Error(_) -> None
-  }
-}
-
-fn unwrap_name(name: Result(String, Nil)) -> String {
-  case name {
-    Ok(name) -> name
-    Error(Nil) -> ""
   }
 }

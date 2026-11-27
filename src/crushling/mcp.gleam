@@ -7,6 +7,7 @@
 //// points at the endpoint (`provider.config`). Requests are answered
 //// with plain JSON; there is no server-initiated stream.
 
+import crushling/agent/env as agent_env
 import crushling/sandbox_http
 import crushling/token as bearer
 import gleam/bit_array
@@ -38,7 +39,10 @@ pub fn token(secret: String, key: String) -> String {
 
 /// The environment a thread's agent needs to reach its endpoint.
 pub fn env(secret: String, key: String) -> List(String) {
-  ["CRUSHLING_THREAD=" <> key, "CRUSHLING_MCP_TOKEN=" <> token(secret, key)]
+  [
+    agent_env.pair(agent_env.thread, key),
+    agent_env.pair(agent_env.mcp_token, token(secret, key)),
+  ]
 }
 
 const protocol_version = "2025-06-18"

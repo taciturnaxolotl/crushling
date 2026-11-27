@@ -4,7 +4,6 @@
 
 import crushling/crush/client
 import crushling/github/app as github_app
-import crushling/instance
 import crushling/people
 import crushling/provider
 import crushling/proxy
@@ -264,7 +263,7 @@ fn env_team(getenv: Getenv) -> Parsed(Option(EnvTeam)) {
   case getenv("SLACK_BOT_TOKEN") {
     Error(Nil) -> Ok(None)
     Ok(bot_token) ->
-      instance.env_people(
+      people.env_people(
         setting(getenv, "CRUSHLING_ALLOWED_USERS", ""),
         setting(getenv, "CRUSHLING_ADMINS", ""),
       )

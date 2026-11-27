@@ -6,6 +6,10 @@ How a `docker` sandbox is wired, and what the host (prattle, configured in
 
 ## What a sandbox runs
 
+The bridge drives the Docker Engine API on its unix socket
+(`/var/run/docker.sock`, or `DOCKER_HOST=unix://...`), not the docker CLI.
+The container it creates is what this would make:
+
     docker run --detach --name crushling-<thread> \
       --runtime runsc --network <CRUSHLING_NETWORK> --user <uid>:<gid> \
       --cap-drop ALL --security-opt no-new-privileges ... \
@@ -26,27 +30,36 @@ How a `docker` sandbox is wired, and what the host (prattle, configured in
   `CRUSH_HYPER_*` variable (no `ENV CRUSH_HYPER_...` in its config), or it
   would take Hyper around the proxy or break it.
 - A thread's tokens are derived from its key, so the same token comes back
-  each time the thread's agent is launched: a stop revokes its proxy token
-  and the next launch restores it. That's fine, because the token only
-  ever lives inside that thread's own sandbox and workspace.
+  each time the thread's agent is launched. The proxy only takes a
+  thread's token while its agent is up: a launch allows it, a stop or a
+  failed launch disallows it, and after a restart no token works until its
+  agent is launched again. That's fine, because the token only ever lives
+  inside that thread's own sandbox and workspace.
 - Containers carry a fingerprint label of their policy, which now includes
   the dial transport and the bridge URL, so containers made for the old unix
   socket transport are removed and recreated on their next launch.
 
 ## Launch and stop
 
-A launch opens the thread's tunnel, restores its proxy token, starts (or
-adopts) the container and waits for crush to dial in. If any step after
-opening the tunnel fails, the launch stops the container (even when
-`docker` reported failure: a timed-out CLI doesn't prove the container
-didn't start), closes the tunnel and revokes the token. Anything that
-cleanup couldn't undo is logged and added to the launch's error. A stop
-says bye, stops the container, closes the tunnel and revokes the token.
-Errors from docker never carry tokens: every `--env` value is shown as
-`<redacted>`, in the arguments and wherever it appears in docker's output.
+A launch prepares the thread's directories, opens its tunnel, allows its
+proxy token, starts (or adopts) the container and waits for crush to dial
+in. If any step after opening the tunnel fails, the launch stops the
+container (even when docker reported failure: a timed-out call doesn't
+prove the container didn't start), closes the tunnel and disallows the
+token. Anything that cleanup couldn't undo is logged and added to the
+launch's error. A stop says bye, stops the container, closes the tunnel
+and disallows the token. Tokens travel only in request bodies, so docker's
+errors never carry them. The launch is written once (`crushling/launcher`)
+against a small backend (`crushling/agent/backend`: docker or local), and
+what crush is given is built in one place (`crushling/agent/spec`).
 
-The registry never runs a thread's launch and stop at the same time, and
-shutdown waits for launches in flight before it stops their agents.
+One actor (`crushling/agents`) owns every thread's lifecycle: each key is
+`Absent`, `Starting`, `Live`, `Stopping` or `Forgetting`, and its
+launches, stops, forgets and rekeys run one at a time, in order. Shutdown
+waits for launches in flight before it stops their agents. When the bridge
+starts, sandboxes a previous bridge left running are stopped rather than
+adopted: no registry knows their threads, and the next message starts them
+again, warm.
 
 ## Network
 
@@ -102,8 +115,8 @@ change there:
 7. Comments that say the bridge must share a filesystem with the sandbox
    because of the unix socket (the module's header and the
    `atelier.services.crushling` comment in `machines/prattle/default.nix`)
-   are stale. The bridge still drives the local docker CLI, so it stays on
-   prattle.
+   are stale. The bridge drives the local Docker Engine socket, so it stays
+   on prattle, and its user needs access to that socket.
 8. `threadsDir` (`/storage/crushling/threads`) is well under the 79-byte
    limit the tunnels' socket paths put on `CRUSHLING_ROOT`.
 

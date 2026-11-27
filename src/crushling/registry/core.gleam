@@ -1,6 +1,7 @@
 //// The registry's state, shared by its modules, and the events it sends
 //// itself.
 
+import crushling/agents.{type Agents}
 import crushling/github/broker.{type Broker}
 import crushling/github/connect
 import crushling/home/publisher
@@ -65,6 +66,8 @@ pub type Event {
 pub type State(msg) {
   State(
     config: Config,
+    /// The owner of every agent's lifecycle, which runs launches and stops.
+    agents: Agents,
     self: Subject(msg),
     /// Wraps an event as a message to the registry.
     wrap: fn(Event) -> msg,

@@ -1,5 +1,5 @@
-//// One gVisor container per Slack thread, managed with the docker CLI the
-//// way kloe does it on prattle, with three differences:
+//// One gVisor container per Slack thread, driven through the Docker Engine
+//// API on its unix socket, with three differences from kloe on prattle:
 ////
 //// - the container runs `crush server --dial`, which connects out to the
 ////   bridge's tunnel (`crushling/tunnel`) instead of listening, so nothing
@@ -9,50 +9,51 @@
 //// - it joins a network whose egress is filtered on the host, which lets
 ////   it reach the bridge's one sandbox port.
 ////
-//// The argument building and the adopt/start/recreate decision are pure and
-//// tested; `ensure`, `stop` and `remove` shell out to docker.
+//// The create body, the policy fingerprint and the adopt/start/recreate
+//// decision are pure and tested; the rest are Engine API calls. Secrets
+//// travel in request bodies, never in arguments or error text.
 
-import crushling/key
+import crushling/agent/spec.{type Spec}
+import crushling/gun
 import crushling/sys
-import crushling/tunnel
+import gleam/bit_array
+import gleam/dict
+import gleam/dynamic/decode
+import gleam/float
+import gleam/http
 import gleam/int
+import gleam/json.{type Json}
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/uri
 
 pub type Policy {
   Policy(
-    docker: String,
+    /// The Docker Engine's unix socket, such as `/var/run/docker.sock`.
+    socket: String,
     image: String,
     /// The gVisor runtime, such as `runsc`.
     runtime: String,
     network: String,
+    /// As `docker run --cpus` takes them, such as `2` or `1.5`.
     cpus: String,
+    /// As `docker run --memory` takes it, such as `4g`.
     memory: String,
     pids: Int,
     uid: Int,
     gid: Int,
     /// Host directory holding one directory per thread.
     root: String,
-    /// `KEY=value` pairs passed into every container.
-    env: List(String),
-    /// The workspace whose sandboxes also get `own_env` (the self-host one,
-    /// from `SLACK_BOT_TOKEN`), or "" for none.
-    own_team: String,
-    /// `KEY=value` pairs only for that workspace's sandboxes, such as the
-    /// operator's own Honcho memory settings.
-    own_env: List(String),
-    /// The container's global crush.json, from `provider.config`.
-    crush_config: String,
     /// A static `crush` binary on the host to mount into the container, or
     /// "" to use the image's own.
     crush: String,
     /// Nameservers for the container's own resolv.conf, or [] for docker's.
     /// Docker's embedded DNS doesn't answer gVisor on a custom network.
     dns: List(String),
-    /// How the container reaches the bridge's sandbox server, e.g.
-    /// `http://172.30.0.1:7469`; crush dials its tunnel there.
-    bridge_url: String,
+    /// What every thread's crush is given.
+    spec: spec.Settings,
   )
 }
 
@@ -61,22 +62,12 @@ pub const mounted_crush = "/opt/crushling/crush"
 
 pub const label = "crushling-sandbox"
 
-pub const workspace = "/workspace"
+pub const workspace = spec.workspace
 
-const docker_timeout_ms = 60_000
+/// The engine's socket when nothing says otherwise.
+pub const default_socket = "/var/run/docker.sock"
 
-/// What a thread's container gets beyond `policy.env`: `own_env`, when the
-/// thread is in `own_team`.
-pub fn team_env(policy: Policy, thread: String) -> List(String) {
-  case key.parse(thread) {
-    Ok(thread) if policy.own_team != "" ->
-      case key.team(thread) == policy.own_team {
-        True -> policy.own_env
-        False -> []
-      }
-    _ -> []
-  }
-}
+const timeout_ms = 60_000
 
 pub fn container_name(key: String) -> String {
   "crushling-" <> key
@@ -89,11 +80,12 @@ pub fn host_workspace(policy: Policy, key: String) -> String {
 /// Everything that should force a rebuild when it changes. Stored on the
 /// container as a label, as kloe does.
 pub fn fingerprint(policy: Policy) -> String {
+  let settings = policy.spec
   [
     // How crush is reached. Containers from before the tunnel listened on
     // a socket, and must be recreated with the new command.
     "dial",
-    policy.bridge_url,
+    settings.bridge_url,
     policy.image,
     policy.runtime,
     policy.network,
@@ -103,13 +95,13 @@ pub fn fingerprint(policy: Policy) -> String {
     int.to_string(policy.uid),
     int.to_string(policy.gid),
     policy.root,
-    policy.crush_config,
+    spec.crush_config(settings),
     // A new binary at the same path still means new containers.
     crush_stamp(policy.crush),
     string.join(policy.dns, ","),
-    policy.own_team,
-    string.join(policy.own_env, "\u{0}"),
-    ..policy.env
+    settings.own_team,
+    string.join(settings.own_env, "\u{0}"),
+    ..settings.env
   ]
   |> string.join("\u{0}")
   |> sys.sha256_hex
@@ -126,52 +118,126 @@ fn crush_stamp(path: String) -> String {
 @external(erlang, "crushling_ffi", "file_stamp")
 fn file_stamp(path: String) -> Result(String, Nil)
 
-/// `key_env` is the thread's own environment: its tokens for the Slack
-/// tools, the tunnel and the proxy. They are derived from the key, so they
-/// needn't be part of the fingerprint.
-pub fn run_args(
-  policy: Policy,
-  key: String,
-  key_env: List(String),
-) -> List(String) {
-  let env =
-    list.flatten([policy.env, team_env(policy, key), key_env])
-    |> list.flat_map(fn(pair) { ["--env", pair] })
-  list.flatten([
-    ["run", "--detach", "--name", container_name(key)],
-    ["--label", label <> "=1"],
-    ["--label", label <> "-policy=" <> fingerprint(policy)],
-    ["--runtime", policy.runtime, "--network", policy.network],
-    ["--user", int.to_string(policy.uid) <> ":" <> int.to_string(policy.gid)],
-    ["--cap-drop", "ALL", "--security-opt", "no-new-privileges"],
-    ["--cpus", policy.cpus, "--memory", policy.memory],
-    ["--pids-limit", int.to_string(policy.pids)],
-    ["--workdir", workspace],
-    ["--volume", host_workspace(policy, key) <> ":" <> workspace],
-    ["--env", "HOME=" <> workspace <> "/.home"],
-    ["--env", "XDG_DATA_HOME=" <> workspace <> "/.home/.local/share"],
-    ["--env", "XDG_CACHE_HOME=" <> workspace <> "/.home/.cache"],
-    ["--env", "HONCHO_CONFIG_DIR=" <> workspace <> "/.home/.honcho"],
-    // The bridge owns the lifecycle; the server must not exit on its own
-    // while a thread is quiet.
-    ["--env", "CRUSH_SERVER_IDLE_TIMEOUT=31536000"],
-    ["--env", "CRUSH_SERVER_DETACH_GRACE=120"],
-    env,
-    case policy.dns {
-      [] -> []
-      _ -> ["--volume", host_resolv_conf(policy) <> ":/etc/resolv.conf:ro"]
-    },
-    case policy.crush {
-      "" -> [policy.image, "crush"]
-      path -> [
-        "--volume",
-        path <> ":" <> mounted_crush <> ":ro",
-        policy.image,
-        mounted_crush,
-      ]
-    },
-    ["server", "--dial", tunnel.dial_url(policy.bridge_url, key)],
+pub type Error {
+  /// The engine answered `status` with `message`.
+  Engine(status: Int, message: String)
+  /// The engine's socket couldn't be reached, or didn't answer in time.
+  Unreachable(reason: String)
+  Filesystem(reason: String)
+  /// The policy can't be expressed to the engine.
+  BadPolicy(reason: String)
+  /// A script run in the container exited with `status`.
+  Exited(status: Int, output: String)
+}
+
+pub fn describe(error: Error) -> String {
+  case error {
+    Engine(status:, message:) ->
+      "docker: " <> message <> " (" <> int.to_string(status) <> ")"
+    Unreachable(reason) -> "docker is unreachable: " <> reason
+    Filesystem(reason) -> reason
+    BadPolicy(reason) -> "sandbox policy: " <> reason
+    Exited(status:, output:) ->
+      "exit status " <> int.to_string(status) <> ": " <> string.trim(output)
+  }
+}
+
+/// Check what `create_body` needs from the policy, so a bad setting stops
+/// the bridge at start rather than every launch.
+pub fn check(policy: Policy) -> Result(Nil, Error) {
+  use _ <- result.try(nano_cpus(policy.cpus))
+  memory_bytes(policy.memory) |> result.replace(Nil)
+}
+
+/// The body of `POST /containers/create` for a thread's container.
+pub fn create_body(policy: Policy, spec: Spec) -> Result(Json, Error) {
+  use cpus <- result.try(nano_cpus(policy.cpus))
+  use memory <- result.map(memory_bytes(policy.memory))
+  let binds =
+    list.flatten([
+      [spec.host_work <> ":" <> workspace],
+      case policy.dns {
+        [] -> []
+        _ -> [host_resolv_conf(policy) <> ":/etc/resolv.conf:ro"]
+      },
+      case policy.crush {
+        "" -> []
+        path -> [path <> ":" <> mounted_crush <> ":ro"]
+      },
+    ])
+  let crush = case policy.crush {
+    "" -> "crush"
+    _ -> mounted_crush
+  }
+  json.object([
+    #("Image", json.string(policy.image)),
+    #(
+      "Cmd",
+      json.array([crush, "server", "--dial", spec.dial_url], json.string),
+    ),
+    #(
+      "User",
+      json.string(int.to_string(policy.uid) <> ":" <> int.to_string(policy.gid)),
+    ),
+    #("WorkingDir", json.string(spec.workdir)),
+    #("Env", json.array(spec.env, json.string)),
+    #(
+      "Labels",
+      json.object([
+        #(label, json.string("1")),
+        #(label <> "-policy", json.string(fingerprint(policy))),
+      ]),
+    ),
+    #(
+      "HostConfig",
+      json.object([
+        #("Runtime", json.string(policy.runtime)),
+        #("NetworkMode", json.string(policy.network)),
+        #("CapDrop", json.array(["ALL"], json.string)),
+        #("SecurityOpt", json.array(["no-new-privileges"], json.string)),
+        #("NanoCpus", json.int(cpus)),
+        #("Memory", json.int(memory)),
+        #("PidsLimit", json.int(policy.pids)),
+        #("Binds", json.array(binds, json.string)),
+      ]),
+    ),
   ])
+}
+
+/// `--cpus` as the engine's billionths of a CPU.
+pub fn nano_cpus(cpus: String) -> Result(Int, Error) {
+  case number(string.trim(cpus)) {
+    Ok(n) if n >. 0.0 -> Ok(float.round(n *. 1.0e9))
+    _ -> Error(BadPolicy("cpus must be a positive number, not " <> cpus))
+  }
+}
+
+/// `--memory` in bytes: a number with an optional `b`, `k`, `m`, `g` or `t`
+/// suffix (binary multiples, as docker reads them).
+pub fn memory_bytes(memory: String) -> Result(Int, Error) {
+  let text = string.lowercase(string.trim(memory))
+  let text = case string.ends_with(text, "b") && string.length(text) > 1 {
+    True -> string.drop_end(text, 1)
+    False -> text
+  }
+  let #(digits, scale) = case string.last(text) {
+    Ok("k") -> #(string.drop_end(text, 1), 1024)
+    Ok("m") -> #(string.drop_end(text, 1), 1_048_576)
+    Ok("g") -> #(string.drop_end(text, 1), 1_073_741_824)
+    Ok("t") -> #(string.drop_end(text, 1), 1_099_511_627_776)
+    _ -> #(text, 1)
+  }
+  case number(digits) {
+    Ok(n) if n >. 0.0 -> Ok(float.truncate(n *. int.to_float(scale)))
+    _ -> Error(BadPolicy("memory must be a size such as 4g, not " <> memory))
+  }
+}
+
+fn number(text: String) -> Result(Float, Nil) {
+  case int.parse(text) {
+    Ok(whole) -> Ok(int.to_float(whole))
+    Error(Nil) -> float.parse(text)
+  }
 }
 
 pub type Observed {
@@ -200,31 +266,269 @@ pub fn decide(observed: Observed, policy: Policy) -> Action {
   }
 }
 
-/// Parse `docker inspect -f '{{.State.Running}} {{index .Config.Labels "…"}}'`.
-pub fn parse_inspect(output: String) -> Observed {
-  case string.split_once(string.trim(output), " ") {
-    Ok(#("true", fingerprint)) -> Present(True, string.trim(fingerprint))
-    Ok(#("false", fingerprint)) -> Present(False, string.trim(fingerprint))
-    _ ->
-      case string.trim(output) {
-        "true" -> Present(True, "")
-        "false" -> Present(False, "")
-        _ -> Missing
-      }
+/// Parse the body of `GET /containers/<name>/json`.
+pub fn parse_inspect(body: String) -> Observed {
+  let decoder = {
+    use running <- decode.subfield(["State", "Running"], decode.bool)
+    use labels <- decode.subfield(
+      ["Config", "Labels"],
+      decode.optional(decode.dict(decode.string, decode.string)),
+    )
+    let seen =
+      option.unwrap(labels, dict.new())
+      |> dict.get(label <> "-policy")
+      |> result.unwrap("")
+    decode.success(Present(running, seen))
+  }
+  json.parse(body, decoder) |> result.unwrap(Missing)
+}
+
+// The engine ------------------------------------------------------------------
+
+type Reply {
+  Reply(status: Int, body: String)
+}
+
+fn call(
+  policy: Policy,
+  method: http.Method,
+  path: String,
+  body: Option(Json),
+) -> Result(#(Int, BitArray), Error) {
+  use conn <- result.try(
+    gun.connect_unix(policy.socket, 5000) |> result.map_error(Unreachable),
+  )
+  let #(headers, payload) = case body {
+    Some(body) -> #(
+      [#("content-type", "application/json")],
+      bit_array.from_string(json.to_string(body)),
+    )
+    None -> #([], <<>>)
+  }
+  let answer = gun.request(conn, method, path, headers, payload, timeout_ms)
+  gun.close(conn)
+  case answer {
+    Ok(response) -> Ok(#(response.status, response.body))
+    Error(reason) -> Error(Unreachable(reason))
   }
 }
 
-@external(erlang, "crushling_ffi", "exec")
-fn exec(
-  program: String,
-  args: List(String),
-  timeout_ms: Int,
-) -> Result(#(Int, String), String)
+/// Succeed with the body on any status in `ok`, else the engine's error.
+fn expect(
+  answer: Result(#(Int, BitArray), Error),
+  ok: List(Int),
+) -> Result(Reply, Error) {
+  use #(status, body) <- result.try(answer)
+  let reply = Reply(status, bit_array.to_string(body) |> result.unwrap(""))
+  case list.contains(ok, status) {
+    True -> Ok(reply)
+    False -> Error(engine_error(reply))
+  }
+}
 
-pub type Error {
-  DockerFailed(args: List(String), status: Int, output: String)
-  DockerUnavailable(reason: String)
-  Filesystem(reason: String)
+/// The engine's error from a failed answer's `{"message": ...}`.
+fn engine_error(reply: Reply) -> Error {
+  let message =
+    json.parse(reply.body, decode.at(["message"], decode.string))
+    |> result.unwrap(string.trim(reply.body))
+  Engine(reply.status, message)
+}
+
+fn container(key: String) -> String {
+  "/containers/" <> container_name(key)
+}
+
+pub fn observe(policy: Policy, key: String) -> Result(Observed, Error) {
+  use reply <- result.try(
+    call(policy, http.Get, container(key) <> "/json", None)
+    |> expect([200, 404]),
+  )
+  case reply.status {
+    404 -> Ok(Missing)
+    _ -> Ok(parse_inspect(reply.body))
+  }
+}
+
+fn create(policy: Policy, spec: Spec) -> Result(Nil, Error) {
+  use body <- result.try(create_body(policy, spec))
+  call(
+    policy,
+    http.Post,
+    "/containers/create?name=" <> container_name(spec.key),
+    Some(body),
+  )
+  |> expect([201])
+  |> result.replace(Nil)
+}
+
+fn start(policy: Policy, key: String) -> Result(Nil, Error) {
+  // 304: already running.
+  call(policy, http.Post, container(key) <> "/start", None)
+  |> expect([204, 304])
+  |> result.replace(Nil)
+}
+
+/// Make sure the thread's container is running under the current policy.
+/// Its crush then dials the bridge; waiting for that is the launcher's job.
+pub fn ensure(policy: Policy, spec: Spec) -> Result(Nil, Error) {
+  use observed <- result.try(observe(policy, spec.key))
+  case decide(observed, policy) {
+    Adopt -> Ok(Nil)
+    Start -> start(policy, spec.key)
+    Recreate -> {
+      use _ <- result.try(remove(policy, spec.key))
+      use _ <- result.try(create(policy, spec))
+      start(policy, spec.key)
+    }
+    Create -> {
+      use _ <- result.try(create(policy, spec))
+      start(policy, spec.key)
+    }
+  }
+}
+
+/// Warm tier: stop the container but keep it, so installed state survives.
+/// One that is already stopped or doesn't exist is fine.
+pub fn stop(policy: Policy, key: String) -> Result(Nil, Error) {
+  call(policy, http.Post, container(key) <> "/stop?t=2", None)
+  |> expect([204, 304, 404])
+  |> result.replace(Nil)
+}
+
+/// Cold tier: remove the container, keeping the workspace on disk. One that
+/// doesn't exist is fine.
+pub fn remove(policy: Policy, key: String) -> Result(Nil, Error) {
+  call(policy, http.Delete, container(key) <> "?force=true", None)
+  |> expect([204, 404])
+  |> result.replace(Nil)
+}
+
+/// The body of `POST /containers/<name>/exec`: `script` with `sh`, as the
+/// container's own user, with `env` (`NAME=value` pairs) added.
+pub fn exec_body(env: List(String), script: String) -> Json {
+  json.object([
+    #("AttachStdout", json.bool(True)),
+    #("AttachStderr", json.bool(True)),
+    #("Env", json.array(env, json.string)),
+    #("Cmd", json.array(["sh", "-c", script], json.string)),
+  ])
+}
+
+/// Run `script` in a thread's running container and return its output,
+/// stdout and stderr together. A non-zero exit is an error with the output.
+pub fn run_in(
+  policy: Policy,
+  key: String,
+  env: List(String),
+  script: String,
+) -> Result(String, Error) {
+  use created <- result.try(
+    call(
+      policy,
+      http.Post,
+      container(key) <> "/exec",
+      Some(exec_body(env, script)),
+    )
+    |> expect([201]),
+  )
+  use id <- result.try(
+    json.parse(created.body, decode.at(["Id"], decode.string))
+    |> result.replace_error(Engine(201, "no exec id in the answer")),
+  )
+  let detached = json.object([#("Detach", json.bool(False))])
+  use stream <- result.try(call(
+    policy,
+    http.Post,
+    "/exec/" <> id <> "/start",
+    Some(detached),
+  ))
+  use _ <- result.try(case stream.0 {
+    200 | 101 -> Ok(Nil)
+    status ->
+      Error(
+        engine_error(Reply(
+          status,
+          bit_array.to_string(stream.1) |> result.unwrap(""),
+        )),
+      )
+  })
+  let output = demux(stream.1, <<>>) |> bit_array.to_string |> result.unwrap("")
+  use inspected <- result.try(
+    call(policy, http.Get, "/exec/" <> id <> "/json", None) |> expect([200]),
+  )
+  case json.parse(inspected.body, decode.at(["ExitCode"], decode.int)) {
+    Ok(0) -> Ok(output)
+    Ok(status) -> Error(Exited(status, output))
+    Error(_) -> Error(Exited(-1, output))
+  }
+}
+
+/// The payloads of a multiplexed stdout and stderr stream, in order: each
+/// frame is a stream byte, three zero bytes, a 32-bit length and the data.
+pub fn demux(stream: BitArray, acc: BitArray) -> BitArray {
+  case stream {
+    <<kind, 0, 0, 0, size:32, rest:bits>> if kind <= 2 ->
+      case rest {
+        <<payload:bytes-size(size), more:bits>> ->
+          demux(more, bit_array.append(acc, payload))
+        _ -> bit_array.append(acc, rest)
+      }
+    // Not multiplexed after all (a TTY): take it as it is.
+    rest -> bit_array.append(acc, rest)
+  }
+}
+
+/// A container in a list, by name, with its image and whether it runs.
+type Listed {
+  Listed(name: String, image: String, running: Bool)
+}
+
+fn filters(pairs: List(#(String, List(String)))) -> String {
+  json.object(
+    list.map(pairs, fn(pair) { #(pair.0, json.array(pair.1, json.string)) }),
+  )
+  |> json.to_string
+  |> uri.percent_encode
+}
+
+fn list_containers(
+  policy: Policy,
+  by: List(#(String, List(String))),
+) -> Result(List(Listed), Error) {
+  use reply <- result.try(
+    call(
+      policy,
+      http.Get,
+      "/containers/json?all=true&filters=" <> filters(by),
+      None,
+    )
+    |> expect([200]),
+  )
+  let item = {
+    use names <- decode.field("Names", decode.list(decode.string))
+    use image <- decode.field("Image", decode.string)
+    use state <- decode.optional_field("State", "", decode.string)
+    let name = case names {
+      ["/" <> name, ..] | [name, ..] -> name
+      [] -> ""
+    }
+    decode.success(Listed(name, image, state == "running"))
+  }
+  json.parse(reply.body, decode.list(item))
+  |> result.replace_error(Engine(200, "unreadable container list"))
+}
+
+/// The keys of every sandbox container still running.
+pub fn running(policy: Policy) -> Result(List(String), Error) {
+  use listed <- result.map(
+    list_containers(policy, [#("label", [label <> "=1"])]),
+  )
+  list.filter_map(listed, fn(container) {
+    case container.running, container.name {
+      True, "crushling-" <> key -> Ok(key)
+      _, _ -> Error(Nil)
+    }
+  })
 }
 
 /// Remove sandbox images nothing will run again. Old images are what fill
@@ -236,46 +540,54 @@ pub type Error {
 /// removed.
 pub fn prune_images(policy: Policy) -> Result(List(String), Error) {
   use stopped <- result.try(
-    docker(policy, [
-      "ps",
-      "--all",
-      "--filter",
-      "label=" <> label <> "=1",
-      "--filter",
-      "status=exited",
-      "--format",
-      "{{.Names}} {{.Image}}",
+    list_containers(policy, [
+      #("label", [label <> "=1"]),
+      #("status", ["exited"]),
     ]),
   )
-  string.split(stopped, "\n")
-  |> list.each(fn(line) {
-    case string.split(string.trim(line), " ") {
-      [name, image] if image != policy.image -> {
-        let _ = docker(policy, ["rm", name])
+  list.each(stopped, fn(container) {
+    case container.image != policy.image {
+      True -> {
+        let _ =
+          call(policy, http.Delete, "/containers/" <> container.name, None)
         Nil
       }
-      _ -> Nil
+      False -> Nil
     }
   })
   let repository = case string.split_once(policy.image, ":") {
     Ok(#(repository, _)) -> repository
     Error(Nil) -> policy.image
   }
-  use tags <- result.try(
-    docker(policy, [
-      "image", "ls", repository, "--format", "{{.Repository}}:{{.Tag}}",
-    ]),
+  use images <- result.try(
+    call(
+      policy,
+      http.Get,
+      "/images/json?filters=" <> filters([#("reference", [repository])]),
+      None,
+    )
+    |> expect([200]),
   )
-  use used <- result.try(
-    docker(policy, ["ps", "--all", "--format", "{{.Image}}"]),
-  )
-  let used = string.split(used, "\n") |> list.map(string.trim)
-  let stale = unused_images(string.split(tags, "\n"), used, policy.image)
-  list.filter(stale, fn(image) {
-    case docker(policy, ["image", "rm", image]) {
-      Ok(_) -> True
-      Error(_) -> False
-    }
+  let repo_tags = {
+    use tags <- decode.optional_field(
+      "RepoTags",
+      [],
+      decode.optional(decode.list(decode.string))
+        |> decode.map(option.unwrap(_, [])),
+    )
+    decode.success(tags)
+  }
+  let tags =
+    json.parse(images.body, decode.list(repo_tags))
+    |> result.unwrap([])
+    |> list.flatten
+  use used <- result.try(list_containers(policy, []))
+  let used = list.map(used, fn(container) { container.image })
+  unused_images(tags, used, policy.image)
+  |> list.filter(fn(image) {
+    call(policy, http.Delete, "/images/" <> uri.percent_encode(image), None)
+    |> expect([200])
+    |> result.is_ok
   })
   |> Ok
 }
@@ -297,151 +609,18 @@ pub fn unused_images(
   })
 }
 
-fn docker(policy: Policy, args: List(String)) -> Result(String, Error) {
-  case exec(policy.docker, args, docker_timeout_ms) {
-    Ok(#(0, output)) -> Ok(output)
-    Ok(#(status, output)) ->
-      Error(DockerFailed(redact(args), status, redact_output(args, output)))
-    Error(reason) -> Error(DockerUnavailable(reason))
-  }
-}
-
-/// `output` with every `--env` value from `args` hidden, so a docker that
-/// echoes its arguments back can't leak a token either. Values shorter
-/// than 4 bytes (`1`, `on`) are left alone: hiding them would hide most of
-/// the output and they are never secrets.
-pub fn redact_output(args: List(String), output: String) -> String {
-  env_values(args)
-  |> list.filter(fn(value) { string.byte_size(value) >= 4 })
-  // Longest first, so a value containing another is hidden whole.
-  |> list.sort(fn(a, b) {
-    int.compare(string.byte_size(b), string.byte_size(a))
-  })
-  |> list.fold(output, fn(output, value) {
-    string.replace(output, value, "<redacted>")
-  })
-}
-
-fn env_values(args: List(String)) -> List(String) {
-  case args {
-    ["--env", pair, ..rest] ->
-      case string.split_once(pair, "=") {
-        Ok(#(_, value)) -> [value, ..env_values(rest)]
-        Error(Nil) -> env_values(rest)
-      }
-    [_, ..rest] -> env_values(rest)
-    [] -> []
-  }
-}
-
-/// The arguments with every `--env NAME=value` value hidden, so an error
-/// that is logged or posted in Slack carries no token.
-pub fn redact(args: List(String)) -> List(String) {
-  case args {
-    ["--env", pair, ..rest] -> {
-      let name = case string.split_once(pair, "=") {
-        Ok(#(name, _)) -> name
-        Error(Nil) -> pair
-      }
-      ["--env", name <> "=<redacted>", ..redact(rest)]
-    }
-    [arg, ..rest] -> [arg, ..redact(rest)]
-    [] -> []
-  }
-}
-
-pub fn observe(policy: Policy, key: String) -> Result(Observed, Error) {
-  let format =
-    "{{.State.Running}} {{index .Config.Labels \"" <> label <> "-policy\"}}"
-  case docker(policy, ["inspect", "--format", format, container_name(key)]) {
-    Ok(output) -> Ok(parse_inspect(output))
-    Error(DockerFailed(output:, ..)) ->
-      case string.contains(string.lowercase(output), "no such") {
-        True -> Ok(Missing)
-        False -> Error(DockerFailed(["inspect"], 1, output))
-      }
-    Error(error) -> Error(error)
-  }
-}
-
-/// Make sure the thread's container is running under the current policy.
-/// Its crush then dials the bridge; waiting for that is the launcher's job.
-pub fn ensure(
-  policy: Policy,
-  key: String,
-  key_env: List(String),
-) -> Result(Nil, Error) {
-  use _ <- result.try(prepare(policy, key))
-  use observed <- result.try(observe(policy, key))
-  let name = container_name(key)
-  case decide(observed, policy) {
-    Adopt -> Ok("")
-    Start -> docker(policy, ["start", name])
-    Recreate -> {
-      use _ <- result.try(docker(policy, ["rm", "--force", name]))
-      docker(policy, run_args(policy, key, key_env))
-    }
-    Create -> docker(policy, run_args(policy, key, key_env))
-  }
-  |> result.replace(Nil)
-}
-
-/// Warm tier: stop the container but keep it, so installed state survives.
-pub fn stop(policy: Policy, key: String) -> Result(Nil, Error) {
-  docker(policy, ["stop", "--time", "2", container_name(key)])
-  |> result.replace(Nil)
-}
-
-/// The arguments to run `script` with `sh` in a thread's running container,
-/// as its own user, with `env` (`NAME=value` pairs) added.
-pub fn exec_args(
-  key: String,
-  env: List(String),
-  script: String,
-) -> List(String) {
-  list.flatten([
-    ["exec"],
-    list.flat_map(env, fn(pair) { ["--env", pair] }),
-    [container_name(key), "sh", "-c", script],
-  ])
-}
-
-/// Run `script` in a thread's running container and return its output.
-pub fn run_in(
-  policy: Policy,
-  key: String,
-  env: List(String),
-  script: String,
-) -> Result(String, Error) {
-  docker(policy, exec_args(key, env, script))
-}
-
-/// Cold tier: remove the container, keeping the workspace on disk.
-pub fn remove(policy: Policy, key: String) -> Result(Nil, Error) {
-  docker(policy, ["rm", "--force", container_name(key)])
-  |> result.replace(Nil)
-}
-
-/// Where crush in the container keeps its global data, under the
-/// `XDG_DATA_HOME` set in `run_args`.
-pub fn host_crush_data(policy: Policy, key: String) -> String {
-  host_workspace(policy, key) <> "/.home/.local/share/crush"
-}
-
 /// The resolv.conf every container shares, beside the threads.
 pub fn host_resolv_conf(policy: Policy) -> String {
   policy.root <> "/resolv.conf"
 }
 
-/// Create the thread's host directories as the bridge's own user. Left to
-/// docker, missing mount sources are created owned by root, and the
-/// container's uid could then not write its workspace.
-pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
+/// Create the thread's host directories and files as the bridge's own
+/// user. Left to docker, missing mount sources are created owned by root,
+/// and the container's uid could then not write its workspace.
+pub fn prepare(policy: Policy, spec: Spec) -> Result(Nil, Error) {
   use _ <- result.try(
-    sys.mkdir_p(host_workspace(policy, key)) |> result.map_error(Filesystem),
+    list.try_each(spec.dirs, sys.mkdir_p) |> result.map_error(Filesystem),
   )
-  let data = host_crush_data(policy, key)
-  use _ <- result.try(sys.mkdir_p(data) |> result.map_error(Filesystem))
   use _ <- result.try(case policy.dns {
     [] -> Ok(Nil)
     servers ->
@@ -450,6 +629,6 @@ pub fn prepare(policy: Policy, key: String) -> Result(Nil, Error) {
       |> sys.write_private(host_resolv_conf(policy), _)
       |> result.map_error(Filesystem)
   })
-  sys.write_private(data <> "/crush.json", policy.crush_config)
+  list.try_each(spec.files, fn(file) { sys.write_private(file.0, file.1) })
   |> result.map_error(Filesystem)
 }

@@ -1,6 +1,9 @@
 //// Start the bridge from a `config.Config`: every service, spawn and side
 //// effect (the `id -u` lookups included) happens here, none while parsing.
 
+import crushling/agent/backend
+import crushling/agent/spec
+import crushling/agents
 import crushling/config.{type Config}
 import crushling/events
 import crushling/files
@@ -13,8 +16,8 @@ import crushling/install
 import crushling/instance
 import crushling/launcher
 import crushling/mcp
-import crushling/provider
 import crushling/proxy
+import crushling/proxy/meter
 import crushling/registry/shutdown
 import crushling/registry/tailnet
 import crushling/sandbox
@@ -34,6 +37,8 @@ import gleam/int
 import gleam/io
 import gleam/list
 import gleam/option
+import gleam/otp/static_supervisor as supervisor
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import slackline
@@ -51,15 +56,18 @@ fn install_sigterm(subject: process.Subject(Nil)) -> Result(Nil, String)
 
 /// Run the bridge until SIGTERM, then shut down; the exit code says
 /// whether every agent stopped in time.
+///
+/// The store and the GitHub App's keeper are linked to this process, so if
+/// either dies the bridge exits. Everything after them runs under one
+/// supervisor, rest-for-one, in order: the proxy's meter, the tunnels, the
+/// lifecycle owner, the workspaces and the sandbox server. Each is reached
+/// by name, so a restart is invisible to its users, and a restart of one
+/// restarts everything after it: a new lifecycle owner stops the sandboxes
+/// it doesn't know, and new registries start from nothing running.
 pub fn run(config: Config) -> Result(Int, String) {
   let root = config.root
   use secret <- result.try(mcp_secret(root))
   use store <- result.try(open_store(config.store_key, root))
-  use proxy <- result.try(start_proxy(config.proxy, secret))
-  keep_spend(proxy, store)
-  use tunnels <- result.try(tunnel.start(
-    tunnel.Config(..tunnel.config(secret, root), on_event: log_tunnel_event),
-  ))
   let local = case config.sandbox {
     config.Local(..) -> True
     config.Docker(..) -> False
@@ -69,27 +77,61 @@ pub fn run(config: Config) -> Result(Int, String) {
   // host's own git and gh.
   let github_reads = github != option.None && !local
   let bridge_url = config.bridge.url
-  let bridge =
-    launcher.bridge(
-      url: bridge_url,
-      secret:,
-      tunnels:,
-      proxy:,
-      github: github_reads,
-      hello_timeout_ms: config.limits.hello_timeout_ms,
-    )
   // Self-host: the workspace of SLACK_BOT_TOKEN, seeded into the store.
   use env_team <- result.try(seed_env_team(config.slack.env_team, store, root))
   let own_team = case env_team {
     option.Some(seeded) -> seeded.team.id
     option.None -> ""
   }
-  use launcher <- result.try(start_launcher(config, bridge, own_team))
-  let tailnet = tailnet(config.tailnet, launcher)
 
-  use teams <- result.try(
-    instance.start(instance.Shared(
-      launcher:,
+  let proxy_config = proxy_config(config.proxy, secret, store)
+  use proxy <- result.try(
+    proxy.new(proxy_config)
+    |> result.map_error(fn(reason) {
+      "the proxy upstream (CRUSHLING_PROXY_UPSTREAM or HYPER_URL) " <> reason
+    }),
+  )
+  let tunnel_config =
+    tunnel.Config(..tunnel.config(secret, root), on_event: log_tunnel_event)
+  use _ <- result.try(tunnel.check_root(root))
+  let tunnels_name = process.new_name("crushling_tunnels")
+  let tunnels = tunnel.named(tunnel_config, tunnels_name)
+  let settings =
+    spec.Settings(
+      bridge_url:,
+      secret:,
+      github: github_reads,
+      models: config.models,
+      env: [],
+      own_team:,
+      own_env: case config.sandbox {
+        // The Honcho settings are the operator's own memory, so only the
+        // self-host workspace's sandboxes get them.
+        config.Docker(docker) -> docker.honcho
+        // The local launcher passes no Honcho settings: only the docker
+        // settings read them, and a local agent shares the operator's home.
+        config.Local(..) -> []
+      },
+    )
+  use backend <- result.try(backend(config, settings))
+  let launcher =
+    launcher.new(
+      launcher.Wiring(
+        tunnels:,
+        proxy:,
+        spec: settings,
+        hello_timeout_ms: config.limits.hello_timeout_ms,
+      ),
+      backend,
+    )
+  let agents_name = process.new_name("crushling_agents")
+  let owner = agents.named(launcher, agents_name)
+  let tailnet = tailnet(config.tailnet, launcher)
+  let teams_name = process.new_name("crushling_teams")
+  let teams = instance.named(teams_name)
+  let shared =
+    instance.Shared(
+      agents: owner,
       store:,
       root:,
       mode: config.mode,
@@ -100,59 +142,64 @@ pub fn run(config: Config) -> Result(Int, String) {
       client: slackline.new,
       github:,
       default_model: config.models.large,
-    )),
-  )
-  use _ <- result.try(case env_team {
-    option.None -> Ok(Nil)
-    option.Some(seeded) ->
-      instance.start_team(teams, seeded.team) |> result.replace(Nil)
-  })
-  // Every other workspace that installed the app.
-  use failed <- result.try(instance.start_stored(teams, store))
-  list.each(failed, fn(failure) {
-    io.println_error(
-      "crushling: couldn't start workspace " <> failure.0 <> ": " <> failure.1,
     )
-  })
 
   let context = instance.tools_context(teams, store)
   // Every agent reaches the bridge here: its tunnel, its inference, its
   // Slack tools and its files.
   let config.Address(bind:, port:) = config.bridge.address
+  let routes = [
+    tunnel.route(tunnels),
+    proxy.route(proxy),
+    mcp.route_with(
+      secret,
+      slack_tools.tools(tailnet: tailnet != option.None),
+      fn(key, name, arguments) {
+        slack_tools.call(context, key, name, arguments)
+      },
+      case github_reads {
+        True -> github_route.instructions
+        False -> ""
+      },
+    ),
+    files.route(secret, root, fn(key, name, contents, comment) {
+      slack_tools.share(context, key, name, contents, comment)
+    }),
+    ..case github_reads {
+      True -> [
+        github_route.route(github_route.Setup(
+          secret:,
+          access: instance.github_access(teams, store),
+          web: github_route.github(),
+          api: github_route.github_api(),
+          bridge_url:,
+          wait_ms: github_route.default_wait_ms,
+          // Containers keep their env across wakes, so epochs wait for per-create tokens.
+          epoch: fn(_) { option.None },
+        )),
+      ]
+      False -> []
+    }
+  ]
   use _ <- result.try(
-    sandbox_http.start(bind, port, [
-      tunnel.route(tunnels),
-      proxy.route(proxy),
-      mcp.route_with(
-        secret,
-        slack_tools.tools(tailnet: tailnet != option.None),
-        fn(key, name, arguments) {
-          slack_tools.call(context, key, name, arguments)
-        },
-        case github_reads {
-          True -> github_route.instructions
-          False -> ""
-        },
-      ),
-      files.route(secret, root, fn(key, name, contents, comment) {
-        slack_tools.share(context, key, name, contents, comment)
-      }),
-      ..case github_reads {
-        True -> [
-          github_route.route(github_route.Setup(
-            secret:,
-            access: instance.github_access(teams, store),
-            web: github_route.github(),
-            api: github_route.github_api(),
-            bridge_url:,
-            wait_ms: github_route.default_wait_ms,
-            // Until launches record each sandbox's epoch, any token goes.
-            epoch: fn(_) { option.None },
-          )),
-        ]
-        False -> []
-      }
-    ]),
+    supervisor.new(supervisor.RestForOne)
+    |> supervisor.add(
+      supervision.worker(fn() { proxy.start_meter(proxy_config) }),
+    )
+    |> supervisor.add(tunnel.supervised(tunnel_config, tunnels_name))
+    |> supervisor.add(agents.supervised(launcher, backend.running, agents_name))
+    // Its teams actor starts every active workspace in the store.
+    |> supervisor.add(instance.supervised(shared, teams_name))
+    |> supervisor.add(sandbox_http.supervised(bind, port, routes))
+    |> supervisor.start
+    |> result.map_error(fn(error) {
+      "could not start the bridge (is "
+      <> bind
+      <> ":"
+      <> int.to_string(port)
+      <> " free?): "
+      <> string.inspect(error)
+    }),
   )
   io.println(
     "crushling: sandbox server at "
@@ -232,7 +279,10 @@ pub fn run(config: Config) -> Result(Int, String) {
   // One deadline for all of it, from the registries' own timers.
   let outcome = instance.shutdown(teams, config.limits.shutdown_grace_ms)
   // Turns that finished during the grace period spent too.
-  save_spend(proxy, store)
+  case proxy.flush(proxy) {
+    Ok(Nil) -> Nil
+    Error(reason) -> sys.warn("crushling: saving spend failed: " <> reason)
+  }
   case outcome {
     shutdown.Clean -> {
       io.println("crushling: stopped")
@@ -353,33 +403,6 @@ fn seed_env_team(
   }
 }
 
-/// Every `spend_flush_ms`, move what the proxy counted into the store, so
-/// spend outlives the bridge.
-fn keep_spend(proxy: proxy.Proxy, store: store.Store) -> Nil {
-  process.spawn_unlinked(fn() { flush_spend_forever(proxy, store) })
-  Nil
-}
-
-const spend_flush_ms = 10_000
-
-fn flush_spend_forever(proxy: proxy.Proxy, store: store.Store) -> Nil {
-  process.sleep(spend_flush_ms)
-  save_spend(proxy, store)
-  flush_spend_forever(proxy, store)
-}
-
-fn save_spend(proxy: proxy.Proxy, store: store.Store) -> Nil {
-  case proxy.drain(proxy) {
-    [] -> Nil
-    spent ->
-      case usage.record(store, spent) {
-        Ok(Nil) -> Nil
-        Error(reason) ->
-          sys.warn("crushling: saving spend failed, dropped: " <> reason)
-      }
-  }
-}
-
 /// The GitHub App people connect their accounts through. With its private
 /// key, the app's own token reads public repos nobody connected for, and
 /// the bridge knows where the app is installed.
@@ -453,26 +476,25 @@ fn mcp_secret(root: String) -> Result(String, String) {
   }
 }
 
-fn start_launcher(
+/// Where agents run, from the settings.
+fn backend(
   config: Config,
-  bridge: launcher.Bridge,
-  own_team: String,
-) -> Result(launcher.Launcher, String) {
+  settings: spec.Settings,
+) -> Result(backend.Backend, String) {
   let root = config.root
-  let models = config.models
   case config.sandbox {
     config.Local(crush:) -> {
       io.println(
         "crushling: local launcher, agents run unsandboxed with your access",
       )
-      Ok(launcher.local(root, crush, models, bridge))
+      Ok(backend.local(root, crush))
     }
     config.Docker(docker) -> {
       use uid <- result.try(id("-u"))
       use gid <- result.try(id("-g"))
       let policy =
         sandbox.Policy(
-          docker: "docker",
+          socket: docker_socket(),
           image: docker.image,
           runtime: docker.runtime,
           network: docker.network,
@@ -482,20 +504,28 @@ fn start_launcher(
           uid:,
           gid:,
           root:,
-          env: [],
-          // The Honcho settings are the operator's own memory, so only the
-          // self-host workspace's sandboxes get them. Other workspaces get
-          // none until they have memory settings of their own.
-          own_team:,
-          own_env: docker.honcho,
-          crush_config: provider.config(models, bridge.url),
           crush: docker.crush,
           dns: docker.dns,
-          bridge_url: bridge.url,
+          spec: settings,
         )
+      use _ <- result.try(
+        sandbox.check(policy) |> result.map_error(sandbox.describe),
+      )
       prune_images(policy)
-      Ok(launcher.docker(policy, bridge))
+      Ok(backend.docker(policy))
     }
+  }
+}
+
+@external(erlang, "crushling_ffi", "getenv")
+fn getenv(name: String) -> Result(String, Nil)
+
+/// The Engine's socket: `DOCKER_HOST` when it names a unix socket, as the
+/// docker CLI reads it, else the default.
+fn docker_socket() -> String {
+  case getenv("DOCKER_HOST") {
+    Ok("unix://" <> path) -> path
+    _ -> sandbox.default_socket
   }
 }
 
@@ -543,22 +573,31 @@ fn tailnet(
   }
 }
 
-/// The inference proxy, with the org's key.
-fn start_proxy(
+/// The inference proxy's settings, with the org's key, its spend kept in
+/// the store so caps survive a restart.
+fn proxy_config(
   settings: config.Proxy,
   secret: String,
-) -> Result(proxy.Proxy, String) {
-  proxy.start(proxy.Config(
+  store: store.Store,
+) -> proxy.Config {
+  proxy.Config(
     secret:,
     org_key: settings.org_key,
     upstream: settings.upstream,
     thread_cap: settings.thread_cap,
-    instance_cap: settings.instance_cap,
+    // CRUSHLING_PROXY_INSTANCE_CAP_*, now held by each workspace.
+    team_cap: settings.instance_cap,
     max_per_thread: proxy.default_max_per_thread,
     max_uploads: proxy.default_max_uploads,
     upload_timeout_ms: proxy.default_upload_timeout_ms,
-  ))
-  |> result.map_error(fn(reason) {
-    "the proxy upstream (CRUSHLING_PROXY_UPSTREAM or HYPER_URL) " <> reason
-  })
+    keeper: option.Some(meter.Keeper(
+      thread_total: usage.thread_total(store, _, usage.Ever),
+      team_total: usage.team_total(store, _, usage.Month),
+      save: usage.record(store, _),
+      every_ms: spend_flush_ms,
+    )),
+    name: option.Some(process.new_name("crushling_meter")),
+  )
 }
+
+const spend_flush_ms = 10_000

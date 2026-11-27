@@ -5,6 +5,7 @@
 //// prompts in order (`registry/backlog`), and a quiet agent is stopped while
 //// its workspace and `meta` stay, so the next message picks the work up.
 
+import crushling/agents.{type Agents}
 import crushling/commands
 import crushling/conversation.{Conversation}
 import crushling/github/broker.{type Broker}
@@ -112,10 +113,41 @@ type State =
 
 const seen_limit = 1000
 
+/// A registry with its own lifecycle owner over `config.launcher`, linked
+/// to it: for tests and tools.
 pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
-  actor.new_with_initialiser(1000, fn(self) {
+  start_with(config, None, None) |> result.map(fn(started) { started.data })
+}
+
+/// A registry whose agents are run by `agents` (else by an owner of its
+/// own), registered under `name` when given.
+pub fn start_with(
+  config: Config,
+  owner: Option(Agents),
+  name: Option(process.Name(Message)),
+) -> actor.StartResult(Subject(Message)) {
+  let builder =
+    actor.new_with_initialiser(1000, fn(self) { init(config, owner, self) })
+    |> actor.on_message(handle)
+  case name {
+    Some(name) -> actor.named(builder, name)
+    None -> builder
+  }
+  |> actor.start
+}
+
+fn init(
+  config: Config,
+  owner: Option(Agents),
+  named: Subject(Message),
+) -> Result(actor.Initialised(State, Message, Subject(Message)), String) {
+  {
+    // Its own callbacks and timers come here, so ones from a crashed
+    // registry die with it rather than reach the one started after it.
+    let self = process.new_subject()
     let selector =
       process.new_selector()
+      |> process.select(named)
       |> process.select(self)
       |> process.select_monitors(fn(down) { Internal(Own(ThreadDown(down))) })
     // The first sweep a minute in, once the bridge has settled.
@@ -163,8 +195,15 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
       )
       |> result.replace_error("the App Home could not start"),
     )
+    use owner <- result.try(case owner {
+      Some(owner) -> Ok(owner)
+      None -> agents.start(config.launcher)
+    })
+    // A registry starting afresh knows none of the agents its workspace had.
+    agents.reset(owner, config.team)
     State(
       config:,
+      agents: owner,
       self:,
       wrap: fn(event) { Internal(Own(event)) },
       threads: dict.new(),
@@ -201,12 +240,9 @@ pub fn start(config: Config) -> Result(Subject(Message), actor.StartError) {
     )
     |> actor.initialised
     |> actor.selecting(selector)
-    |> actor.returning(self)
+    |> actor.returning(named)
     |> Ok
-  })
-  |> actor.on_message(handle)
-  |> actor.start
-  |> result.map(fn(started) { started.data })
+  }
 }
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {

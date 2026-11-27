@@ -2,7 +2,6 @@
 //// workspace, checked with users.info against a fake Slack.
 
 import crushling/crush/client
-import crushling/instance
 import crushling/launcher
 import crushling/people
 import crushling/registry
@@ -303,18 +302,18 @@ pub fn ids_only_never_ask_slack_test() {
 // STARTUP AND APPROVERS -------------------------------------------------------
 
 pub fn admins_cannot_be_everyone_test() {
-  let assert Error(reason) = instance.env_people("U1", "*")
+  let assert Error(reason) = people.env_people("U1", "*")
   let assert True = string.contains(reason, "CRUSHLING_ADMINS")
-  let assert Error(_) = instance.env_people("U1", "U2,*")
+  let assert Error(_) = people.env_people("U1", "U2,*")
 }
 
 pub fn the_allowlist_must_not_be_empty_test() {
-  let assert Error(reason) = instance.env_people(" ", "")
+  let assert Error(reason) = people.env_people(" ", "")
   let assert True = string.contains(reason, "CRUSHLING_ALLOWED_USERS")
 }
 
 pub fn everyone_is_accepted_at_startup_test() {
-  let assert Ok(#(allowed, admins)) = instance.env_people("*", "U1")
+  let assert Ok(#(allowed, admins)) = people.env_people("*", "U1")
   let assert True = allowed.everyone
   let assert True = admins == set.from_list(["U1"])
 }

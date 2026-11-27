@@ -4,6 +4,7 @@
 //// `HYPER_API_KEY`, which crush reads from its environment for Hyper, so
 //// crush.json holds the models and no key.
 
+import crushling/agent/env
 import gleam/json
 
 /// The models the agents use, by Hyper model id.
@@ -56,14 +57,11 @@ pub fn config(models: Models, bridge_url: String) -> String {
               "slack",
               json.object([
                 #("type", json.string("http")),
-                #("url", json.string(url <> "/mcp/$CRUSHLING_THREAD")),
+                #("url", json.string(url <> "/mcp/$" <> env.thread)),
                 #(
                   "headers",
                   json.object([
-                    #(
-                      "Authorization",
-                      json.string("Bearer $CRUSHLING_MCP_TOKEN"),
-                    ),
+                    #("Authorization", json.string("Bearer $" <> env.mcp_token)),
                   ]),
                 ),
               ]),
