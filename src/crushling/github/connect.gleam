@@ -151,10 +151,10 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
             state,
             found.from,
             found.user,
-            "_Couldn't connect GitHub: " <> reason <> "._",
+            "_Failed to connect GitHub: " <> reason <> "._",
           )
           let state = end_flow(state, poller)
-          emit(state, found.user, Some("Couldn't connect: " <> reason <> "."))
+          emit(state, found.user, Some("Failed to connect: " <> reason <> "."))
           state
         }
         Error(Nil) -> state
@@ -179,13 +179,13 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
             state,
             found.from,
             found.user,
-            "_Connecting GitHub stopped unexpectedly._",
+            "_The GitHub connection flow crashed. Try again._",
           )
           let state = end_flow(state, pid)
           emit(
             state,
             found.user,
-            Some("Connecting stopped unexpectedly; try again."),
+            Some("The connection flow crashed. Try again."),
           )
           state
         }
@@ -200,7 +200,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
           "GitHub disconnected here. GitHub still lists crushling under your authorized apps until you revoke it there."
         RevokeFailed(reason) -> {
           sys.warn("crushling: revoking GitHub for " <> user <> ": " <> reason)
-          "GitHub disconnected here, but revoking it on GitHub failed; revoke crushling in your GitHub settings."
+          "GitHub disconnected here, but revoking it on GitHub failed. Revoke crushling in your GitHub settings."
         }
       }
       reply(state, from, user, "_" <> said <> "_")
@@ -311,10 +311,10 @@ fn granted(state: State, poller: Pid, tokens: Tokens, login: String) -> State {
             state,
             found.from,
             user,
-            "_Couldn't save the GitHub connection._",
+            "_Failed to save the GitHub connection. Try again._",
           )
           sys.warn("crushling: saving GitHub for " <> user <> ": " <> reason)
-          emit(state, user, Some("Couldn't save the connection."))
+          emit(state, user, Some("Failed to save the connection. Try again."))
         }
       }
       state
@@ -355,8 +355,8 @@ fn disconnect(state: State, user: String, from: Option(Place)) -> State {
   case found, forgot {
     Error(reason), _ | _, Error(reason) -> {
       sys.warn("crushling: disconnecting GitHub for " <> user <> ": " <> reason)
-      reply(state, from, user, "_Couldn't disconnect GitHub; try again._")
-      emit(state, user, Some("Couldn't disconnect; try again."))
+      reply(state, from, user, "_Failed to disconnect GitHub. Try again._")
+      emit(state, user, Some("Failed to disconnect. Try again."))
     }
     Ok(None), Ok(Nil) ->
       process.send(self, Revoked(user, from, NothingToRevoke))

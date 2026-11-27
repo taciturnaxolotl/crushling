@@ -3,20 +3,20 @@
 import gleam/int
 
 pub const broken_thread =
-  "_couldn't move this thread's old workspace; an admin should check the logs._"
+  "_Failed to migrate this thread's workspace. An admin should check the bridge logs._"
 
 pub fn could_not_start(reason: String) -> String {
-  "_couldn't start an agent for this thread: " <> reason <> "_"
+  "_Failed to start an agent for this thread: " <> reason <> "._"
 }
 
 pub const could_not_stop =
-  "_couldn't stop this thread's agent, so its sandbox may still be running. Send a follow-up to start it again._"
+  "_Failed to stop this thread's agent, so its sandbox may still be running. Send a follow-up to start it again._"
 
 pub const stopped_unexpectedly =
-  "_the agent for this thread stopped unexpectedly. Send a follow-up to start it again._"
+  "_crushling's handler for this thread crashed. Send a follow-up to start it again._"
 
 pub const restart_note =
-  "crushling restarted, so this run was stopped. Send a follow-up to carry on."
+  "crushling restarted and stopped this run. Send a follow-up to carry on."
 
 pub const cant_use = "_You can't use crushling here._"
 
@@ -44,10 +44,10 @@ pub const github_not_set_up = "_GitHub isn't set up for this crushling._"
 pub const connect_first =
   "_Connect your GitHub account first, from crushling's Home tab or with `!github`, then press again: the PR opens as you._"
 
-pub const no_connection = "_Couldn't get your GitHub connection; try again._"
+pub const no_connection = "_Failed to load your GitHub connection. Try again._"
 
 pub fn could_not_open_pr(why: String) -> String {
-  "_Couldn't open the PR: " <> why <> "._"
+  "_Failed to open the PR: " <> why <> "._"
 }
 
 pub fn pr_dismissed(user: String) -> String {

@@ -566,7 +566,7 @@ pub fn a_saved_model_crush_refuses_goes_back_to_the_default_test() {
   let #(server, t, seen) =
     start("broken", Some(ModelChoice("broken", DefaultReasoning)))
   let assert Posted(text) = receive(seen)
-  let assert True = string.contains(text, "crush wouldn't run `broken`")
+  let assert True = string.contains(text, "`broken` failed to start")
   let assert Chosen(None) = receive(seen)
   process.send(t, thread.Stop)
   stop_server(server)

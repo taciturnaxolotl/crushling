@@ -120,7 +120,7 @@ pub fn from_facts(
     "" -> string.replace(at(4), "origin/", "")
     other -> other
   }
-  use <- guard(base == "", "couldn't tell which branch this was made from")
+  use <- guard(base == "", "the base branch is unknown")
   use <- guard(
     subjects == [],
     "`" <> head <> "` has no commits on `" <> base <> "`",
@@ -286,7 +286,7 @@ pub fn open(
         decode.success(#(number, url))
       })
       |> result.replace_error(
-        "GitHub opened it, but its answer didn't make sense",
+        "GitHub opened it but returned an unreadable response",
       )
     Ok(resp) -> Error(refusal(resp.status, resp.body))
   }
@@ -312,6 +312,6 @@ fn refusal(status: Int, body: String) -> String {
     403, _ | 404, _ -> "your GitHub account can't open pull requests there"
     _, Ok(#(_, [detail, ..])) if detail != "" -> "GitHub said: " <> detail
     _, Ok(#(message, _)) if message != "" -> "GitHub said: " <> message
-    _, _ -> "GitHub answered " <> int.to_string(status)
+    _, _ -> "GitHub returned HTTP " <> int.to_string(status)
   }
 }

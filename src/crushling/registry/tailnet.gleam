@@ -353,7 +353,7 @@ fn joined(
         gone,
         key,
         thread,
-        "_couldn't put the sandbox on the tailnet: " <> reason <> "_",
+        "_Failed to put the sandbox on the tailnet: " <> reason <> "._",
       )
     }
     // The agent stopped while it joined; its access waits for the next one.

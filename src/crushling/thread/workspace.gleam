@@ -130,7 +130,9 @@ pub fn proposal(
   })
   use facts <- result.try(
     shell(pr.facts(dir))
-    |> result.replace_error("couldn't read the repository; is the agent awake?"),
+    |> result.replace_error(
+      "failed to read the repository (the agent may be asleep)",
+    ),
   )
   pr.from_facts(facts, title, body)
 }

@@ -581,7 +581,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
         process.send(thread, thread.Info(asked))
         let text =
           process.receive(asked, 15_000)
-          |> result.unwrap("_The agent didn't answer in time._")
+          |> result.unwrap("_The agent timed out._")
         whisper(state, incoming, text)
       })
       state

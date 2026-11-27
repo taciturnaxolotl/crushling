@@ -291,7 +291,7 @@ pub fn answer_and_note_test() {
   let assert Some(limited) =
     render.note(feed([done("", "429 rate_limit_error", False)]), False)
   let assert True =
-    string.starts_with(limited, "_The model provider is rate limiting us.")
+    string.starts_with(limited, "_The model provider rate-limited the request.")
   let assert True = string.ends_with(limited, "> `429 rate_limit_error`")
   let partial =
     render.note(
@@ -334,11 +334,11 @@ pub fn chunk_keeps_fences_balanced_test() {
 
 pub fn explain_test() {
   let cause = fn(reason) { render.explain(reason).0 }
-  let assert "The conversation got too long for the model" =
+  let assert "The conversation exceeded the model's context window" =
     cause(
       "bad request: 400 {\"message\":\"prompt is too long: 241668 tokens > 200000 maximum\"}",
     )
-  let assert "The bridge's Hyper key was rejected" =
+  let assert "Hyper rejected the bridge's API key" =
     cause("unauthorized: authentication failed")
   let assert True =
     string.contains(
@@ -346,18 +346,19 @@ pub fn explain_test() {
       "CRUSHLING_HYPER_KEY",
     )
   // No Claude login or version advice is left.
-  let assert "Something went wrong" = cause("claude_code_version_too_old")
-  let assert "The model provider is rate limiting us" =
+  let assert "The run failed with an unrecognized error" =
+    cause("claude_code_version_too_old")
+  let assert "The model provider rate-limited the request" =
     cause("429 Too Many Requests: rate_limit_error")
-  let assert "The model provider is having trouble" =
+  let assert "The model provider returned a server error" =
     cause("529 overloaded_error")
-  let assert "The model provider refused the request" =
+  let assert "The model provider rejected the request as invalid" =
     cause(
       "bad request: 400 max_tokens: 128000 > 64000, which is the maximum allowed",
     )
-  let assert "Lost touch with the agent partway through" =
+  let assert "The connection to the agent dropped mid-run" =
     cause("lost the connection mid-run")
-  let assert "Something went wrong" = cause("boom")
+  let assert "The run failed with an unrecognized error" = cause("boom")
 }
 
 pub fn tool_running_test() {

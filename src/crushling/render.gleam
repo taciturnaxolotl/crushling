@@ -278,7 +278,7 @@ pub fn explain(reason: String) -> #(String, String) {
   let has = fn(needles) { list.any(needles, string.contains(text, _)) }
   case Nil {
     _ if text == "lost the connection mid-run" -> #(
-      "Lost touch with the agent partway through",
+      "The connection to the agent dropped mid-run",
       "Send a follow-up to carry on.",
     )
     _ ->
@@ -327,35 +327,35 @@ pub fn explain(reason: String) -> #(String, String) {
         has(["max_tokens", "invalid_request", "bad request", "400"])
       {
         True, _, _, _, _, _, _ -> #(
-          "The conversation got too long for the model",
+          "The conversation exceeded the model's context window",
           "Start a new thread to carry on.",
         )
         _, True, _, _, _, _, _ -> #(
-          "The model provider is out of credits",
+          "The model provider account is out of credits",
           "Top up the account, then send a follow-up to carry on.",
         )
         _, _, True, _, _, _, _ -> #(
-          "The model provider is rate limiting us",
+          "The model provider rate-limited the request",
           "Wait a minute, then send a follow-up to carry on.",
         )
         _, _, _, True, _, _, _ -> #(
-          "The bridge's Hyper key was rejected",
+          "Hyper rejected the bridge's API key",
           "Check CRUSHLING_HYPER_KEY on the bridge, then send a follow-up to carry on.",
         )
         _, _, _, _, True, _, _ -> #(
-          "The model provider is having trouble",
-          "Try again in a bit.",
+          "The model provider returned a server error",
+          "Wait a bit, then send a follow-up to try again.",
         )
         _, _, _, _, _, True, _ -> #(
           "The connection to the model provider dropped",
           "Send a follow-up to carry on.",
         )
         _, _, _, _, _, _, True -> #(
-          "The model provider refused the request",
-          "This is likely a configuration problem; check the model settings.",
+          "The model provider rejected the request as invalid",
+          "Check the model settings, then send a follow-up.",
         )
         _, _, _, _, _, _, _ -> #(
-          "Something went wrong",
+          "The run failed with an unrecognized error",
           "Send a follow-up to try again.",
         )
       }

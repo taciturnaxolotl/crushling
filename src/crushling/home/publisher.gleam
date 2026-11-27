@@ -138,7 +138,7 @@ fn github_of(
         Ok(None) -> home.NotConnected(note:)
         Error(reason) -> {
           sys.warn("crushling: reading GitHub for " <> user <> ": " <> reason)
-          home.NotConnected(note: Some("Couldn't read your connection."))
+          home.NotConnected(note: Some("Failed to load your connection."))
         }
       }
   }

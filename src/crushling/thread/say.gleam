@@ -30,7 +30,7 @@ pub fn session_title(prompt: String) -> String {
 }
 
 pub const stalled =
-  "_no word from the agent in 10 minutes; it may be stuck. Reply `!stop` to stop it._"
+  "_The agent hasn't responded in 10 minutes and may be stuck. Reply `!stop` to stop it._"
 
 /// The note ending a run whose agent went away, saying why as best the
 /// backend could tell, with crush's last complaint quoted when there is one.
@@ -102,11 +102,10 @@ pub const no_repo = "_No repository here yet._"
 pub const asleep =
   "_The agent is asleep; send a message to wake it, then ask again._"
 
-pub const not_connected =
-  "_the agent isn't connected right now; try again in a moment._"
+pub const not_connected = "_The agent is disconnected. Try again in a moment._"
 
 pub fn not_sent(reason: String) -> String {
-  aside("couldn't send that to the agent: " <> reason)
+  aside("Failed to send the message to the agent: " <> reason <> ".")
 }
 
 /// Said in the thread when the work moves to a code channel.
@@ -188,25 +187,25 @@ pub fn reasoning_dropped(model: String) -> String {
 
 pub fn model_refused(model: String, reason: String) -> String {
   aside(
-    "crush wouldn't run `"
+    "`"
     <> model
-    <> "` ("
+    <> "` failed to start ("
     <> reason
     <> "), so this thread is back on the default model.",
   )
 }
 
 pub fn no_model_card(reason: String) -> String {
-  aside("couldn't show the model: " <> reason <> ".")
+  aside("Failed to load the models: " <> reason <> ".")
 }
 
 pub fn not_switched(reason: String) -> String {
-  aside("couldn't switch the model: " <> reason <> ".")
+  aside("Failed to switch the model: " <> reason <> ".")
 }
 
 /// The note on a model card whose Confirm was refused.
 pub fn refused_note(reason: String) -> String {
-  "couldn't switch: " <> reason <> "."
+  "Failed to switch: " <> reason <> "."
 }
 
 pub fn switched(user: String, current: Current) -> String {

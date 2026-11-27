@@ -74,7 +74,7 @@ pub fn closing_test() {
   let t = turn.Turn(..t, stop_note: Some("restarting"))
   let assert "_restarting_" = turn.closing(t)
   let failed = turn.observe(asked(0), completes("429 rate_limit", False), 1)
-  let assert True = string.contains(turn.closing(failed), "rate limiting")
+  let assert True = string.contains(turn.closing(failed), "rate-limited")
   let quiet = turn.observe(asked(0), completes("", False), 1)
   let assert "_no reply._" = turn.closing(quiet)
 }
