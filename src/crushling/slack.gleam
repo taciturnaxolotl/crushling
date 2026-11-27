@@ -376,8 +376,14 @@ pub fn sink(
       }
     },
     code: fn(diff, base, head) {
-      case place {
-        InCodeChannel -> {
+      case place, string.trim(diff) {
+        InCodeChannel, "" -> {
+          let _ =
+            agents.conversations_remove_view(channel_id: channel)
+            |> httpc.send(client)
+          Nil
+        }
+        InCodeChannel, _ -> {
           let call =
             agents.conversations_set_view(channel_id: channel)
             |> conversations_set_view.type_("diff")
@@ -412,7 +418,7 @@ pub fn sink(
               sys.warn("crushling: Code tab update failed: " <> reason)
           }
         }
-        _ -> Nil
+        _, _ -> Nil
       }
     },
   )

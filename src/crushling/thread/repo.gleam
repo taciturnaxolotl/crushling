@@ -122,7 +122,20 @@ pub fn status(shell: Shell, dir: String) -> String {
 
 /// Update the code channel's context bar and Code tab.
 pub fn show(shell: Shell, sink: Sink, dir: String, info: RepoInfo) -> Nil {
-  let changes = changes(shell, dir)
+  // Every repository in the workspace with changes, the channel's own
+  // first: an agent often works across several (a review that clones a
+  // few). With more than one, each path says which.
+  let others =
+    shell(snapshot.list_repos())
+    |> result.unwrap("")
+    |> string.split("\n")
+    |> list.map(string.trim)
+    |> list.filter(fn(other) { other != "" && other != dir })
+  let changed =
+    [dir, ..others]
+    |> list.map(fn(repo) { #(repo, changes(shell, repo)) })
+    |> list.filter(fn(pair) { pair.1 != [] })
+  let changes = list.flat_map(changed, fn(pair) { pair.1 })
   let web = snapshot.web_url(info.url)
   let link = fn(path) {
     case web {
@@ -154,8 +167,20 @@ pub fn show(shell: Shell, sink: Sink, dir: String, info: RepoInfo) -> Nil {
   ]
   |> result.values
   |> sink.context
-  case shell(snapshot.repo_diff(dir)) {
-    Ok("") | Error(Nil) -> Nil
-    Ok(diff) -> sink.code(diff, info.base, info.branch)
+  let diff = case changed {
+    [] -> Ok("")
+    [#(only, _)] if only == dir -> shell(snapshot.repo_diff(dir))
+    changed ->
+      list.try_map(changed, fn(pair) {
+        shell(snapshot.repo_diff_prefixed(pair.0))
+      })
+      |> result.map(string.join(_, ""))
+  }
+  case diff, changed {
+    Error(Nil), _ -> Nil
+    // Nothing changed (any more): an empty Code tab, not the last diff.
+    Ok(diff), [#(only, _)] if only == dir ->
+      sink.code(diff, info.base, info.branch)
+    Ok(diff), _ -> sink.code(diff, "", "")
   }
 }

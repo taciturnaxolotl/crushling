@@ -153,6 +153,22 @@ pub fn repo_diff(dir: String) -> String {
   against_base(dir, "")
 }
 
+/// `repo_diff`, with the repository's directory before every path, for
+/// showing several repositories' changes as one diff.
+pub fn repo_diff_prefixed(dir: String) -> String {
+  let prefix = case string.starts_with(dir, "./") {
+    True -> string.drop_start(dir, 2)
+    False -> dir
+  }
+  against_base(
+    dir,
+    "--src-prefix="
+      <> quote("a/" <> prefix <> "/")
+      <> " --dst-prefix="
+      <> quote("b/" <> prefix <> "/"),
+  )
+}
+
 pub fn repo_numstat(dir: String) -> String {
   against_base(dir, "--numstat")
 }
