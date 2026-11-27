@@ -12,6 +12,7 @@ import crushling/text
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 
 /// Slack's markdown block accepts up to 12,000 characters; stay well under.
@@ -247,122 +248,176 @@ pub fn note(run: Run, answered: Bool) -> Option(String) {
   case run.outcome {
     Some(run.Cancelled) -> None
     Some(run.Errored(reason)) -> {
-      let #(cause, advice) = explain(reason)
-      let where = case answered, did_work {
-        True, _ -> " The reply above may be partial."
-        False, True -> " The steps above show what got done."
-        False, False -> ""
+      let failure = explain(reason)
+      let where = case answered {
+        True -> " The reply above may be partial."
+        False -> ""
       }
-      Some(
-        "_"
-        <> cause
-        <> "."
-        <> where
-        <> " "
-        <> advice
-        <> "_\n> `"
-        <> clip_reason(reason)
-        <> "`",
-      )
+      let next = case failure.advice, failure.retry {
+        "", _ -> " Send a follow-up to try again."
+        advice, False -> " " <> advice
+        advice, True -> " " <> advice <> " Send a follow-up to try again."
+      }
+      let quoted = case failure.quote {
+        True -> "\n> `" <> clip_reason(reason) <> "`"
+        False -> ""
+      }
+      Some("_" <> failure.cause <> "." <> where <> next <> "_" <> quoted)
     }
     Some(run.Completed(_)) if !answered && !did_work -> Some("_no reply._")
     _ -> None
   }
 }
 
-/// What went wrong in words, and what to do about it, from an error as
-/// crush reports it. Crush passes provider errors through, so this goes by
-/// what the text contains.
-pub fn explain(reason: String) -> #(String, String) {
-  let text = string.lowercase(reason)
-  let has = fn(needles) { list.any(needles, string.contains(text, _)) }
-  case Nil {
-    _ if text == "lost the connection mid-run" -> #(
-      "The connection to the agent dropped mid-run",
-      "Send a follow-up to carry on.",
-    )
-    _ ->
-      case
-        has([
-          "prompt is too long",
-          "context length",
-          "context_length",
-          "too many tokens",
-          "maximum context",
-        ]),
-        has([
-          "credit",
-          "billing",
-          "insufficient_quota",
-          "payment required",
-          "402",
-        ]),
-        has(["rate limit", "rate_limit", "429", "too many requests"]),
-        has([
-          "unauthorized",
-          "authentication",
-          "invalid token",
-          "invalid api key",
-          "401",
-          "token is expired",
-          "re-authenticate",
-        ]),
-        has([
-          "overloaded",
-          "529",
-          "503",
-          "502",
-          "500 internal",
-          "internal server error",
-          "bad gateway",
-          "service unavailable",
-        ]),
-        has([
-          "timeout",
-          "timed out",
-          "deadline exceeded",
-          "connection reset",
-          "eof",
-        ]),
-        has(["max_tokens", "invalid_request", "bad request", "400"])
-      {
-        True, _, _, _, _, _, _ -> #(
-          "The conversation exceeded the model's context window",
-          "Start a new thread to carry on.",
-        )
-        _, True, _, _, _, _, _ -> #(
-          "The model provider account is out of credits",
-          "Top up the account, then send a follow-up to carry on.",
-        )
-        _, _, True, _, _, _, _ -> #(
-          "The model provider rate-limited the request",
-          "Wait a minute, then send a follow-up to carry on.",
-        )
-        _, _, _, True, _, _, _ -> #(
-          "Hyper rejected the bridge's API key",
-          "Check CRUSHLING_HYPER_KEY on the bridge, then send a follow-up to carry on.",
-        )
-        _, _, _, _, True, _, _ -> #(
-          "The model provider returned a server error",
-          "Wait a bit, then send a follow-up to try again.",
-        )
-        _, _, _, _, _, True, _ -> #(
-          "The connection to the model provider dropped",
-          "Send a follow-up to carry on.",
-        )
-        _, _, _, _, _, _, True -> #(
-          "The model provider rejected the request as invalid",
-          "Check the model settings, then send a follow-up.",
-        )
-        _, _, _, _, _, _, _ -> #(
-          "The run failed with an unrecognized error",
-          "Send a follow-up to try again.",
-        )
-      }
-  }
+/// Why a run failed, in words for the people in the thread.
+pub type Failure {
+  Failure(
+    cause: String,
+    /// What to do before trying again, or "" for nothing.
+    advice: String,
+    /// Whether a follow-up is the way to try again.
+    retry: Bool,
+    /// Whether crush's own error text adds anything worth quoting.
+    quote: Bool,
+  )
 }
 
-/// The raw error, on one line and short, for a code span.
+/// What went wrong, from an error as crush reports it. Crush passes provider
+/// errors through as text, so this goes by what the text says: telling
+/// phrases first, then HTTP statuses, which count only as whole words so a
+/// token count can't pass for one.
+pub fn explain(reason: String) -> Failure {
+  let text = string.lowercase(reason)
+  let words = words(text)
+  let says = fn(phrases) {
+    fn() { list.any(phrases, string.contains(text, _)) }
+  }
+  let status = fn(codes) { fn() { list.any(codes, list.contains(words, _)) } }
+  let checks = [
+    #(fn() { text == "lost the connection mid-run" }, lost_agent),
+    #(
+      says([
+        "prompt is too long", "context length", "context_length",
+        "context window", "too many tokens", "maximum context",
+      ]),
+      too_long,
+    ),
+    #(
+      says([
+        "credit balance", "out of credits", "insufficient credits",
+        "insufficient_quota", "billing", "payment required",
+      ]),
+      out_of_credits,
+    ),
+    #(says(["rate limit", "rate_limit", "too many requests"]), rate_limited),
+    #(
+      says([
+        "unauthorized", "authentication", "invalid token", "invalid api key",
+        "invalid x-api-key", "token is expired",
+      ]),
+      key_rejected,
+    ),
+    #(
+      says([
+        "overloaded", "internal server error", "bad gateway",
+        "service unavailable", "gateway timeout",
+      ]),
+      server_error,
+    ),
+    #(
+      says([
+        "timed out", "timeout", "deadline exceeded", "connection reset",
+        "connection refused",
+      ]),
+      dropped,
+    ),
+    #(status(["eof"]), dropped),
+    #(
+      says(["invalid_request", "invalid request", "bad request", "max_tokens"]),
+      invalid,
+    ),
+    #(status(["429"]), rate_limited),
+    #(status(["402"]), out_of_credits),
+    #(status(["401", "403"]), key_rejected),
+    #(status(["500", "502", "503", "504", "529"]), server_error),
+    #(status(["400", "413", "422"]), invalid),
+  ]
+  list.find(checks, fn(check) { check.0() })
+  |> result.map(fn(check) { check.1 })
+  |> result.unwrap(unrecognized)
+}
+
+/// The text split into runs of letters and digits.
+fn words(text: String) -> List(String) {
+  string.to_graphemes(text)
+  |> list.map(fn(c) {
+    case string.contains("abcdefghijklmnopqrstuvwxyz0123456789_", c) {
+      True -> c
+      False -> " "
+    }
+  })
+  |> string.concat
+  |> string.split(" ")
+  |> list.filter(fn(word) { word != "" })
+}
+
+const lost_agent =
+  Failure("The connection to the agent dropped mid-run", "", True, False)
+
+const too_long =
+  Failure(
+    "The conversation exceeded the model's context window",
+    "Start a new thread to carry on.",
+    False,
+    False,
+  )
+
+const out_of_credits =
+  Failure(
+    "The model provider account is out of credits",
+    "Ask whoever runs crushling to top it up.",
+    False,
+    False,
+  )
+
+const rate_limited =
+  Failure(
+    "The model provider rate-limited the request",
+    "Wait a minute.",
+    True,
+    False,
+  )
+
+const key_rejected =
+  Failure(
+    "The model provider rejected crushling's API key",
+    "Ask whoever runs crushling to check it.",
+    False,
+    True,
+  )
+
+const server_error =
+  Failure(
+    "The model provider returned a server error",
+    "Wait a bit.",
+    True,
+    False,
+  )
+
+const dropped =
+  Failure("The connection to the model provider dropped", "", True, False)
+
+const invalid =
+  Failure(
+    "The model provider rejected the request as invalid",
+    "Try another model with `!model`, or ask whoever runs crushling to check the model settings.",
+    False,
+    True,
+  )
+
+const unrecognized =
+  Failure("The run failed with an unrecognized error", "", True, True)
+
 fn clip_reason(reason: String) -> String {
   reason
   |> string.replace("\n", " ")

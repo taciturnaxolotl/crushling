@@ -258,7 +258,7 @@ fn resync(reason: String) -> String {
 }
 
 fn lost(posts: List(String)) -> Bool {
-  list.any(posts, string.contains(_, "lost the connection"))
+  list.any(posts, string.contains(_, "connection to the agent dropped mid-run"))
 }
 
 pub fn run_completing_in_a_gap_finishes_from_the_replay_test() {

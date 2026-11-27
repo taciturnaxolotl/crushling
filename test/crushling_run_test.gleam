@@ -292,7 +292,6 @@ pub fn answer_and_note_test() {
     render.note(feed([done("", "429 rate_limit_error", False)]), False)
   let assert True =
     string.starts_with(limited, "_The model provider rate-limited the request.")
-  let assert True = string.ends_with(limited, "> `429 rate_limit_error`")
   let partial =
     render.note(
       feed([assistant("m", "half", []), done("", "boom", False)]),
@@ -333,18 +332,16 @@ pub fn chunk_keeps_fences_balanced_test() {
 }
 
 pub fn explain_test() {
-  let cause = fn(reason) { render.explain(reason).0 }
+  let cause = fn(reason) { render.explain(reason).cause }
   let assert "The conversation exceeded the model's context window" =
     cause(
       "bad request: 400 {\"message\":\"prompt is too long: 241668 tokens > 200000 maximum\"}",
     )
-  let assert "Hyper rejected the bridge's API key" =
+  let assert "The model provider rejected crushling's API key" =
     cause("unauthorized: authentication failed")
-  let assert True =
-    string.contains(
-      render.explain("401 invalid api key").1,
-      "CRUSHLING_HYPER_KEY",
-    )
+  // Operator fixes go to whoever runs crushling, not the thread.
+  let assert False =
+    string.contains(render.explain("401 invalid api key").advice, "CRUSHLING_")
   // No Claude login or version advice is left.
   let assert "The run failed with an unrecognized error" =
     cause("claude_code_version_too_old")
@@ -359,6 +356,48 @@ pub fn explain_test() {
   let assert "The connection to the agent dropped mid-run" =
     cause("lost the connection mid-run")
   let assert "The run failed with an unrecognized error" = cause("boom")
+}
+
+pub fn explain_matches_statuses_as_whole_words_test() {
+  let cause = fn(reason) { render.explain(reason).cause }
+  // A number that merely contains 401 or 500 is no status.
+  let assert "The run failed with an unrecognized error" =
+    cause("used 140123 tokens, 25001 cached")
+  let assert "The model provider rejected crushling's API key" =
+    cause("status 401")
+  let assert "The model provider returned a server error" =
+    cause("upstream said 502")
+  // "eof" counts only as a word.
+  let assert "The run failed with an unrecognized error" =
+    cause("the cause thereof is unclear")
+  let assert "The connection to the model provider dropped" =
+    cause("unexpected EOF")
+}
+
+pub fn explain_prefers_phrases_to_statuses_test() {
+  let cause = fn(reason) { render.explain(reason).cause }
+  let assert "The model provider account is out of credits" =
+    cause("400 Bad Request: your credit balance is too low")
+  let assert "The model provider rate-limited the request" =
+    cause("400 rate_limit_error")
+  // "credit" alone is not a billing problem.
+  let assert "The model provider rejected the request as invalid" =
+    cause("400 bad request: field credit_note is unknown")
+}
+
+pub fn notes_quote_only_errors_worth_reading_test() {
+  let assert Some(limited) =
+    render.note(feed([done("", "429 rate_limit_error", False)]), False)
+  let assert False = string.contains(limited, "\n>")
+  let assert Some(odd) = render.note(feed([done("", "boom", False)]), False)
+  let assert True = string.ends_with(odd, "\n> `boom`")
+  // "Send a follow-up" is said once, at the end.
+  let assert True =
+    limited
+    == "_The model provider rate-limited the request. Wait a minute. Send a follow-up to try again._"
+  let assert Some(long) =
+    render.note(feed([done("", "prompt is too long", False)]), False)
+  let assert False = string.contains(long, "follow-up")
 }
 
 pub fn tool_running_test() {
