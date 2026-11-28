@@ -61,7 +61,7 @@ pub fn plan(
 }
 
 pub const archive_note =
-  "_Quiet for a week, so this channel is archived. Mention me in the original thread to pick the work up again._"
+  "_Archived after a week without activity. Mention crushling in the original thread to pick the work back up._"
 
 /// Carry out the plan: Slack and the disk are touched off the registry.
 pub fn run(state: State(msg)) -> State(msg) {

@@ -80,6 +80,11 @@ pub fn track(subs: Subagents, parent: Parent, event: event.Event) -> Subagents {
       case call_id(id) {
         Ok(call) ->
           upsert(subs, call, id, fn(sub) {
+            // Named from its dispatch result before its session was seen.
+            let sub = case sub.run.session_id {
+              "" -> Sub(..sub, run: run.new(id, ""))
+              _ -> sub
+            }
             case title {
               "" | "New Agent Session" -> sub
               title -> Sub(..sub, title:)
@@ -92,8 +97,10 @@ pub fn track(subs: Subagents, parent: Parent, event: event.Event) -> Subagents {
     ->
       list.fold(message.tool_results, subs, fn(subs, result) {
         case result.name, started_label(result.content) {
+          // The result may come before the subagent's session does; keep
+          // the name for when it shows up.
           "agent_dispatch", Ok(label) ->
-            update(subs, result.tool_call_id, fn(sub) { Sub(..sub, label:) })
+            upsert(subs, result.tool_call_id, "", fn(sub) { Sub(..sub, label:) })
           _, _ -> subs
         }
       })
@@ -329,15 +336,14 @@ fn finish_thread(parent: Parent, sub: Sub) -> Sub {
       sink.working(thread.sink, False)
       let #(text, blocks) = say.subagent_card(who, scope, status)
       let _ = parent.sink.update_blocks(thread.root_ts, text, blocks)
-      case thread.link {
-        "" -> Nil
-        link -> {
-          let #(text, blocks) =
-            say.subagent_done(who, scope, failed, status, link)
-          let _ = parent.sink.post_blocks(text, blocks)
-          Nil
-        }
+      let report = case render.reply(sub.run), rest {
+        "", rest -> rest
+        said, _ -> said
       }
+      let #(text, blocks) =
+        say.subagent_report(who, scope, failed, status, report, thread.link)
+      let _ = parent.sink.post_blocks(text, blocks)
+      Nil
     }
     None -> Nil
   }
@@ -346,7 +352,11 @@ fn finish_thread(parent: Parent, sub: Sub) -> Sub {
 
 /// The parent's plan card rows, with each subagent's row saying who it is,
 /// what it's on, and, while it works, its latest step.
-pub fn rows(subs: Subagents, tasks: List(render.Task)) -> List(render.Task) {
+pub fn rows(
+  subs: Subagents,
+  tasks: List(render.Task),
+  ended: Bool,
+) -> List(render.Task) {
   list.map(tasks, fn(task) {
     case dict.get(subs.by_call, task.id) {
       Error(Nil) -> task
@@ -359,13 +369,17 @@ pub fn rows(subs: Subagents, tasks: List(render.Task)) -> List(render.Task) {
         render.Task(
           ..task,
           title: who <> ": " <> scope,
-          status: case sub.done {
-            False -> render.InProgress
-            True -> render.run_status(sub.run)
+          // Still out when the parent's run ends: it reports back later,
+          // which isn't a failure.
+          status: case sub.done, ended {
+            False, False -> render.InProgress
+            False, True -> render.Complete
+            True, _ -> render.run_status(sub.run)
           },
-          details: case sub.done {
-            False -> latest
-            True -> outcome(sub)
+          details: case sub.done, ended {
+            False, False -> latest
+            False, True -> "Still working; reports back when done"
+            True, _ -> outcome(sub)
           },
         )
       }

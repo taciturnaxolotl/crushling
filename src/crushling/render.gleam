@@ -264,7 +264,8 @@ pub fn note(run: Run, answered: Bool) -> Option(String) {
       }
       Some("_" <> failure.cause <> "." <> where <> next <> "_" <> quoted)
     }
-    Some(run.Completed(_)) if !answered && !did_work -> Some("_no reply._")
+    Some(run.Completed(_)) if !answered && !did_work ->
+      Some("_The agent finished without replying._")
     _ -> None
   }
 }

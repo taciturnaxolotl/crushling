@@ -562,7 +562,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
         state,
         route.incoming,
         route.origin,
-        "_paused: I'll only answer when mentioned. `!resume` to have me follow along again._",
+        "_Paused. The agent only replies when mentioned._",
       )
       set_meta(state, route.key, entry, Meta(..entry.meta, paused: True))
     }
@@ -571,7 +571,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
         state,
         route.incoming,
         route.origin,
-        "_following along again: every message here reaches me._",
+        "_Following along again. Every message here reaches the agent._",
       )
       let meta = Meta(..entry.meta, paused: False, follow: True)
       set_meta(state, route.key, entry, meta)
@@ -587,7 +587,11 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
           case result {
             Ok(_) -> Nil
             Error(why) ->
-              whisper(state, incoming, "_No PR card: " <> why <> "._")
+              whisper(
+                state,
+                incoming,
+                "_Failed to propose a PR: " <> why <> "._",
+              )
           }
         }),
       )
@@ -619,7 +623,7 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
       state
     }
     commands.StopCommand, _ -> {
-      whisper(state, route.incoming, "_nothing is running in this thread._")
+      whisper(state, route.incoming, "_Nothing is running in this thread._")
       state
     }
     commands.TailnetCommand(on: True), Some(entry) -> {
@@ -667,7 +671,11 @@ fn act(state: State, route: Route, command: commands.Command) -> State {
     | commands.TailnetCommand(..), None
     | commands.ModelCommand(..), None
     -> {
-      whisper(state, route.incoming, "_I'm not working in this thread._")
+      whisper(
+        state,
+        route.incoming,
+        "_crushling isn't running in this thread._",
+      )
       state
     }
     // A bare mention with nothing attached has nothing to say.

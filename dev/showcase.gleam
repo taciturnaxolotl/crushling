@@ -199,7 +199,7 @@ fn samples(channel: String) -> List(Sample) {
       "run error, quoted",
       "_The run failed with an unrecognized error. Send a follow-up to try again._\n> `boom: something odd happened`",
     ),
-    md("A7", "empty run", "_no reply._"),
+    md("A7", "empty run", "_The agent finished without replying._"),
     md("A8", "stalled", say.stalled),
     md(
       "A9-oom",
@@ -260,23 +260,25 @@ fn samples(channel: String) -> List(Sample) {
     ),
     bk(
       "B11",
-      "subagent done note in parent",
-      say.subagent_done(
-        "Explorer",
-        "map the checkout flow",
+      "subagent report in parent",
+      say.subagent_report(
+        "Jan",
+        "Gemini subscription sign-in research",
         False,
-        say.subagent_outcome(render.Complete, False, 7, 72_000),
+        say.subagent_outcome(render.Complete, False, 29, 240_000),
+        sample_report,
         "https://slack.com/archives/" <> channel,
       ),
     ),
     bk(
       "B11-failed",
-      "subagent stopped note in parent",
-      say.subagent_done(
+      "subagent stopped, in parent",
+      say.subagent_report(
         "Explorer",
         "map the checkout flow",
         True,
         say.subagent_outcome(render.Failed, False, 3, 9000),
+        "The connection to the model provider dropped.",
         "https://slack.com/archives/" <> channel,
       ),
     ),
@@ -285,14 +287,14 @@ fn samples(channel: String) -> List(Sample) {
     md(
       "C2-pause",
       "!pause",
-      "_paused: I'll only answer when mentioned. `!resume` to have me follow along again._",
+      "_Paused. The agent only replies when mentioned._",
     ),
     md(
       "C2-resume",
       "!resume",
-      "_following along again: every message here reaches me._",
+      "_Following along again. Every message here reaches the agent._",
     ),
-    md("C3", "!stop, nothing running", "_nothing is running in this thread._"),
+    md("C3", "!stop, nothing running", "_Nothing is running in this thread._"),
     md(
       "C4",
       "!info",
@@ -319,14 +321,14 @@ fn samples(channel: String) -> List(Sample) {
     md(
       "C6",
       "!pr failure",
-      "_No PR card: some commits aren't pushed yet: push first._",
+      "_Failed to propose a PR: some commits aren't pushed yet, so push first._",
     ),
     md(
       "C7",
       "!model usage",
       "_`!model` shows the model; `!model <id> [level]` switches, and `!model default` goes back to the default._",
     ),
-    md("C8", "not working here", "_I'm not working in this thread._"),
+    md("C8", "not working here", "_crushling isn't running in this thread._"),
     md("C9-use", "can't use", text.cant_use),
     md("C9-stop", "can't stop", text.cant_stop),
     md("C9-model", "can't change model", text.cant_change_model),
@@ -560,3 +562,24 @@ fn plan_task(task: render.Task) -> block.PlanTask {
     hide_title: None,
   )
 }
+
+const sample_report =
+  "# Sign in with Google for Gemini subscriptions
+
+## 1. gemini-cli \"Login with Google\" OAuth
+
+Source: [oauth2.ts](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts)
+
+* **Client ID**: a public installed-app client, embedded in the CLI.
+* **Scopes**: `cloud-platform`, `userinfo.email`, `userinfo.profile`.
+* **Browser flow**: authorization code with PKCE over a loopback redirect.
+
+## 2. After sign-in
+
+The CLI calls `v1internal:loadCodeAssist` to find the user's project, and `onboardUser` for a fresh account, then sends every request to `cloudcode-pa.googleapis.com/v1internal:generateContent` with that project.
+
+```
+POST /v1internal:generateContent
+{ \"model\": \"...\", \"project\": \"...\", \"request\": { ... } }
+```
+"

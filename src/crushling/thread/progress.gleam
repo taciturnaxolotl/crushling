@@ -1,6 +1,7 @@
 //// Showing a turn in Slack as it goes, and ending its reply.
 
 import crushling/render
+import crushling/run
 import crushling/sink.{type Sink}
 import crushling/sys
 import crushling/thread/subagents.{type Subagents}
@@ -21,10 +22,27 @@ pub type Place {
 const max_patch_bytes = 400_000
 
 /// Show the turn as it goes: what the agent has said, and its steps.
+///
+/// While subagents are still out, what the agent says is only it waiting
+/// for them ("both reports will wake me"), so the reply holds its steps
+/// alone; and a turn crush started to read one report, with others still
+/// to come, isn't shown at all. The answer comes with the last report.
 pub fn show(place: Place, current: Turn) -> Turn {
-  let text = turn.said(current)
+  let waiting = subagents.running(place.subs)
+  case waiting && !turn.solicited(current) && turn.reply(current) == None {
+    True -> current
+    False -> show_now(place, current, waiting)
+  }
+}
+
+fn show_now(place: Place, current: Turn, waiting: Bool) -> Turn {
+  let text = case waiting {
+    True -> ""
+    False -> turn.said(current)
+  }
   let steps =
-    render.all_tasks(current.run, place.root) |> subagents.rows(place.subs, _)
+    render.all_tasks(current.run, place.root)
+    |> subagents.rows(place.subs, _, run.is_done(current.run))
   case turn.reply(current), text, steps {
     None, "", [] -> current
     shown, _, _ -> {

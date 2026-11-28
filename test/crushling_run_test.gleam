@@ -283,7 +283,7 @@ pub fn answer_and_note_test() {
   let assert ["fallback"] = render.answer(feed([done("fallback", "", False)]))
   let assert [] = render.answer(feed([done("", "", False)]))
 
-  let assert Some("_no reply._") =
+  let assert Some("_The agent finished without replying._") =
     render.note(feed([done("", "", False)]), False)
   let assert None = render.note(feed([done("hi", "", False)]), True)
   // Whoever stopped a run knows; it gets no note.

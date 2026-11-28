@@ -20,17 +20,17 @@ pub const cant_use = "_You can't use crushling here._"
 
 pub const cant_stop = "_You can't use crushling here, so you can't stop it._"
 
-pub const cant_change_model = "_you can't change this thread's model._"
+pub const cant_change_model = "_You can't change this thread's model._"
 
-pub const not_working_there = "_I'm not working in that thread anymore._"
+pub const not_working_there = "_crushling is no longer running in that thread._"
 
 pub const wrapping_up =
-  "_wrapping up; this channel will be archived. Mention me in the original thread to pick the work up again._"
+  "_Wrapping up. This channel will be archived; mention crushling in the original thread to pick the work back up._"
 
 pub const still_working =
-  "_still working; `!stop` first, or wait for this turn to finish._"
+  "_The agent is still working. Use `!stop` first, or wait for this turn to finish._"
 
-pub const no_code_channel = "_there's no code channel to wrap up._"
+pub const no_code_channel = "_There's no code channel to wrap up._"
 
 pub const card_expired = "_This card has expired; `/pr` posts a new one._"
 

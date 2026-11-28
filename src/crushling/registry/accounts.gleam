@@ -13,7 +13,6 @@ import crushling/registry/core.{type State, GitHubAskPosted, PrSettled, State}
 import crushling/registry/entry.{Entry, Live}
 import crushling/registry/text
 import crushling/slack/workspace
-import crushling/sys
 import crushling/thread
 import gleam/dict
 import gleam/erlang/process.{type Subject}

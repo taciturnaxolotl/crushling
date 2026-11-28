@@ -76,7 +76,7 @@ pub fn closing_test() {
   let failed = turn.observe(asked(0), completes("429 rate_limit", False), 1)
   let assert True = string.contains(turn.closing(failed), "rate-limited")
   let quiet = turn.observe(asked(0), completes("", False), 1)
-  let assert "_no reply._" = turn.closing(quiet)
+  let assert "_The agent finished without replying._" = turn.closing(quiet)
 }
 
 pub fn moved_leaves_out_what_was_said_test() {

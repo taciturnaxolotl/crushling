@@ -222,7 +222,7 @@ fn pressed(
         t.workspace,
         conversation.from_slack(card.channel, card.thread_ts),
         user,
-        Message("You can't change this sandbox's tailnet access.", []),
+        Message("_You can't change this sandbox's tailnet access._", []),
       )
       keep(t)
     }

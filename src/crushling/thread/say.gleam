@@ -7,6 +7,7 @@ import crushling/git.{type PushState, type RepoInfo}
 import crushling/meta
 import crushling/render
 import crushling/slack/blocks
+import crushling/slack/mrkdwn
 import crushling/snapshot.{type Change}
 import crushling/text
 import gleam/int
@@ -15,6 +16,7 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import slackline/block
+import slackline/block/container
 import slackline/element
 import slackline/element/button
 
@@ -113,7 +115,7 @@ pub fn not_sent(reason: String) -> String {
 
 /// Said in the thread when the work moves to a code channel.
 pub fn moved(repo: String, channel: String) -> String {
-  aside("working on `" <> repo <> "` in <#" <> channel <> ">")
+  aside("Moved to <#" <> channel <> "> to work on `" <> repo <> "`.")
 }
 
 /// The answer to `propose_pr` once its card is up.
@@ -317,38 +319,63 @@ fn took(ms: Int) -> String {
   }
 }
 
-/// The note in the parent's conversation when a subagent finishes, linking
-/// to its thread.
-pub fn subagent_done(
+/// What a subagent found, posted in the parent's conversation when it
+/// reports back: a collapsed box titled by who it was, opened to read the
+/// whole report, with a way to its thread. The text, and the blocks.
+pub fn subagent_report(
   who: String,
   scope: String,
   failed: Bool,
   status: String,
+  report: String,
   link: String,
 ) -> #(String, List(block.Block)) {
-  let #(verb, icon) = case failed {
-    True -> #("stopped on", block.IconWarning)
-    False -> #("finished", block.IconCheck)
+  let title = case failed {
+    True -> who <> " stopped"
+    False -> "Report from " <> who
   }
-  let line = "*" <> who <> "* " <> verb <> " " <> scope
+  let body = case string.trim(report) {
+    "" -> [blocks.context("_No report._")]
+    report ->
+      render.chunk(mrkdwn.from_markdown(report), report_section)
+      |> fit_sections
+      |> list.map(blocks.text)
+  }
   let open = case link {
     "" -> []
     link -> [
-      element.button(
-        text: "Open thread",
-        action_id: "crushling_open_thread",
-        with: [button.url(link)],
+      block.actions(
+        elements: [
+          element.button(
+            text: "Open thread",
+            action_id: "crushling_open_thread",
+            with: [button.url(link)],
+          ),
+        ],
+        with: [],
       ),
     ]
   }
-  #(line, [
-    blocks.card(
-      blocks.Card(
-        ..blocks.new_card(icon, "*" <> who <> "* " <> verb),
-        body: scope,
-        subtext: status,
-        actions: open,
-      ),
-    ),
+  #(title <> ": " <> scope, [
+    block.container(child_blocks: list.append(body, open), with: [
+      container.title(text.clip(title, 150)),
+      container.subtitle(block.mrkdwn(text.clip(scope <> " · " <> status, 150))),
+      container.is_collapsible(True),
+      container.default_collapsed(True),
+    ]),
   ])
+}
+
+/// Sections hold 3000 characters; a little under leaves room for mrkdwn.
+const report_section = 2900
+
+/// A container holds 10 blocks, one of them the thread's button: a longer
+/// report keeps its start and points to the rest.
+fn fit_sections(sections: List(String)) -> List(String) {
+  case list.length(sections) > 9 {
+    False -> sections
+    True ->
+      list.take(sections, 8)
+      |> list.append(["_The rest of the report is in its thread._"])
+  }
 }
