@@ -9,6 +9,7 @@ import crushling/run.{type Run}
 import crushling/sink.{type Reply}
 import crushling/thread/say
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 
@@ -27,6 +28,10 @@ pub type Turn {
     liveness: Liveness,
     /// Said in place of "stopped" when the turn was cancelled for a reason.
     stop_note: Option(String),
+    /// How many of the run's steps an earlier reply already showed: a
+    /// progress update the agent posts mid-run ends the reply before it,
+    /// and the next one carries on from there.
+    steps_shown: Int,
   )
 }
 
@@ -100,6 +105,7 @@ fn new(run: Run, origin: Origin, now: Int) -> Turn {
     shown: NotShown(after: ""),
     liveness: Lively(last_event: now, marked: now),
     stop_note: None,
+    steps_shown: 0,
   )
 }
 
@@ -193,6 +199,16 @@ pub fn streaming(turn: Turn, reply: Reply) -> Turn {
 /// new one starts after it.
 pub fn moved(turn: Turn) -> Turn {
   Turn(..turn, shown: NotShown(after: render.reply(turn.run)))
+}
+
+/// The turn after the agent posted a progress update: the reply so far
+/// stays above it, and a new one starts below with what comes next.
+pub fn split(turn: Turn) -> Turn {
+  Turn(
+    ..turn,
+    shown: NotShown(after: render.reply(turn.run)),
+    steps_shown: list.length(turn.run.tools),
+  )
 }
 
 /// The line that ends the reply, or "" for none.

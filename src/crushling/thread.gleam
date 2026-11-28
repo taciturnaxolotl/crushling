@@ -363,9 +363,23 @@ fn dispatch(state: State, message: Message) -> State {
       process.send(reply, reader(state))
       state
     }
+    // A progress update mid-run goes after the reply so far, which ends
+    // there; what the run does next starts a new reply below it, so the
+    // thread reads in order.
     Say(text, reply) -> {
+      let current = case state.turn {
+        Some(current) ->
+          case turn.reply(current) {
+            Some(_) -> {
+              close_reply(state, current, "")
+              Some(turn.split(current))
+            }
+            None -> Some(current)
+          }
+        None -> None
+      }
       process.send(reply, here(state).post(text))
-      state
+      State(..state, turn: current)
     }
     OpenCodeChannel(name, dir, reply) -> {
       let #(state, result) = move(state, dir, name)

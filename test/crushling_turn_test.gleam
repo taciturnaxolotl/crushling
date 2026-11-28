@@ -99,3 +99,27 @@ pub fn timings_test() {
     turn.timings(t)
   let assert None = turn.timings(turn.report(run.new("s1", ""), 0))
 }
+
+/// A progress update splits the reply: what was said and done before it
+/// stays above, and the next reply shows only what comes after.
+pub fn a_progress_update_splits_the_reply_test() {
+  let said = fn(id, text) {
+    event.MessageEvent(
+      "updated",
+      event.Message(id, "s1", event.Assistant, text, [], [], []),
+    )
+  }
+  let t =
+    asked(0)
+    |> turn.observe(said("m0", "Looking for the branch."), 1)
+    |> turn.observe(calls_tool(), 2)
+    |> turn.split
+  let assert 1 = t.steps_shown
+  let assert None = turn.reply(t)
+  // What was said before the update isn't said again after it.
+  let t =
+    t
+    |> turn.observe(said("m2", "Here's the answer."), 3)
+    |> turn.observe(completes("", False), 4)
+  let assert "Here's the answer." = turn.said(t)
+}

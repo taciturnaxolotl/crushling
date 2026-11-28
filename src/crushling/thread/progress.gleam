@@ -42,6 +42,7 @@ fn show_now(place: Place, current: Turn, waiting: Bool) -> Turn {
   }
   let steps =
     render.all_tasks(current.run, place.root)
+    |> list.drop(current.steps_shown)
     |> subagents.rows(place.subs, _, run.is_done(current.run))
   case turn.reply(current), text, steps {
     None, "", [] -> current
